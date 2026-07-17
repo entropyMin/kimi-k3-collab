@@ -1,0 +1,24 @@
+{
+  "name": "kimi-k3-collab",
+  "version": "0.1.0+codex.20260717053928",
+  "description": "Delegate engineering and visual design reviews from a native Codex subagent to a persistent local Kimi K3 service.",
+  "author": {
+    "name": "entropyMin",
+    "url": "https://github.com/entropyMin"
+  },
+  "homepage": "https://github.com/entropyMin/kimi-k3-collab",
+  "repository": "https://github.com/entropyMin/kimi-k3-collab",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Kimi K3 Collab",
+    "shortDescription": "Native Codex collaboration with persistent Kimi K3 jobs.",
+    "longDescription": "Adds one thin native Codex collaborator for explicit Kimi K3 engineering, review, discussion, implementation, and visual-design delegation, including persistent jobs, status, result, cancellation, and recovery after wrapper interruption.",
+    "developerName": "entropyMin",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Local delegation"
+    ],
+    "defaultPrompt": "Ask Kimi K3 for an independent engineering or visual-design review."
+  }
+}
