@@ -1,0 +1,18 @@
+{
+  "name": "kimi-k3-collab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-platform Kimi K3 collaboration bridge for Codex.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/entropyMin/kimi-k3-collab.git"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "check": "node scripts/portable-check.mjs",
+    "test": "node scripts/self-test.mjs"
+  }
+}

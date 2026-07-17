@@ -1,25 +1,30 @@
 # Kimi K3 Collab
 
-This personal Codex plugin follows the thin-agent pattern used by OpenAI's `codex-plugin-cc`: one native agent forwards engineering, review, discussion, implementation, or visual-design work to an independent persistent runtime and returns a durable job result.
+This cross-platform Codex plugin follows the thin-agent pattern used by OpenAI's `codex-plugin-cc`: one native agent forwards engineering, review, discussion, implementation, or visual-design work to an independent persistent runtime and returns a durable job result.
 
-The Kimi server remains the source of truth for execution. The single native `kimi-k3-collaborator` Codex role uses a low-cost wrapper model only to invoke `scripts/kimi-k3.ps1 -Action delegate`; `-Focus engineering|visual|general` changes its preference without creating separate agents. Every delegated job verifies the server-selected model is `kimi-code/k3`.
+The Kimi server remains the source of truth for execution. The single native `kimi-k3-collaborator` Codex role uses a low-cost wrapper model only to invoke `node scripts/kimi-k3.mjs delegate`; `--focus engineering|visual|general` changes its preference without creating separate agents. Every delegated job verifies the server-selected model is `kimi-code/k3`.
 
-Job snapshots are stored under `%USERPROFILE%\.kimi-code\codex-jobs`, so an interrupted wrapper can recover the latest Kimi session.
+Job snapshots are stored under `$KIMI_CODE_HOME/codex-jobs` (default: `~/.kimi-code/codex-jobs`), so an interrupted wrapper can recover the latest Kimi session.
 
-Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\self-test.ps1` to verify script syntax, service health, the advertised K3 model, and any existing durable job record.
+Run `node scripts/self-test.mjs` to verify script syntax, service health, the advertised K3 model, and any existing durable job record.
 
 ## Requirements
 
-- Windows PowerShell 5.1 or newer.
-- Kimi Code installed under `%USERPROFILE%\.kimi-code` and authenticated.
+- Node.js 18.18 or newer on Windows, macOS, or Linux.
+- Kimi Code CLI with local-server support (`0.26.0` tested), installed and authenticated.
 - A Codex build with personal plugins and custom agent roles.
+
+The bridge uses only the Node.js standard library; no npm install is required. It finds Kimi on `PATH` or under `$KIMI_CODE_HOME/bin` (default: `~/.kimi-code/bin`). Set `KIMI_CODE_BIN` only when the executable lives elsewhere.
+
+The standard installation path, `$HOME/plugins/kimi-k3-collab`, is part of this native-agent contract. Analysis jobs verify that Kimi keeps server-side plan mode enabled while running and abort on constraint drift. Execution allowlists are explicit instructions to K3, not an operating-system sandbox; Codex must review the resulting diff before accepting edits.
 
 ## Local installation
 
 Clone the repository into the standard personal-plugin location:
 
-```powershell
-git clone https://github.com/entropyMin/kimi-k3-collab "$HOME\plugins\kimi-k3-collab"
+```sh
+git clone https://github.com/entropyMin/kimi-k3-collab "$HOME/plugins/kimi-k3-collab"
+node "$HOME/plugins/kimi-k3-collab/scripts/self-test.mjs"
 ```
 
-Register that directory as `kimi-k3-collab` in your personal Codex marketplace, install `kimi-k3-collab@personal`, and point the `kimi-k3-collaborator` agent role at `agents\kimi-k3-collaborator.toml` using its absolute local path. Start a new Codex task after installation so the skill and role are reloaded.
+Register that directory as `kimi-k3-collab` in your personal Codex marketplace, install `kimi-k3-collab@personal`, and point the `kimi-k3-collaborator` agent role at `agents/kimi-k3-collaborator.toml` using its absolute local path. Start a new Codex task after installation so the skill and role are reloaded.
