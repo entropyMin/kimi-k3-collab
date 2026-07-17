@@ -17,14 +17,20 @@ Use the single `kimi-k3-collaborator` native Codex role as a thin forwarding wra
 2. Spawn a native Codex subagent using `kimi-k3-collaborator` when role selection is exposed. Otherwise spawn one normal native subagent named `kimi_k3_collaborator` and give it the thin-wrapper contract below.
 3. Use `analyze` for review, discussion, architecture, planning, and critique. Treat `constraint_drift: true` as a failed review and inspect the working tree. Use `execute` only when the user already authorized edits, and pass explicit allowed paths under the working directory.
 4. Continue independent Codex work while K3 runs when safe. Do not edit the same files concurrently with an execution delegation.
-5. Retrieve K3's final JSON, independently evaluate its claims and edits, and report `session_id`, `focus`, `server_reported_model`, and `verified_k3`. After execution, compare the working-tree diff with the allowed paths; the allowlist is a K3 instruction, not an OS sandbox.
+5. Keep K3's original Markdown report visible, then independently discuss its claims, agreements, disagreements, and resulting decisions. Report `session_id`, `focus`, `server_reported_model`, and `verified_k3` in human-readable text. Do not expose the bridge JSON in the subagent conversation. After execution, compare the working-tree diff with the allowed paths; the allowlist is a K3 instruction, not an OS sandbox.
 
-## Thin-wrapper contract
+## Transparent-wrapper contract
 
-Make exactly one shell call and return stdout verbatim:
+Use short, bounded shell calls. Start the persistent job and capture its `Session` value:
 
 ```text
-node "$HOME/plugins/kimi-k3-collab/scripts/kimi-k3.mjs" delegate --mode analyze --focus engineering --cwd "/path/to/project" --prompt "Review the proposed caching architecture and challenge its failure modes."
+node "$HOME/plugins/kimi-k3-collab/scripts/kimi-k3.mjs" start --format text --mode analyze --focus engineering --cwd "/path/to/project" --prompt "Review the proposed caching architecture and challenge its failure modes."
 ```
 
-Prefer `--prompt-file "/path/to/utf8-task.txt"` for multiline or shell-sensitive task text; standard input is also accepted when neither prompt option is supplied. Use `--prompt` only with the current shell's correct literal quoting. For implementation, use `--mode execute --allowed-path "src;tests"`. If the native wrapper is interrupted, recover with `latest`, then use `result --session-id ID --wait-seconds 30`. Never claim K3 was used unless the JSON reports the exact `server_reported_model: "kimi-code/k3"` and `verified_k3: true`.
+Then poll until Status is `completed`, `blocked`, `failed`, `cancelled`, `stopped`, or `error`; every call stays below the Codex shell timeout:
+
+```text
+node "$HOME/plugins/kimi-k3-collab/scripts/kimi-k3.mjs" result --format text --session-id SESSION --wait-seconds 30
+```
+
+Prefer `--prompt-file "/path/to/utf8-task.txt"` for multiline or shell-sensitive task text; standard input is also accepted when neither prompt option is supplied. Use `--prompt` only with the current shell's correct literal quoting. For implementation, use `--mode execute --allowed-path "src;tests"`. Stop after 60 running polls; the persistent job continues and its footer makes later recovery possible. If the native wrapper is interrupted, recover with `latest --format text`, then continue the same bounded `result` polling. Return K3's Markdown report and plain-text verification footer, not JSON and not a wrapper summary. Never claim K3 was used unless the footer reports the exact model `kimi-code/k3` as verified.

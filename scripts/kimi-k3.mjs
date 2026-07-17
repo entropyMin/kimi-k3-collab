@@ -13,6 +13,7 @@ const LOCK_FILE = path.join(KIMI_HOME, "server", "lock");
 const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMPLETE_STATES = new Set(["completed", "cancelled", "failed", "error", "stopped", "end_turn"]);
+const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped"]);
 
 function assertRuntime() {
   const [major, minor] = process.versions.node.split(".").map(Number);
@@ -28,6 +29,7 @@ function parseArgs(argv) {
     mode: "analyze",
     focus: "general",
     cwd: process.cwd(),
+    outputFormat: "json",
     waitSeconds: 0,
     maxWaitSeconds: 1800,
     allowedPaths: []
@@ -40,6 +42,7 @@ function parseArgs(argv) {
     ["--prompt-file", "promptFile"],
     ["--allowed-path", "allowedPaths"],
     ["--session-id", "sessionId"],
+    ["--format", "outputFormat"],
     ["--wait-seconds", "waitSeconds"],
     ["--max-wait-seconds", "maxWaitSeconds"]
   ]);
@@ -69,6 +72,9 @@ function parseArgs(argv) {
   if (!["general", "engineering", "visual"].includes(options.focus)) {
     throw new Error(`Unsupported focus: ${options.focus}`);
   }
+  if (!["json", "text"].includes(options.outputFormat)) {
+    throw new Error(`Unsupported output format: ${options.outputFormat}`);
+  }
   if (!Number.isInteger(options.waitSeconds) || options.waitSeconds < 0 || options.waitSeconds > 55) {
     throw new Error("--wait-seconds must be an integer from 0 to 55.");
   }
@@ -80,6 +86,56 @@ function parseArgs(argv) {
 
 function printJson(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function formatText(value) {
+  if (value.kind === "kimi-k3-service") {
+    return `Kimi K3 service is healthy.\nModel: ${value.model} (verified)\nServer: ${value.host}:${value.port}\n`;
+  }
+
+  if (value.kind === "kimi-k3-job-cancel") {
+    return `Kimi K3 prompt ${value.aborted ? "cancelled" : "was not active"}.\nSession: ${value.session_id}\n`;
+  }
+
+  const status = value.status || value;
+  const sessionId = value.session_id || status.session_id || "unknown";
+  const rawState = String(value.state || status.state || (value.complete ? "completed" : "running"));
+  const state = value.error ? "constraint-drift" : rawState === "end_turn" ? "completed" : rawState;
+  const model = value.server_reported_model || status.server_reported_model || value.explicit_model || K3_MODEL;
+  const verified = value.verified_k3 ?? status.verified_k3;
+  const verification = verified ? "verified" : "NOT VERIFIED";
+  const context = [value.mode && `Mode: ${value.mode}`, value.focus && `Focus: ${value.focus}`].filter(Boolean).join("\n");
+  const contextBlock = context ? `${context}\n` : "";
+
+  if (value.kind === "kimi-k3-job") {
+    return `Kimi K3 started.\nSession: ${sessionId}\n${contextBlock}Status: ${state}\nModel: ${model} (${verification})\n`;
+  }
+
+  if (value.kind === "kimi-k3-job-status") {
+    return `Kimi K3 is ${value.busy ? "working" : "idle"}.\nSession: ${sessionId}\n${contextBlock}Status: ${state}\nModel: ${model} (${verification})\n`;
+  }
+
+  let report = "Kimi K3 is still working.";
+  if (value.error) {
+    report = `Kimi K3 collaboration stopped: ${value.error}`;
+  } else if (typeof value.result === "string" && value.result.trim()) {
+    report = value.result.trimEnd();
+  } else if (state === "blocked") {
+    report = "Kimi K3 is blocked waiting for interaction.";
+  } else if (FAILURE_STATES.has(state)) {
+    report = `Kimi K3 stopped with status: ${state}.`;
+  } else if (value.complete) {
+    report = "Kimi K3 completed without a text report.";
+  }
+  return `${report}\n\n---\nKimi K3 session: ${sessionId}\n${contextBlock}Status: ${state}\nModel: ${model} (${verification})\n`;
+}
+
+function printOutput(value, outputFormat) {
+  if (outputFormat === "text") {
+    process.stdout.write(formatText(value));
+    return;
+  }
+  printJson(value);
 }
 
 function sleep(milliseconds) {
@@ -231,6 +287,50 @@ function writeJobRecord(record) {
   writeJsonFile(path.join(JOB_ROOT, "latest.json"), record);
 }
 
+function createJobRecord(job, options) {
+  return {
+    kind: "kimi-k3-native-delegation",
+    session_id: job.session_id,
+    state: job.state,
+    complete: false,
+    mode: options.mode,
+    focus: options.focus,
+    cwd: path.resolve(options.cwd),
+    explicit_model: job.explicit_model,
+    server_reported_model: job.server_reported_model,
+    verified_k3: job.verified_k3,
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    result: null
+  };
+}
+
+function readJobRecord(sessionId) {
+  const file = path.join(JOB_ROOT, `${sessionId}.json`);
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
+}
+
+function persistJobResult(result) {
+  const record = readJobRecord(result.session_id);
+  if (!record) {
+    return null;
+  }
+  Object.assign(record, {
+    state: result.error ? "constraint-drift" : result.status.state,
+    complete: result.complete,
+    server_reported_model: result.status.server_reported_model,
+    verified_k3: result.status.verified_k3,
+    updated_at: new Date().toISOString(),
+    result: result.result
+  });
+  if (result.error) {
+    record.error = result.error;
+    record.cancellation = result.cancellation;
+  }
+  writeJobRecord(record);
+  return record;
+}
+
 function requireSessionId(options) {
   if (!options.sessionId?.trim()) {
     throw new Error("--session-id is required.");
@@ -253,14 +353,16 @@ async function getJobStatus(sessionId) {
     callApi("GET", `/api/v1/sessions/${escaped}`),
     callApi("GET", `/api/v1/sessions/${escaped}/status`)
   ]);
+  const record = readJobRecord(sessionId);
+  const mode = session.metadata?.mode || record?.mode;
   const state = session.pending_interaction && session.pending_interaction !== "none"
     ? "blocked"
     : runtime.busy
       ? "running"
       : session.last_turn_reason || "idle";
-  const expectedPlanMode = session.metadata?.mode === "analyze"
+  const expectedPlanMode = mode === "analyze"
     ? true
-    : session.metadata?.mode === "execute"
+    : mode === "execute"
       ? false
       : null;
   const planMode = Boolean(runtime.plan_mode);
@@ -282,7 +384,9 @@ async function getJobStatus(sessionId) {
     constraint_drift: constraintDrift,
     permission_mode: String(runtime.permission || ""),
     verified_k3: String(runtime.model || "") === K3_MODEL,
-    message_count: Number(session.message_count || 0)
+    message_count: Number(session.message_count || 0),
+    mode: mode || "",
+    focus: String(record?.focus || session.metadata?.focus || "")
   };
 }
 
@@ -414,52 +518,37 @@ async function abortActivePrompt(sessionId) {
   return { prompt_id: promptId, aborted: Boolean(response.aborted) };
 }
 
+async function pollJobResult(sessionId, waitSeconds) {
+  const result = await getResult(sessionId, waitSeconds);
+  if (result.status.constraint_drift) {
+    result.cancellation = await abortActivePrompt(sessionId);
+    result.complete = true;
+    const cancellation = result.cancellation.aborted
+      ? "The active prompt was aborted."
+      : "No active prompt remained to abort.";
+    result.error = `Kimi changed the active session plan-mode constraint. ${cancellation} Inspect the working tree before accepting any result.`;
+  }
+  const record = persistJobResult(result);
+  if (record) {
+    result.mode = record.mode;
+    result.focus = record.focus;
+  }
+  return result;
+}
+
 async function delegate(options) {
   const job = await startJob(options);
-  const record = {
-    kind: "kimi-k3-native-delegation",
-    session_id: job.session_id,
-    state: job.state,
-    complete: false,
-    mode: options.mode,
-    focus: options.focus,
-    cwd: path.resolve(options.cwd),
-    explicit_model: job.explicit_model,
-    server_reported_model: job.server_reported_model,
-    verified_k3: job.verified_k3,
-    started_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    result: null
-  };
+  let record = createJobRecord(job, options);
   writeJobRecord(record);
 
   const deadline = Date.now() + options.maxWaitSeconds * 1000;
   do {
     const remainingSeconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-    const result = await getResult(job.session_id, Math.min(30, remainingSeconds));
-    if (result.status.constraint_drift) {
-      const cancellation = await abortActivePrompt(job.session_id);
-      Object.assign(record, {
-        state: "constraint-drift",
-        complete: true,
-        verified_k3: result.status.verified_k3,
-        updated_at: new Date().toISOString(),
-        result: result.result,
-        error: "Kimi changed the active session plan-mode constraint; the prompt was aborted. Inspect the working tree before accepting any result.",
-        cancellation
-      });
-      writeJobRecord(record);
+    const result = await pollJobResult(job.session_id, Math.min(30, remainingSeconds));
+    record = readJobRecord(job.session_id) || record;
+    if (result.error) {
       return record;
     }
-    Object.assign(record, {
-      state: result.status.state,
-      complete: result.complete,
-      server_reported_model: result.status.server_reported_model,
-      verified_k3: result.status.verified_k3,
-      updated_at: new Date().toISOString(),
-      result: result.result
-    });
-    writeJobRecord(record);
     if (record.complete || Date.now() >= deadline) {
       return record;
     }
@@ -477,7 +566,7 @@ async function main() {
     if (!model) {
       throw new Error(`The local Kimi service does not advertise ${K3_MODEL}.`);
     }
-    printJson({
+    printOutput({
       kind: "kimi-k3-service",
       healthy: true,
       persistent: true,
@@ -488,7 +577,7 @@ async function main() {
       model: model.model,
       display_name: model.display_name,
       max_context_size: model.max_context_size
-    });
+    }, options.outputFormat);
     return;
   }
 
@@ -497,32 +586,35 @@ async function main() {
     if (!fs.existsSync(latest)) {
       throw new Error("No persisted Kimi K3 delegation record was found.");
     }
-    process.stdout.write(fs.readFileSync(latest, "utf8"));
+    const record = JSON.parse(fs.readFileSync(latest, "utf8"));
+    printOutput(record, options.outputFormat);
     return;
   }
 
   if (options.action === "start") {
-    printJson(await startJob(options));
+    const job = await startJob(options);
+    writeJobRecord(createJobRecord(job, options));
+    printOutput(job, options.outputFormat);
     return;
   }
 
   if (options.action === "status") {
-    printJson(await getJobStatus(requireSessionId(options)));
+    printOutput(await getJobStatus(requireSessionId(options)), options.outputFormat);
     return;
   }
 
   if (options.action === "result") {
-    printJson(await getResult(requireSessionId(options), options.waitSeconds));
+    printOutput(await pollJobResult(requireSessionId(options), options.waitSeconds), options.outputFormat);
     return;
   }
 
   if (options.action === "cancel") {
     const sessionId = requireSessionId(options);
-    printJson({ kind: "kimi-k3-job-cancel", session_id: sessionId, ...await abortActivePrompt(sessionId) });
+    printOutput({ kind: "kimi-k3-job-cancel", session_id: sessionId, ...await abortActivePrompt(sessionId) }, options.outputFormat);
     return;
   }
 
-  printJson(await delegate(options));
+  printOutput(await delegate(options), options.outputFormat);
 }
 
 main().catch((error) => {

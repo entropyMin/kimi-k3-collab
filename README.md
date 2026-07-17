@@ -2,9 +2,11 @@
 
 This cross-platform Codex plugin follows the thin-agent pattern used by OpenAI's `codex-plugin-cc`: one native agent forwards engineering, review, discussion, implementation, or visual-design work to an independent persistent runtime and returns a durable job result.
 
-The Kimi server remains the source of truth for execution. The single native `kimi-k3-collaborator` Codex role uses a low-cost wrapper model only to invoke `node scripts/kimi-k3.mjs delegate`; `--focus engineering|visual|general` changes its preference without creating separate agents. Every delegated job verifies the server-selected model is `kimi-code/k3`.
+The Kimi server remains the source of truth for execution. The single native `kimi-k3-collaborator` Codex role uses a low-cost wrapper model to start a persistent job and poll it with short, bounded calls; `--focus engineering|visual|general` changes its preference without creating separate agents. Every delegated job verifies the server-selected model is `kimi-code/k3`.
 
 Job snapshots are stored under `$KIMI_CODE_HOME/codex-jobs` (default: `~/.kimi-code/codex-jobs`), so an interrupted wrapper can recover the latest Kimi session.
+
+The native subagent uses `--format text`: its conversation shows K3's original Markdown report, readable progress, and a small verification footer instead of the bridge's JSON transport envelope. Polls stop on completed, blocked, or failed jobs and after 30 minutes of continuous running; the persistent K3 job itself continues and remains recoverable. JSON remains the default CLI format for scripts and integrations.
 
 Run `node scripts/self-test.mjs` to verify script syntax, service health, the advertised K3 model, and any existing durable job record.
 

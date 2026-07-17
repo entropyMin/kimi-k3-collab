@@ -1,6 +1,6 @@
 {
   "name": "kimi-k3-collab",
-  "version": "0.1.0+codex.20260717061521",
+  "version": "0.1.0+codex.20260717073709",
   "description": "Delegate engineering and visual design work from a native Codex subagent to a persistent cross-platform Kimi K3 service.",
   "author": {
     "name": "entropyMin",
