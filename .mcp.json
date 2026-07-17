@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "kimi-k3": {
+      "command": "node",
+      "args": ["./scripts/mcp-server.mjs"],
+      "cwd": ".",
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 3720,
+      "supports_parallel_tool_calls": false
+    }
+  }
+}

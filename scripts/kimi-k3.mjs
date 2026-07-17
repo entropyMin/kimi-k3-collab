@@ -17,7 +17,10 @@ const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMPLETE_STATES = new Set(["completed", "cancelled", "failed", "error", "stopped", "end_turn"]);
 const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped"]);
-const READ_ONLY_TOOLS = ["Read", "ReadMediaFile", "Glob", "Grep", "WebSearch", "FetchURL"];
+const READ_ONLY_TOOLS = [
+  "Read", "ReadMediaFile", "Glob", "Grep", "WebSearch", "FetchURL", "TodoList",
+  "Agent", "Skill", "TaskList", "TaskOutput", "GetGoal"
+];
 const TERMINAL_EVENTS = new Set(["turn.ended", "prompt.completed", "prompt.aborted"]);
 const PROCESS_DEADLINE = Date.now() + 115000;
 const STREAM_EXIT_RESERVE_MS = 10000;
@@ -323,8 +326,17 @@ function writeJsonFile(file, value) {
   }
 }
 
+function validateSessionId(value) {
+  const sessionId = String(value || "").trim();
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(sessionId)) {
+    throw new Error("Kimi session id contains unsupported characters.");
+  }
+  return sessionId;
+}
+
 function writeJobRecord(record) {
-  writeJsonFile(path.join(JOB_ROOT, `${record.session_id}.json`), record);
+  const sessionId = validateSessionId(record.session_id);
+  writeJsonFile(path.join(JOB_ROOT, `${sessionId}.json`), record);
   writeJsonFile(path.join(JOB_ROOT, "latest.json"), record);
 }
 
@@ -349,15 +361,16 @@ function createJobRecord(job, options) {
 }
 
 function readJobRecord(sessionId) {
-  const file = path.join(JOB_ROOT, `${sessionId}.json`);
+  const file = path.join(JOB_ROOT, `${validateSessionId(sessionId)}.json`);
   return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
 }
 
 function requireSessionId(options) {
-  if (!options.sessionId?.trim()) {
+  const sessionId = options.sessionId?.trim();
+  if (!sessionId) {
     throw new Error("--session-id is required.");
   }
-  return options.sessionId.trim();
+  return validateSessionId(sessionId);
 }
 
 function verifyWithinRoot(root, candidate) {
@@ -431,6 +444,7 @@ async function startJob(options) {
   }
   const readOnly = options.mode === "analyze";
   const planMode = false;
+  const permissionMode = readOnly ? "manual" : "auto";
   let scopeText = "";
   if (!readOnly) {
     const items = options.allowedPaths.flatMap((value) => value.split(";")).map((value) => value.trim()).filter(Boolean);
@@ -442,12 +456,21 @@ async function startJob(options) {
   }
 
   const systemPrompt = readOnly
-    ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Inspect relevant project files and assets as needed.\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
+    ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Do not call Bash, Shell, or another command-execution tool; use the configured read-only inspection tools instead. You may use TodoList to organize the review. Inspect relevant project files and assets as needed.\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
     : `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe user has authorized the scoped implementation described in the task. Inspect before editing, preserve unrelated user changes, and do not touch files outside the allowed paths.${scopeText}\nImplement the requested work, verify it with appropriate tests, static checks, or rendered evidence, and return the files changed, decisions made, and verification results.`;
 
   const session = await callApi("POST", "/api/v1/sessions", {
     title: `Codex K3 collaboration (${options.focus}, ${options.mode})`,
-    metadata: { cwd: root, focus: options.focus, mode: options.mode }
+    metadata: { cwd: root, focus: options.focus, mode: options.mode },
+    agent_config: {
+      model: K3_MODEL,
+      system_prompt: systemPrompt.trim(),
+      tools: readOnly ? READ_ONLY_TOOLS : undefined,
+      thinking: "max",
+      permission_mode: permissionMode,
+      plan_mode: planMode,
+      swarm_mode: false
+    }
   });
   const escaped = encodeURIComponent(String(session.id));
   const profile = {
@@ -455,7 +478,7 @@ async function startJob(options) {
       model: K3_MODEL,
       system_prompt: systemPrompt.trim(),
       thinking: "max",
-      permission_mode: "auto",
+      permission_mode: permissionMode,
       plan_mode: planMode,
       swarm_mode: false,
       ...(readOnly ? { tools: READ_ONLY_TOOLS } : {})
@@ -463,16 +486,24 @@ async function startJob(options) {
   };
   await callApi("POST", `/api/v1/sessions/${escaped}/profile`, profile);
   const configured = await callApi("GET", `/api/v1/sessions/${escaped}/status`);
-  if (configured.model !== K3_MODEL || configured.thinking_level !== "max" || Boolean(configured.plan_mode)) {
+  if (
+    configured.model !== K3_MODEL ||
+    configured.thinking_level !== "max" ||
+    configured.permission !== permissionMode ||
+    Boolean(configured.plan_mode)
+  ) {
     throw new Error(`Kimi session configuration verification failed for ${session.id}.`);
   }
 
   const submitted = await callApi("POST", `/api/v1/sessions/${escaped}/prompts`, {
-    content: [{ type: "text", text: prompt }],
+    // Kimi Code 0.26 accepts profile system_prompt/tools fields but does not
+    // apply them on its legacy REST route. Keep the profile fields for newer
+    // servers and repeat the collaboration contract in the task for 0.26.
+    content: [{ type: "text", text: `${systemPrompt.trim()}\n\nTask from Codex:\n${prompt.trim()}` }],
     metadata: { delegated_by: "codex", collaboration: options.focus },
     model: K3_MODEL,
     thinking: "max",
-    permission_mode: "auto",
+    permission_mode: permissionMode,
     plan_mode: planMode,
     swarm_mode: false
   });
@@ -492,6 +523,24 @@ async function startJob(options) {
     verified_k3: configured.model === K3_MODEL,
     persistent_server: true
   };
+}
+
+async function rejectAnalysisApproval(sessionId, approval) {
+  const approvalId = String(approval.approval_id || "").trim();
+  if (!approvalId) throw new Error("Kimi approval event did not include an approval id.");
+  try {
+    return await callApi(
+      "POST",
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(approvalId)}`,
+      {
+        decision: "rejected",
+        feedback: "Codex requested read-only analysis. Use Read, Grep, Glob, ReadMediaFile, WebSearch, or FetchURL instead."
+      }
+    );
+  } catch (error) {
+    if (String(error).includes("40902")) return { resolved: false };
+    throw error;
+  }
 }
 
 async function getLatestAssistantText(sessionId) {
@@ -759,6 +808,28 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
         if (!record) {
           const synced = await syncJobRecord(sessionId, null);
           record = synced.record;
+        }
+        if (record.mode === "analyze" && frame.type === "event.approval.requested") {
+          await rejectAnalysisApproval(sessionId, frame.payload);
+          const toolCallId = String(frame.payload.tool_call_id || "");
+          if (!toolCallId) throw new Error("Kimi approval event did not include a tool call id.");
+          record.denied_tool_call_ids = [...new Set([...(record.denied_tool_call_ids || []), toolCallId])];
+          applyK3Event(record, frame);
+          writeJobRecord(record);
+          onText(actionLine(renderState, `Denied ${frame.payload.tool_name || "approval-gated tool"} in read-only analysis`));
+          continue;
+        }
+        if (
+          record.mode === "analyze" &&
+          (frame.type === "tool.call.started" || frame.type === "tool.result") &&
+          record.denied_tool_call_ids?.includes(frame.payload.toolCallId)
+        ) {
+          applyK3Event(record, frame);
+          if (frame.type === "tool.result") {
+            record.denied_tool_call_ids = record.denied_tool_call_ids.filter((id) => id !== frame.payload.toolCallId);
+          }
+          writeJobRecord(record);
+          continue;
         }
         if (record.mode === "analyze" && frame.type === "tool.call.started" && !READ_ONLY_TOOLS.includes(frame.payload.name)) {
           applyK3Event(record, frame);
