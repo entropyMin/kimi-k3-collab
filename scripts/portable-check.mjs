@@ -24,47 +24,143 @@ for (const script of [bridge, mcpServer, websocketModule, selfTest]) {
 }
 
 const { applyK3Event, createRenderState, renderK3Event } = await import(pathToFileURL(bridge));
-const { parseBridgeFooter, toolDefinition, toolDefinitions } = await import(pathToFileURL(mcpServer));
+const {
+  browserCommand,
+  browserToolDefinition,
+  panelResource,
+  parseBridgeFooter,
+  receiveToolDefinition,
+  startToolDefinition,
+  toolDefinitions
+} = await import(pathToFileURL(mcpServer));
 const { connectLocalWebSocket } = await import(pathToFileURL(websocketModule));
 const footer = parseBridgeFooter("---\nKimi K3 session: session_mcp\nMode: analyze\nFocus: engineering\nStatus: completed\nModel: kimi-code/k3 (verified)\n");
 if (footer.sessionId !== "session_mcp" || footer.status !== "completed" || footer.model !== "kimi-code/k3" || !footer.verifiedK3) {
   throw new Error("The MCP server did not preserve the K3 verification footer.");
 }
 if (
-  toolDefinition.name !== "collaborate_with_k3" ||
-  toolDefinition.inputSchema.properties.max_wait_seconds.maximum !== 3600 ||
+  startToolDefinition.name !== "start_k3_collaboration" ||
+  startToolDefinition._meta?.ui?.resourceUri !== panelResource.uri ||
+  startToolDefinition._meta?.["openai/outputTemplate"] !== panelResource.uri ||
+  panelResource.mimeType !== "text/html;profile=mcp-app" ||
   toolDefinitions.map((tool) => tool.name).join(",") !==
-    "collaborate_with_k3,start_k3_job,get_k3_status,get_k3_result,cancel_k3_job"
+    "start_k3_collaboration,open_k3_panel,send_k3_message,receive_k3_events,open_k3_in_browser,get_k3_status,get_k3_result,cancel_k3_job"
 ) {
-  throw new Error("The foreground/background MCP tool contract is invalid.");
+  throw new Error("The direct MCP Apps tool contract is invalid.");
+}
+if (
+  browserToolDefinition._meta?.ui?.visibility?.join(",") !== "app" ||
+  browserToolDefinition._meta?.["openai/visibility"] !== "private" ||
+  browserToolDefinition._meta?.["openai/widgetAccessible"] !== true ||
+  browserCommand("http://127.0.0.1:1/#token=test", "win32").command !== "rundll32.exe" ||
+  browserCommand("http://127.0.0.1:1/#token=test", "darwin").command !== "open" ||
+  browserCommand("http://127.0.0.1:1/#token=test", "linux").command !== "xdg-open"
+) {
+  throw new Error("The private cross-platform Kimi browser launcher contract is invalid.");
+}
+const sendDefinition = toolDefinitions.find((tool) => tool.name === "send_k3_message");
+if (
+  sendDefinition?._meta?.ui?.visibility?.join(",") !== "model,app" ||
+  sendDefinition?._meta?.["openai/widgetAccessible"] !== true
+) {
+  throw new Error("The K3 panel cannot send direct app-initiated follow-up messages.");
+}
+if (
+  receiveToolDefinition._meta?.ui?.visibility?.join(",") !== "app" ||
+  receiveToolDefinition._meta?.["openai/visibility"] !== "private" ||
+  receiveToolDefinition._meta?.["openai/widgetAccessible"] !== true
+) {
+  throw new Error("The pushed K3 event receiver is not private and app-only.");
+}
+
+function websocketFrame(value) {
+  const payload = Buffer.from(JSON.stringify(value));
+  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  if (payload.length <= 0xffff) {
+    const header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+    return Buffer.concat([header, payload]);
+  }
+  const header = Buffer.alloc(10);
+  header[0] = 0x81;
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(payload.length), 2);
+  return Buffer.concat([header, payload]);
 }
 
 const mcpFixtureHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-mcp-"));
 const stubBridge = path.join(mcpFixtureHome, "stub-bridge.mjs");
+const fixtureToken = "fixture-secret-token";
+const relayServer = http.createServer();
+const relaySockets = new Set();
+let relayAuthenticated = false;
+let relayConnectionCount = 0;
+relayServer.on("upgrade", (request, socket) => {
+  relayConnectionCount += 1;
+  relayAuthenticated ||= request.headers.authorization === `Bearer ${fixtureToken}`;
+  relaySockets.add(socket);
+  socket.once("close", () => relaySockets.delete(socket));
+  const accept = createHash("sha1")
+    .update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+    .digest("base64");
+  const headers = Buffer.from([
+    "HTTP/1.1 101 Switching Protocols",
+    "Upgrade: websocket",
+    "Connection: Upgrade",
+    `Sec-WebSocket-Accept: ${accept}`,
+    "",
+    ""
+  ].join("\r\n"));
+  const sharedToolStart = { type: "tool.call.started", session_id: "session_portable_mcp", seq: 3, payload: { toolCallId: "tool_fixture", name: "Read", args: { path: "README.md" } } };
+  const frames = relayConnectionCount === 1
+    ? [
+        { type: "server_hello", payload: { protocol_version: 1 } },
+        { type: "turn.started", session_id: "session_portable_mcp", seq: 1, payload: { turnId: "turn_fixture" } },
+        { type: "assistant.delta", session_id: "session_portable_mcp", seq: 2, volatile: true, offset: 0, payload: { turnId: "turn_fixture", delta: "A" } },
+        { type: "assistant.delta", session_id: "session_portable_mcp", seq: 2, volatile: true, offset: 1, payload: { turnId: "turn_fixture", delta: "B" } },
+        sharedToolStart
+      ]
+    : [
+        { type: "server_hello", payload: { protocol_version: 1 } },
+        sharedToolStart,
+        { type: "tool.progress", session_id: "session_portable_mcp", seq: 4, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "x".repeat(300000) } } },
+        { type: "tool.progress", session_id: "session_portable_mcp", seq: 4, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "y".repeat(300000) } } },
+        { type: "tool.result", session_id: "session_portable_mcp", seq: 5, payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
+        { type: "turn.ended", session_id: "session_portable_mcp", seq: 6, payload: { turnId: "turn_fixture", reason: "completed" } }
+      ];
+  socket.write(Buffer.concat([headers, ...frames.map(websocketFrame)]));
+  if (relayConnectionCount === 1) setTimeout(() => socket.destroy(), 20);
+});
+await new Promise((resolve) => relayServer.listen(0, "127.0.0.1", resolve));
+const relayPort = relayServer.address().port;
+fs.mkdirSync(path.join(mcpFixtureHome, "server"), { recursive: true });
+fs.writeFileSync(
+  path.join(mcpFixtureHome, "server", "lock"),
+  JSON.stringify({ host: "127.0.0.1", port: relayPort }),
+  "utf8"
+);
+fs.writeFileSync(path.join(mcpFixtureHome, "server.token"), fixtureToken, "utf8");
 fs.writeFileSync(stubBridge, `
 import fs from "node:fs";
-import path from "node:path";
-const [action, ...args] = process.argv.slice(2);
-const value = (flag) => args[args.indexOf(flag) + 1];
+const [action] = process.argv.slice(2);
 const session = "session_portable_mcp";
-const stateFile = path.join(process.env.KIMI_CODE_HOME, "stub-count");
 const footer = (status) => \`---\\nKimi K3 session: \${session}\\nMode: analyze\\nFocus: engineering\\nStatus: \${status}\\nModel: kimi-code/k3 (verified)\\n\`;
 if (action === "start") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
   process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
+} else if (action === "send") {
+  if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
+  process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "status") {
   process.stdout.write(JSON.stringify({ session_id: session, state: "completed", busy: false, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
+} else if (action === "result") {
+  process.stdout.write(\`# Stub K3 report\\n\\nOriginal Markdown.\\n\\n\${footer("completed")}\`);
 } else if (action === "cancel") {
   process.stdout.write(JSON.stringify({ session_id: session, prompt_id: "prompt_stub", aborted: true }));
-} else if (action === "watch" && process.env.KIMI_K3_STUB_HANG === "1") {
-  fs.writeFileSync(path.join(process.env.KIMI_CODE_HOME, "stub-watch-started"), "1");
-  setTimeout(() => {}, 10000);
-} else if (action === "watch" && value("--wait-seconds") === "0") {
-  process.stdout.write(\`# Stub K3 report\\n\\nOriginal Markdown.\\n\\n\${footer("completed")}\`);
-} else if (action === "watch") {
-  const count = fs.existsSync(stateFile) ? Number(fs.readFileSync(stateFile, "utf8")) + 1 : 1;
-  fs.writeFileSync(stateFile, String(count));
-  process.stdout.write(count === 1 ? \`K3 · Turn started\\n\${footer("running")}\` : \`K3 · Read completed\\n\${footer("completed")}\`);
+} else if (action === "ensure") {
+  process.stdout.write(JSON.stringify({ healthy: true, model: "kimi-code/k3" }));
 } else {
   process.exit(3);
 }
@@ -76,7 +172,7 @@ const mcpChild = spawn(process.execPath, [mcpServer], {
     ...process.env,
     KIMI_K3_BRIDGE: stubBridge,
     KIMI_CODE_HOME: mcpFixtureHome,
-    KIMI_K3_DISABLE_BACKGROUND_WORKER: "1"
+    KIMI_K3_BROWSER_TEST: "1"
   }
 });
 let mcpExited = false;
@@ -113,57 +209,145 @@ try {
 
   const initialized = await request(1, "initialize", { protocolVersion: "2025-11-25" });
   const listed = await request(2, "tools/list", {});
-  const foreground = await request(3, "tools/call", {
-    name: "collaborate_with_k3",
-    arguments: { prompt: "Stub review", mode: "analyze", focus: "engineering", cwd: root, max_wait_seconds: 5 }
+  const resources = await request(3, "resources/list", {});
+  const panel = await request(4, "resources/read", { uri: panelResource.uri });
+  let nextRequestId = 5;
+  const started = await request(nextRequestId++, "tools/call", {
+    name: "start_k3_collaboration",
+    arguments: { prompt: "Stub review", mode: "analyze", focus: "engineering", cwd: root }
   });
-  const started = await request(4, "tools/call", {
-    name: "start_k3_job",
-    arguments: { prompt: "Background stub review", mode: "analyze", focus: "engineering", cwd: root }
+  let relayCursor = 0;
+  let relayGeneration = "";
+  const relayedFrames = [];
+  let maxRelayedBatchBytes = 0;
+  for (let attempt = 0; attempt < 10 && !relayedFrames.some((frame) => frame.type === "turn.ended"); attempt += 1) {
+    const received = await request(nextRequestId++, "tools/call", {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_portable_mcp", after_cursor: relayCursor, wait_ms: 1000 }
+    });
+    const batch = received.result?.structuredContent;
+    relayGeneration ||= batch?.relay_generation || "";
+    maxRelayedBatchBytes = Math.max(maxRelayedBatchBytes, Buffer.byteLength(JSON.stringify(batch?.events || []), "utf8"));
+    relayedFrames.push(...(batch?.events || []));
+    relayCursor = batch?.cursor ?? relayCursor;
+  }
+  const opened = await request(nextRequestId++, "tools/call", {
+    name: "open_k3_panel",
+    arguments: { session_id: "session_portable_mcp" }
   });
-  const status = await request(5, "tools/call", {
+  const browserOpened = await request(nextRequestId++, "tools/call", {
+    name: "open_k3_in_browser",
+    arguments: { session_id: "session_portable_mcp" }
+  });
+  const messaged = await request(nextRequestId++, "tools/call", {
+    name: "send_k3_message",
+    arguments: { session_id: "session_portable_mcp", prompt: "Challenge the retry policy." }
+  });
+  const status = await request(nextRequestId++, "tools/call", {
     name: "get_k3_status",
     arguments: { session_id: "session_portable_mcp" }
   });
-  const result = await request(6, "tools/call", {
+  const result = await request(nextRequestId++, "tools/call", {
     name: "get_k3_result",
     arguments: { session_id: "session_portable_mcp" }
   });
-  const cancelled = await request(7, "tools/call", {
+  const cancelled = await request(nextRequestId++, "tools/call", {
     name: "cancel_k3_job",
     arguments: { session_id: "session_portable_mcp" }
   });
-  const invalid = await request(8, "tools/call", {
-    name: "collaborate_with_k3",
+  const invalid = await request(nextRequestId++, "tools/call", {
+    name: "start_k3_collaboration",
     arguments: { prompt: "Invalid cwd", cwd: "." }
   });
 
-  if (initialized.result?.serverInfo?.name !== "Kimi K3 Collab" || listed.result?.tools?.length !== 5) {
-    throw new Error("The MCP stdio server did not advertise the K3 collaboration tool.");
-  }
-  const toolResult = foreground.result;
-  const resultText = toolResult?.content?.[0]?.text || "";
   if (
-    toolResult?.structuredContent?.status !== "completed" ||
-    toolResult.structuredContent.action_count !== 2 ||
-    !resultText.includes("K3 · Turn started") ||
-    !resultText.includes("K3 · Read completed") ||
-    !resultText.includes("# Stub K3 report")
+    initialized.result?.serverInfo?.name !== "Kimi K3 Collab" ||
+    listed.result?.tools?.length !== 8 ||
+    resources.result?.resources?.[0]?.uri !== panelResource.uri ||
+    panel.result?.contents?.[0]?.mimeType !== panelResource.mimeType ||
+    !panel.result?.contents?.[0]?.text?.includes("Kimi K3 live session") ||
+    !panel.result?.contents?.[0]?.text?.includes("[hidden] { display: none !important; }") ||
+    !panel.result?.contents?.[0]?.text?.includes("value?.result?._meta") ||
+    panel.result?.contents?.[0]?.text?.includes("new WebSocket") ||
+    panel.result?.contents?.[0]?.text?.includes("kimi-code.bearer.") ||
+    !panel.result?.contents?.[0]?.text?.includes("receive_k3_events") ||
+    !panel.result?.contents?.[0]?.text?.includes("open_k3_in_browser") ||
+    !panel.result?.contents?.[0]?.text?.includes("send_k3_message") ||
+    !panel.result?.contents?.[0]?.text?.includes("stream gap: resumed at source offset") ||
+    panel.result?.contents?.[0]?.text?.includes("<iframe") ||
+    panel.result?.contents?.[0]?._meta?.ui?.csp?.connectDomains !== undefined ||
+    panel.result?.contents?.[0]?._meta?.ui?.csp?.frameDomains !== undefined ||
+    panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.connect_domains?.length !== 0 ||
+    panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.frame_domains !== undefined ||
+    !panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.redirect_domains?.includes("http://127.0.0.1:58627")
   ) {
-    throw new Error("The MCP delegate/watch flow lost K3 actions or the original Markdown report.");
+    throw new Error("The MCP server did not advertise the K3 tools and app resource.");
   }
+
+  const panelScript = panel.result?.contents?.[0]?.text?.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  if (!panelScript) throw new Error("The K3 event panel script is missing.");
+  Function(panelScript);
+
+  const privatePanelUrl = started.result?._meta?.["kimi-k3/panelUrl"];
+  const openedPanelUrl = opened.result?._meta?.["kimi-k3/panelUrl"];
+  const privateToken = started.result?._meta?.["kimi-k3/token"];
+  const privateOrigin = started.result?._meta?.["kimi-k3/origin"];
+  const modelVisible = JSON.stringify({
+    content: started.result?.content,
+    structuredContent: started.result?.structuredContent
+  });
   if (
     started.result?.structuredContent?.status !== "running" ||
-    started.result.structuredContent.background_worker_started !== false ||
+    started.result?.structuredContent?.server_reported_model !== "kimi-code/k3" ||
+    !started.result?.structuredContent?.verified_k3 ||
+    !privatePanelUrl?.endsWith(`#token=${fixtureToken}`) ||
+    privateToken !== undefined ||
+    privateOrigin !== undefined ||
+    openedPanelUrl !== privatePanelUrl ||
+    browserOpened.result?.structuredContent?.opened !== true ||
+    JSON.stringify(browserOpened.result?.structuredContent).includes(fixtureToken) ||
+    modelVisible.includes(fixtureToken) ||
+    JSON.stringify(opened.result?.structuredContent).includes(fixtureToken) ||
+    messaged.result?.structuredContent?.status !== "running" ||
     status.result?.structuredContent?.status !== "completed" ||
     !result.result?.content?.[0]?.text?.includes("# Stub K3 report") ||
     !cancelled.result?.structuredContent?.aborted ||
-    [started, status, result, cancelled].some((message) => message.result?.content?.[0]?.text?.trimStart().startsWith("{"))
+    !relayAuthenticated ||
+    !relayGeneration ||
+    relayConnectionCount < 2 ||
+    relayedFrames.filter((frame) => frame.type === "assistant.delta" && frame.seq === 2).length !== 2 ||
+    relayedFrames.filter((frame) => frame.type === "tool.call.started" && frame.seq === 3).length !== 1 ||
+    !relayedFrames.some((frame) => frame.type === "tool.result") ||
+    maxRelayedBatchBytes > 520000 ||
+    relayCursor < relayedFrames.length ||
+    [started, opened, browserOpened, messaged, status, result, cancelled].some((message) =>
+      message.result?.content?.[0]?.text?.trimStart().startsWith("{")
+    )
   ) {
-    throw new Error("The background MCP job flow lost readable status, result, or cancellation output.");
+    throw new Error("The direct K3 panel, messaging, fallback, or token-isolation contract failed.");
   }
   if (!invalid.result?.isError || invalid.error) {
     throw new Error("MCP tool execution errors are not returned with the MCP isError result shape.");
+  }
+  const cancelledReceiveId = nextRequestId++;
+  mcpChild.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: cancelledReceiveId,
+    method: "tools/call",
+    params: {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_portable_mcp", after_cursor: relayCursor, wait_ms: 1000 }
+    }
+  })}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  mcpChild.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    method: "notifications/cancelled",
+    params: { requestId: cancelledReceiveId, reason: "portable cancellation check" }
+  })}\n`);
+  const pingAfterCancellation = await request(nextRequestId++, "ping", {});
+  if (!pingAfterCancellation.result || pingAfterCancellation.error) {
+    throw new Error("Cancelling an app event receive blocked the MCP server.");
   }
   mcpChild.stdin.end();
   const exitCode = await Promise.race([
@@ -172,47 +356,10 @@ try {
   ]);
   mcpExited = true;
   if (exitCode !== 0) throw new Error(`The MCP server exited with code ${exitCode} after stdin closed.`);
-
-  const lifecycleChild = spawn(process.execPath, [mcpServer], {
-    stdio: ["pipe", "ignore", "pipe"],
-    windowsHide: true,
-    env: {
-      ...process.env,
-      KIMI_K3_BRIDGE: stubBridge,
-      KIMI_CODE_HOME: mcpFixtureHome,
-      KIMI_K3_DISABLE_BACKGROUND_WORKER: "1",
-      KIMI_K3_STUB_HANG: "1"
-    }
-  });
-  let lifecycleExited = false;
-  try {
-    lifecycleChild.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 20, method: "initialize", params: {} })}\n`);
-    lifecycleChild.stdin.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 21,
-      method: "tools/call",
-      params: {
-        name: "collaborate_with_k3",
-        arguments: { prompt: "Keep running", mode: "analyze", focus: "engineering", cwd: root }
-      }
-    })}\n`);
-    const watchStarted = path.join(mcpFixtureHome, "stub-watch-started");
-    for (let attempt = 0; !fs.existsSync(watchStarted) && attempt < 40; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    if (!fs.existsSync(watchStarted)) throw new Error("The active MCP bridge fixture did not start.");
-    lifecycleChild.stdin.end();
-    const lifecycleExitCode = await Promise.race([
-      new Promise((resolve) => lifecycleChild.once("exit", (code) => resolve(code))),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("The MCP server left an active bridge child after stdin closed.")), 2000))
-    ]);
-    lifecycleExited = true;
-    if (lifecycleExitCode !== 0) throw new Error(`The active MCP server exited with code ${lifecycleExitCode}.`);
-  } finally {
-    if (!lifecycleExited) lifecycleChild.kill();
-  }
 } finally {
   if (!mcpExited) mcpChild.kill();
+  for (const socket of relaySockets) socket.destroy();
+  await new Promise((resolve) => relayServer.close(resolve));
   fs.rmSync(mcpFixtureHome, { recursive: true, force: true });
 }
 const renderState = createRenderState();
@@ -310,8 +457,15 @@ if (
 const pluginManifest = JSON.parse(fs.readFileSync(path.join(root, ".codex-plugin", "plugin.json"), "utf8"));
 const mcpManifest = JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf8"));
 const mcpConfig = mcpManifest.mcpServers?.["kimi-k3"];
-if (pluginManifest.mcpServers !== "./.mcp.json" || mcpConfig?.args?.[0] !== "./scripts/mcp-server.mjs" || mcpConfig.tool_timeout_sec < 3660) {
-  throw new Error("The plugin MCP server or long-running tool timeout is not configured.");
+if (
+  pluginManifest.mcpServers !== "./.mcp.json" ||
+  mcpConfig?.args?.[0] !== "./scripts/mcp-server.mjs" ||
+  !Number.isInteger(mcpConfig.tool_timeout_sec) ||
+  mcpConfig.tool_timeout_sec < 1 ||
+  mcpConfig.tool_timeout_sec > 120 ||
+  mcpConfig.supports_parallel_tool_calls !== true
+) {
+  throw new Error("The plugin MCP server or bounded tool timeout is not configured.");
 }
 
 const bridgeText = fs.readFileSync(bridge, "utf8");
@@ -325,8 +479,27 @@ if (
   throw new Error("Analysis is still coupled to Kimi plan mode or constraint-drift cancellation.");
 }
 const mcpServerText = fs.readFileSync(mcpServer, "utf8");
-if (!mcpServerText.includes('lines.on("close", closeTransport)') || !mcpServerText.includes('error?.code === "EPIPE"')) {
+if (!mcpServerText.includes('lines.on("close", () => {') || !mcpServerText.includes('error?.code === "EPIPE"')) {
   throw new Error("The MCP stdio transport does not shut down cleanly after its client disconnects.");
+}
+if (
+  mcpServerText.includes("collaborate_with_k3") ||
+  mcpServerText.includes("start_k3_job") ||
+  mcpServerText.includes("setInterval(") ||
+  !mcpServerText.includes('const PANEL_MIME = "text/html;profile=mcp-app"') ||
+  !mcpServerText.includes('"kimi-k3/panelUrl"') ||
+  mcpServerText.includes('"kimi-k3/token"') ||
+  mcpServerText.includes('"kimi-k3/origin"') ||
+  !mcpServerText.includes('name: "receive_k3_events"') ||
+  !mcpServerText.includes('name: "open_k3_in_browser"') ||
+  !mcpServerText.includes('visibility: ["app"]') ||
+  !mcpServerText.includes("MAX_RELAY_BUFFER_BYTES") ||
+  !mcpServerText.includes("MAX_EVENT_BATCH_BYTES") ||
+  !mcpServerText.includes("relay_generation") ||
+  mcpServerText.includes("frameDomains") ||
+  mcpServerText.includes("frame_domains")
+) {
+  throw new Error("The MCP server still contains the old polling/iframe path or lacks the private event panel contract.");
 }
 if (!bridgeText.includes('"TodoList"') || !bridgeText.includes("Do not call Bash")) {
   throw new Error("Analysis mode does not allow safe planning while forbidding shell execution.");

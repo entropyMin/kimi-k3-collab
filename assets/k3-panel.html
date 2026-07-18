@@ -1,0 +1,862 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --surface: #f4f6f8;
+        --panel: #ffffff;
+        --panel-muted: #f8f9fa;
+        --text: #182026;
+        --muted: #68737d;
+        --line: #dce1e5;
+        --accent: #147d64;
+        --accent-soft: #e8f5f0;
+        --danger: #a33b35;
+        --danger-soft: #faecea;
+        --running: #b36b00;
+        --running-soft: #fff4dc;
+      }
+
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+
+      body {
+        margin: 0;
+        background: var(--surface);
+        color: var(--text);
+      }
+
+      button, textarea { font: inherit; }
+
+      .shell {
+        display: grid;
+        grid-template-rows: auto minmax(470px, 72vh) auto;
+        min-height: 580px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel);
+      }
+
+      header {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .identity { min-width: 0; flex: 1; }
+
+      .title-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 680;
+        letter-spacing: -0.01em;
+      }
+
+      #connection {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      #connection::before {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--muted);
+        content: "";
+      }
+
+      #connection.live::before { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+      #connection.busy::before { background: var(--running); box-shadow: 0 0 0 3px var(--running-soft); }
+      #connection.error::before { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+
+      #session {
+        display: block;
+        overflow: hidden;
+        margin-top: 3px;
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        font-size: 11px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .actions { display: flex; flex: none; gap: 8px; }
+
+      button {
+        min-height: 34px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 0 11px;
+        background: var(--panel);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 620;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+
+      button:hover { border-color: var(--accent); color: var(--accent); }
+      button:active { transform: translateY(1px); }
+      button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      button:disabled { cursor: not-allowed; opacity: 0.5; }
+
+      #stage {
+        min-height: 0;
+        overflow: auto;
+        padding: 14px;
+        background: var(--surface);
+        scroll-behavior: smooth;
+      }
+
+      #empty {
+        display: grid;
+        min-height: 100%;
+        place-content: center;
+        gap: 8px;
+        padding: 28px;
+        text-align: center;
+      }
+
+      #empty strong { font-size: 14px; }
+      #empty span { max-width: 52ch; color: var(--muted); font-size: 13px; line-height: 1.5; }
+      #empty.error strong { color: var(--danger); }
+
+      #timeline {
+        display: grid;
+        width: min(100%, 920px);
+        margin: 0 auto;
+        gap: 9px;
+      }
+
+      .event {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--panel);
+      }
+
+      .event-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 36px;
+        padding: 8px 10px;
+      }
+
+      .event-icon {
+        display: grid;
+        width: 23px;
+        height: 23px;
+        flex: none;
+        place-content: center;
+        border-radius: 6px;
+        background: var(--panel-muted);
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        font-size: 11px;
+        font-weight: 700;
+      }
+
+      .event.running .event-icon { background: var(--running-soft); color: var(--running); }
+      .event.success .event-icon { background: var(--accent-soft); color: var(--accent); }
+      .event.failure .event-icon { background: var(--danger-soft); color: var(--danger); }
+
+      .event-title { min-width: 0; flex: 1; font-size: 12px; font-weight: 650; }
+      .event-detail { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+      .event-time { flex: none; color: var(--muted); font-size: 10px; }
+
+      .message .event-head { border-bottom: 1px solid var(--line); }
+
+      .markdown {
+        overflow-wrap: anywhere;
+        margin: 0;
+        padding: 12px;
+        color: var(--text);
+        font: 12.5px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+        white-space: pre-wrap;
+      }
+
+      details { border-top: 1px solid var(--line); }
+      summary { padding: 8px 10px; color: var(--muted); font-size: 11px; cursor: pointer; }
+
+      .raw {
+        overflow: auto;
+        max-height: 280px;
+        margin: 0;
+        padding: 10px;
+        background: var(--panel-muted);
+        color: var(--muted);
+        font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+        white-space: pre-wrap;
+      }
+
+      .notice {
+        padding: 9px 11px;
+        border-style: dashed;
+        background: transparent;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.45;
+      }
+
+      .composer {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 9px;
+        padding: 10px 12px;
+        border-top: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      textarea {
+        width: 100%;
+        min-height: 38px;
+        max-height: 140px;
+        resize: vertical;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 9px 10px;
+        background: var(--panel-muted);
+        color: var(--text);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      #send { min-width: 74px; border-color: var(--accent); background: var(--accent); color: #fff; }
+      #send:hover { background: color-mix(in srgb, var(--accent) 88%, #000); color: #fff; }
+
+      @media (max-width: 600px) {
+        .shell { grid-template-rows: auto minmax(430px, 68vh) auto; border-radius: 0; }
+        header { align-items: flex-start; flex-wrap: wrap; }
+        .identity { flex-basis: 100%; }
+        .actions { width: 100%; }
+        .actions button { flex: 1; }
+        #stage { padding: 9px; }
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --surface: #10151a;
+          --panel: #181e24;
+          --panel-muted: #12181d;
+          --text: #edf1f4;
+          --muted: #99a4ae;
+          --line: #343d46;
+          --accent: #64c7a9;
+          --accent-soft: #193c33;
+          --danger: #f18b83;
+          --danger-soft: #432523;
+          --running: #f0b45e;
+          --running-soft: #44341e;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #stage { scroll-behavior: auto; }
+        button:active { transform: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <div class="identity">
+          <div class="title-row">
+            <h1>Kimi K3 live session</h1>
+            <span id="connection">Waiting</span>
+          </div>
+          <span id="session">Waiting for private session metadata</span>
+        </div>
+        <div class="actions">
+          <button id="fullscreen" type="button">Full screen</button>
+          <button id="external" type="button" disabled>Open Kimi Code</button>
+        </div>
+      </header>
+
+      <section id="stage" aria-live="polite">
+        <div id="empty">
+          <strong>Connecting to Kimi K3</strong>
+          <span>This panel subscribes to Kimi's pushed events. It does not poll and Codex does not rewrite the output.</span>
+        </div>
+        <div id="timeline" hidden></div>
+      </section>
+
+      <form id="composer" class="composer">
+        <textarea id="prompt" rows="1" placeholder="Message this K3 session directly…" aria-label="Message Kimi K3" disabled></textarea>
+        <button id="send" type="submit" disabled>Send</button>
+      </form>
+    </main>
+
+    <script>
+      const elements = {
+        connection: document.getElementById("connection"),
+        session: document.getElementById("session"),
+        external: document.getElementById("external"),
+        fullscreen: document.getElementById("fullscreen"),
+        stage: document.getElementById("stage"),
+        empty: document.getElementById("empty"),
+        timeline: document.getElementById("timeline"),
+        composer: document.getElementById("composer"),
+        prompt: document.getElementById("prompt"),
+        send: document.getElementById("send")
+      };
+
+      const state = {
+        sessionId: "",
+        panelUrl: "",
+        cursor: 0,
+        relayGeneration: "",
+        generation: 0,
+        receiveFailures: 0,
+        terminal: false,
+        disposed: false,
+        tools: new Map(),
+        subagents: new Map(),
+        assistants: new Map(),
+        currentTurnId: "",
+        lastLocalPrompt: "",
+        lastLocalPromptAt: 0
+      };
+
+      function hiddenMeta(value) {
+        const candidates = [
+          value,
+          value?._meta,
+          value?.result?._meta,
+          value?.mcp_tool_result?._meta,
+          value?.call_tool_result?._meta,
+          value?.mcp_tool_result?.result?._meta,
+          value?.call_tool_result?.result?._meta,
+          value?.metadata?._meta
+        ];
+        return candidates.find((item) => item && (
+          item["kimi-k3/sessionId"] || item["kimi-k3/panelUrl"]
+        )) || null;
+      }
+
+      function privateConnection(meta) {
+        const panelUrl = meta?.["kimi-k3/panelUrl"] || "";
+        const sessionId = meta?.["kimi-k3/sessionId"] || "";
+        if (!sessionId) return null;
+        return { sessionId, panelUrl };
+      }
+
+      function setConnection(label, kind = "") {
+        elements.connection.textContent = label;
+        elements.connection.className = kind;
+      }
+
+      function nearBottom() {
+        return elements.stage.scrollHeight - elements.stage.scrollTop - elements.stage.clientHeight < 90;
+      }
+
+      function revealTimeline() {
+        elements.empty.hidden = true;
+        elements.timeline.hidden = false;
+      }
+
+      function scrollAfter(update) {
+        const follow = nearBottom();
+        update();
+        if (follow) elements.stage.scrollTop = elements.stage.scrollHeight;
+      }
+
+      function nowLabel() {
+        return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date());
+      }
+
+      function eventCard({ icon = "·", title, detail = "", status = "", className = "" }) {
+        const card = document.createElement("article");
+        card.className = `event ${status} ${className}`.trim();
+        const head = document.createElement("div");
+        head.className = "event-head";
+        const iconNode = document.createElement("span");
+        iconNode.className = "event-icon";
+        iconNode.textContent = icon;
+        const titleNode = document.createElement("span");
+        titleNode.className = "event-title";
+        titleNode.textContent = title;
+        const detailNode = document.createElement("span");
+        detailNode.className = "event-detail";
+        detailNode.textContent = detail;
+        const time = document.createElement("time");
+        time.className = "event-time";
+        time.textContent = nowLabel();
+        head.append(iconNode, titleNode, detailNode, time);
+        card.append(head);
+        card.parts = { title: titleNode, detail: detailNode };
+        return card;
+      }
+
+      function appendCard(card) {
+        scrollAfter(() => {
+          revealTimeline();
+          elements.timeline.append(card);
+        });
+        return card;
+      }
+
+      function addNotice(text, failure = false) {
+        const card = eventCard({ icon: failure ? "!" : "i", title: text, status: failure ? "failure" : "", className: "notice" });
+        return appendCard(card);
+      }
+
+      function safeText(value, maximum = 60000) {
+        let text;
+        try {
+          text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+        } catch {
+          text = String(value);
+        }
+        // ponytail: cap giant tool payloads to keep the live panel responsive; use Kimi Code for the full artifact.
+        return text.length <= maximum ? text : `${text.slice(0, maximum)}\n\n[truncated in live panel]`;
+      }
+
+      function addRawDetails(card, label, value) {
+        if (value === undefined || value === null || value === "") return;
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = label;
+        const pre = document.createElement("pre");
+        pre.className = "raw";
+        pre.textContent = safeText(value);
+        details.append(summary, pre);
+        card.append(details);
+      }
+
+      function describeTool(payload) {
+        const display = payload.display || {};
+        if (display.kind === "command") return display.command || payload.description || "Running command";
+        if (display.kind === "file_io") return [display.operation, display.path].filter(Boolean).join(" ");
+        if (display.kind === "diff") return `Reviewing ${display.path || "diff"}`;
+        if (display.kind === "search") return `Searching ${display.query || ""}${display.scope ? ` in ${display.scope}` : ""}`;
+        if (display.kind === "url_fetch") return `Fetching ${display.url || "URL"}`;
+        if (display.kind === "agent_call") return `Calling ${display.agent_name || "subagent"}`;
+        if (display.kind === "skill_call") return `Using ${display.skill_name || "skill"}`;
+        if (display.kind === "task") return display.description || display.status || "Task";
+        if (display.kind === "task_stop") return `Stopping ${display.task_description || "task"}`;
+        if (display.kind === "generic") return display.summary || payload.description || "Working";
+        return payload.description || "Working";
+      }
+
+      function assistantBlock(turnId) {
+        const key = turnId || state.currentTurnId || "current";
+        let item = state.assistants.get(key);
+        if (item) return item;
+        const card = eventCard({ icon: "K3", title: "Kimi K3", detail: "Original Markdown stream", status: "running", className: "message" });
+        const pre = document.createElement("pre");
+        pre.className = "markdown";
+        card.append(pre);
+        item = { card, pre, sourceOffset: 0 };
+        state.assistants.set(key, item);
+        appendCard(card);
+        return item;
+      }
+
+      function appendAssistant(frame) {
+        const payload = frame.payload || {};
+        let delta = String(payload.delta || "");
+        if (!delta) return;
+        const item = assistantBlock(payload.turnId);
+        const offset = Number(frame.offset);
+        if (Number.isInteger(offset) && offset >= 0) {
+          if (offset < item.sourceOffset) {
+            const overlap = item.sourceOffset - offset;
+            delta = delta.slice(Math.min(overlap, delta.length));
+          } else if (offset > item.sourceOffset) {
+            scrollAfter(() => {
+              item.pre.textContent += `\n\n[stream gap: resumed at source offset ${offset}]\n\n`;
+            });
+            item.sourceOffset = offset;
+          }
+        }
+        if (!delta) return;
+        item.sourceOffset += delta.length;
+        scrollAfter(() => { item.pre.textContent += delta; });
+      }
+
+      function showUserMessage(text, label = "Codex → K3") {
+        if (!text.trim()) return;
+        const card = eventCard({ icon: "→", title: label, detail: "Direct message", status: "success", className: "message" });
+        const pre = document.createElement("pre");
+        pre.className = "markdown";
+        pre.textContent = text.trim();
+        card.append(pre);
+        appendCard(card);
+      }
+
+      function codexPromptFromContext(payload) {
+        for (const message of payload.messages || []) {
+          if (message.role !== "user") continue;
+          for (const content of message.content || []) {
+            if (content.type !== "text") continue;
+            const text = String(content.text || "");
+            const match = text.match(/\n\n(?:Task from Codex|Follow-up from Codex):\n([\s\S]*)$/);
+            if (match) return match[1].trim();
+          }
+        }
+        return "";
+      }
+
+      function handleTool(frame) {
+        const payload = frame.payload || {};
+        const id = payload.toolCallId || `${payload.name || "tool"}-${frame.seq || Date.now()}`;
+        if (frame.type === "tool.call.started") {
+          const card = eventCard({ icon: "T", title: payload.name || "Tool", detail: describeTool(payload), status: "running" });
+          addRawDetails(card, "Arguments", payload.args);
+          state.tools.set(id, { card, payload, argumentsPart: "" });
+          appendCard(card);
+          return;
+        }
+        let tool = state.tools.get(id);
+        if (!tool) {
+          const card = eventCard({ icon: "T", title: payload.name || "Tool", detail: payload.description || "Tool activity", status: "running" });
+          tool = { card, payload, argumentsPart: "" };
+          state.tools.set(id, tool);
+          appendCard(card);
+        }
+        if (frame.type === "tool.call.delta") {
+          tool.argumentsPart += String(payload.argumentsPart || "");
+          return;
+        }
+        if (frame.type === "tool.progress") {
+          tool.card.parts.detail.textContent = payload.update?.message || payload.update?.description || payload.update?.status || "Working";
+          return;
+        }
+        if (frame.type === "tool.result") {
+          tool.card.classList.remove("running");
+          tool.card.classList.add(payload.isError ? "failure" : "success");
+          tool.card.parts.detail.textContent = payload.isError ? "Failed" : "Completed";
+          if (tool.argumentsPart) addRawDetails(tool.card, "Arguments", tool.argumentsPart);
+          addRawDetails(tool.card, "Tool output", payload.output);
+        }
+      }
+
+      function handleSubagent(frame) {
+        const payload = frame.payload || {};
+        const id = payload.subagentId || `${frame.type}-${frame.seq || Date.now()}`;
+        let card = state.subagents.get(id);
+        if (frame.type === "subagent.spawned" || !card) {
+          card = eventCard({
+            icon: "A",
+            title: payload.subagentName || "K3 subagent",
+            detail: payload.description || "Spawned by K3",
+            status: "running"
+          });
+          state.subagents.set(id, card);
+          appendCard(card);
+        }
+        const phase = frame.type.split(".").at(-1);
+        card.parts.detail.textContent = [phase, payload.description].filter(Boolean).join(" · ");
+        if (phase === "completed") { card.classList.remove("running"); card.classList.add("success"); }
+        if (phase === "failed") { card.classList.remove("running"); card.classList.add("failure"); }
+        addRawDetails(card, "Subagent result", payload.result || payload.output);
+      }
+
+      function handleFrame(frame) {
+        if (!frame || typeof frame !== "object") return;
+        if (frame.type === "server_hello") {
+          setConnection("Live", "live");
+          elements.prompt.disabled = false;
+          elements.send.disabled = false;
+          return;
+        }
+        if (frame.type === "ping") return;
+        if (frame.type === "ack") {
+          if (Number(frame.code || 0) !== 0) addNotice(`Kimi subscription failed: ${frame.msg || frame.code}`, true);
+          if (frame.payload?.resync_required?.includes(state.sessionId)) {
+            addNotice("Earlier buffered events expired; live events continue from the server's current cursor.");
+          }
+          return;
+        }
+        if (frame.type === "resync_required") {
+          addNotice("Kimi refreshed the event cursor after history compaction. Live streaming continues.");
+          return;
+        }
+        if (frame.type === "relay.status") {
+          if (frame.payload?.status === "connected") {
+            setConnection("Live", "live");
+            addNotice("K3 event relay reconnected.");
+          } else if (frame.payload?.terminal) {
+            state.terminal = true;
+            setConnection("Disconnected", "error");
+            addNotice(`K3 event relay stopped: ${frame.payload?.message || "terminal connection error"}`, true);
+          } else {
+            setConnection("Reconnecting", "error");
+            addNotice(`K3 event relay reconnecting: ${frame.payload?.message || "connection interrupted"}`, true);
+          }
+          return;
+        }
+        if (frame.type === "error" && !frame.session_id) {
+          addNotice(frame.payload?.msg || "Kimi WebSocket error", true);
+          if (frame.payload?.fatal) {
+            setConnection("Disconnected", "error");
+          }
+          return;
+        }
+        if (frame.session_id && frame.session_id !== state.sessionId) return;
+
+        const payload = frame.payload || {};
+        if (frame.type === "assistant.delta") { appendAssistant(frame); return; }
+        if (frame.type === "thinking.delta") { setConnection("K3 is thinking", "busy"); return; }
+        if (frame.type === "turn.started") {
+          state.currentTurnId = payload.turnId || `turn-${frame.seq || Date.now()}`;
+          setConnection("K3 is working", "busy");
+          addNotice("K3 turn started");
+          return;
+        }
+        if (frame.type === "turn.ended" || frame.type === "prompt.completed" || frame.type === "prompt.aborted") {
+          const reason = payload.reason || frame.type.split(".").at(-1);
+          const assistant = state.assistants.get(payload.turnId || state.currentTurnId);
+          if (assistant) { assistant.card.classList.remove("running"); assistant.card.classList.add(reason === "completed" ? "success" : ""); }
+          setConnection(reason === "completed" ? "Idle" : reason, reason === "completed" ? "live" : "");
+          addNotice(`K3 ${frame.type.replace(".", " ")}: ${reason}`);
+          return;
+        }
+        if (frame.type === "context.spliced") {
+          const text = codexPromptFromContext(payload);
+          const duplicate = text && text === state.lastLocalPrompt && Date.now() - state.lastLocalPromptAt < 15000;
+          if (text && !duplicate) showUserMessage(text);
+          return;
+        }
+        if (["tool.call.started", "tool.call.delta", "tool.progress", "tool.result"].includes(frame.type)) {
+          handleTool(frame);
+          return;
+        }
+        if (frame.type.startsWith("subagent.")) { handleSubagent(frame); return; }
+        if (frame.type.startsWith("task.") || frame.type.startsWith("background.task.")) {
+          appendCard(eventCard({ icon: "#", title: frame.type, detail: payload.description || payload.status || "", status: frame.type.endsWith("terminated") ? "success" : "running" }));
+          return;
+        }
+        if (frame.type === "warning" || frame.type === "error" || frame.type === "event.approval.requested") {
+          addNotice(payload.message || payload.msg || payload.description || frame.type, frame.type === "error");
+          return;
+        }
+        if (frame.type === "agent.status.updated" && payload.phase) {
+          setConnection(String(payload.phase), "busy");
+        }
+      }
+
+      function callResult(response) {
+        const candidates = [
+          response?.result,
+          response?.mcp_tool_result?.result,
+          response?.call_tool_result?.result,
+          response?.mcp_tool_result,
+          response?.call_tool_result,
+          response
+        ];
+        return candidates.find((item) => item && (
+          item.structuredContent || item.structured_content || item.content || item.isError
+        )) || response;
+      }
+
+      function batchFrom(response) {
+        const result = callResult(response);
+        return result?.structuredContent || result?.structured_content || {};
+      }
+
+      function wait(milliseconds) {
+        return new Promise((resolve) => setTimeout(resolve, milliseconds));
+      }
+
+      function terminalReceiveError(error) {
+        return /(?:session_id|after_cursor|wait_ms) must|unsupported characters|unknown tool/i.test(String(error));
+      }
+
+      async function receiveLoop(generation) {
+        while (!state.disposed && generation === state.generation && state.sessionId) {
+          try {
+            if (!window.openai?.callTool) throw new Error("The MCP Apps tool bridge is unavailable.");
+            const response = await window.openai.callTool("receive_k3_events", {
+              session_id: state.sessionId,
+              after_cursor: state.cursor,
+              wait_ms: 45000
+            });
+            if (generation !== state.generation || state.disposed) return;
+            const result = callResult(response);
+            const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
+            if (result?.isError) throw new Error(errorText || "The K3 event relay rejected the receive call.");
+            const batch = batchFrom(response);
+            if (batch.relay_generation) {
+              if (state.relayGeneration && state.relayGeneration !== batch.relay_generation) {
+                state.relayGeneration = batch.relay_generation;
+                state.cursor = 0;
+                state.tools = new Map();
+                state.subagents = new Map();
+                state.assistants = new Map();
+                state.currentTurnId = "";
+                elements.timeline.replaceChildren();
+                elements.timeline.hidden = true;
+                elements.empty.hidden = false;
+                addNotice("K3 event relay restarted; replaying the retained session stream.");
+                continue;
+              }
+              state.relayGeneration = batch.relay_generation;
+            }
+            elements.prompt.disabled = false;
+            elements.send.disabled = false;
+            if (["Connecting", "Reconnecting", "Relay unavailable"].includes(elements.connection.textContent)) {
+              setConnection("Live", "live");
+            }
+            if (batch.dropped_before_cursor != null) {
+              addNotice("The live panel buffer rolled over; continuing with the oldest retained K3 event.");
+            }
+            for (const frame of batch.events || []) handleFrame(frame);
+            if (Number.isInteger(batch.cursor)) state.cursor = Math.max(state.cursor, batch.cursor);
+            state.receiveFailures = 0;
+            if (state.terminal) return;
+          } catch (error) {
+            if (generation !== state.generation || state.disposed) return;
+            state.receiveFailures += 1;
+            const delay = Math.min(10000, 500 * (2 ** Math.min(state.receiveFailures, 5)));
+            setConnection("Relay unavailable", "error");
+            if (state.receiveFailures === 1 || terminalReceiveError(error)) {
+              addNotice(`K3 event receive failed: ${error instanceof Error ? error.message : String(error)}`, true);
+            }
+            if (terminalReceiveError(error)) return;
+            await wait(delay);
+          }
+        }
+      }
+
+      function configure(value) {
+        const connection = privateConnection(hiddenMeta(value));
+        if (!connection) return false;
+        if (connection.sessionId === state.sessionId) return true;
+        state.generation += 1;
+        Object.assign(state, connection, {
+          cursor: 0,
+          relayGeneration: "",
+          receiveFailures: 0,
+          disposed: false,
+          terminal: false,
+          tools: new Map(),
+          subagents: new Map(),
+          assistants: new Map(),
+          currentTurnId: ""
+        });
+        elements.timeline.replaceChildren();
+        elements.timeline.hidden = true;
+        elements.empty.hidden = false;
+        elements.empty.className = "";
+        elements.empty.querySelector("strong").textContent = "Connecting to Kimi K3";
+        elements.empty.querySelector("span").textContent = "Receiving K3 output and actions directly from Kimi's pushed event stream.";
+        elements.session.textContent = state.sessionId;
+        elements.external.disabled = !state.sessionId;
+        setConnection("Connecting", "busy");
+        void receiveLoop(state.generation);
+        return true;
+      }
+
+      function showMetadataError() {
+        elements.empty.hidden = false;
+        elements.empty.classList.add("error");
+        elements.empty.querySelector("strong").textContent = "Private session metadata is unavailable";
+        elements.empty.querySelector("span").textContent = "Reopen the K3 panel from a start_k3_collaboration result.";
+        setConnection("Unavailable", "error");
+      }
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (message?.jsonrpc === "2.0" && message.method === "ui/notifications/tool-result") configure(message.params);
+      }, { passive: true });
+
+      window.addEventListener("openai:set_globals", (event) => {
+        configure(event.detail?.globals?.toolResponseMetadata);
+      }, { passive: true });
+
+      elements.fullscreen.addEventListener("click", async () => {
+        try { await window.openai?.requestDisplayMode?.({ mode: "fullscreen" }); }
+        catch (error) {
+          elements.fullscreen.disabled = true;
+          elements.fullscreen.title = `Full screen is unavailable: ${String(error)}`;
+        }
+      });
+
+      elements.external.addEventListener("click", async () => {
+        if (!state.sessionId) return;
+        elements.external.disabled = true;
+        try {
+          if (window.openai?.callTool) {
+            const response = await window.openai.callTool("open_k3_in_browser", { session_id: state.sessionId });
+            const result = callResult(response);
+            const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
+            if (result?.isError) throw new Error(errorText || "Kimi Code could not be opened.");
+          } else if (window.openai?.openExternal && state.panelUrl) {
+            await window.openai.openExternal({ href: state.panelUrl, redirectUrl: false });
+          } else if (state.panelUrl) {
+            window.open(state.panelUrl, "_blank", "noopener,noreferrer");
+          } else {
+            throw new Error("The authenticated Kimi Code URL is unavailable.");
+          }
+        } catch (error) {
+          addNotice(`Open Kimi Code failed: ${error instanceof Error ? error.message : String(error)}`, true);
+        } finally {
+          elements.external.disabled = false;
+        }
+      });
+
+      elements.composer.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const prompt = elements.prompt.value.trim();
+        if (!prompt || !state.sessionId || !window.openai?.callTool) return;
+        elements.prompt.disabled = true;
+        elements.send.disabled = true;
+        state.lastLocalPrompt = prompt;
+        state.lastLocalPromptAt = Date.now();
+        showUserMessage(prompt, "You → K3");
+        try {
+          const response = await window.openai.callTool("send_k3_message", { session_id: state.sessionId, prompt });
+          const result = response?.result || response;
+          const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
+          if (result?.isError) throw new Error(errorText || "Kimi rejected the message.");
+          elements.prompt.value = "";
+        } catch (error) {
+          addNotice(`Message failed: ${error instanceof Error ? error.message : String(error)}`, true);
+        } finally {
+          elements.prompt.disabled = false;
+          elements.send.disabled = false;
+          elements.prompt.focus();
+        }
+      });
+
+      elements.prompt.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          elements.composer.requestSubmit();
+        }
+      });
+
+      window.addEventListener("beforeunload", () => {
+        state.disposed = true;
+        state.generation += 1;
+      }, { once: true });
+
+      if (!configure(window.openai?.toolResponseMetadata)) {
+        setTimeout(() => {
+          if (!state.sessionId) showMetadataError();
+        }, 5000);
+      }
+    </script>
+  </body>
+</html>

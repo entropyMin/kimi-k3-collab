@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,23 +9,35 @@ import process from "node:process";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
+import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
+
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = path.dirname(path.dirname(THIS_FILE));
 const BRIDGE = path.resolve(process.env.KIMI_K3_BRIDGE || path.join(ROOT, "scripts", "kimi-k3.mjs"));
-const JOB_ROOT = path.join(path.resolve(process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code")), "codex-jobs");
+const KIMI_HOME = path.resolve(process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code"));
+const JOB_ROOT = path.join(KIMI_HOME, "codex-jobs");
+const LOCK_FILE = path.join(KIMI_HOME, "server", "lock");
+const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
+const PANEL_FILE = path.join(ROOT, "assets", "k3-panel.html");
+const PANEL_URI = "ui://kimi-k3/live-session-v3.html";
+const PANEL_MIME = "text/html;profile=mcp-app";
+const DEFAULT_KIMI_ORIGIN = "http://127.0.0.1:58627";
+const K3_MODEL = "kimi-code/k3";
 const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, ".codex-plugin", "plugin.json"), "utf8")).version;
 const PROTOCOL_VERSION = "2025-11-25";
-const FOREGROUND_TOOL = "collaborate_with_k3";
-const START_TOOL = "start_k3_job";
-const STATUS_TOOL = "get_k3_status";
-const RESULT_TOOL = "get_k3_result";
-const CANCEL_TOOL = "cancel_k3_job";
-const WINDOW_SECONDS = 105;
-const DEFAULT_MAX_WAIT_SECONDS = 3600;
-const TERMINAL_STATES = new Set(["completed", "blocked", "failed", "cancelled", "stopped", "error"]);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const activeChildren = new Map();
 const activeRequests = new Set();
 const cancelledRequests = new Set();
+const relayReceivers = new Map();
+const relays = new Map();
+const MAX_RELAY_EVENTS = 2000;
+const MAX_EVENT_BATCH = 100;
+const MAX_RELAY_BUFFER_BYTES = 16 * 1024 * 1024;
+const MAX_EVENT_BATCH_BYTES = 512 * 1024;
+const MAX_RELAY_FAILURES = 30;
+const RELAY_IDLE_MS = 3 * 60 * 1000;
+const DEFAULT_RECEIVE_WAIT_MS = 45000;
 let transportClosed = false;
 
 function closeTransport() {
@@ -32,11 +45,12 @@ function closeTransport() {
   transportClosed = true;
   for (const requestId of activeRequests) cancelledRequests.add(requestId);
   for (const child of activeChildren.values()) child.kill();
+  for (const cancel of relayReceivers.values()) cancel();
+  for (const relay of relays.values()) relay.stop();
 }
 
 function send(message) {
-  if (transportClosed) return;
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  if (!transportClosed) process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
 process.stdout.on("error", (error) => {
@@ -92,18 +106,6 @@ function parseJobArguments(value) {
   };
 }
 
-function parseForegroundArguments(value) {
-  const input = requireObject(value);
-  const maxWaitSeconds = input.max_wait_seconds === undefined ? DEFAULT_MAX_WAIT_SECONDS : Number(input.max_wait_seconds);
-  if (!Number.isInteger(maxWaitSeconds) || maxWaitSeconds < 1 || maxWaitSeconds > DEFAULT_MAX_WAIT_SECONDS) {
-    throw new Error(`max_wait_seconds must be an integer from 1 to ${DEFAULT_MAX_WAIT_SECONDS}.`);
-  }
-  if (typeof input.session_id === "string" && input.session_id.trim()) {
-    return { sessionId: requireSessionId(input.session_id), maxWaitSeconds };
-  }
-  return { sessionId: null, maxWaitSeconds, ...parseJobArguments(input) };
-}
-
 function parseSessionArguments(value) {
   return { sessionId: requireSessionId(requireObject(value).session_id) };
 }
@@ -130,25 +132,7 @@ function normalizeStatus(value) {
   return value === "end_turn" ? "completed" : value;
 }
 
-function isActionLine(line) {
-  return line.startsWith("K3 · ") && !line.includes("Stream checkpoint saved");
-}
-
-function actionTracePath(sessionId) {
-  return path.join(JOB_ROOT, `${requireSessionId(sessionId)}.actions.log`);
-}
-
-function readActionTrace(sessionId) {
-  const file = actionTracePath(sessionId);
-  return fs.existsSync(file) ? fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean) : [];
-}
-
-function appendAction(sessionId, line) {
-  fs.mkdirSync(JOB_ROOT, { recursive: true });
-  fs.appendFileSync(actionTracePath(sessionId), `${line}\n`, "utf8");
-}
-
-function runBridgeWindow(requestId, args, onLine = () => {}, stdinText = "") {
+function runBridgeWindow(requestId, args, stdinText = "") {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE, ...args], {
       cwd: ROOT,
@@ -160,28 +144,15 @@ function runBridgeWindow(requestId, args, onLine = () => {}, stdinText = "") {
     child.stdin.end(stdinText);
     let stdout = "";
     let stderr = "";
-    let lineBuffer = "";
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      lineBuffer += chunk;
-      let newline = lineBuffer.indexOf("\n");
-      while (newline !== -1) {
-        onLine(lineBuffer.slice(0, newline).replace(/\r$/, ""));
-        lineBuffer = lineBuffer.slice(newline + 1);
-        newline = lineBuffer.indexOf("\n");
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.once("error", reject);
     child.once("close", (code, signal) => {
       activeChildren.delete(requestId);
-      if (lineBuffer) onLine(lineBuffer);
       if (cancelledRequests.has(requestId)) {
-        reject(new Error("MCP call cancelled; the persistent K3 session can be resumed by session_id."));
+        reject(new Error("MCP call cancelled; the persistent K3 session continues."));
       } else if (code !== 0) {
         reject(new Error(stderr.trim() || `Kimi bridge exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}.`));
       } else {
@@ -192,21 +163,12 @@ function runBridgeWindow(requestId, args, onLine = () => {}, stdinText = "") {
 }
 
 async function runBridgeJson(requestId, args, stdinText = "") {
-  const result = await runBridgeWindow(requestId, args, () => {}, stdinText);
+  const result = await runBridgeWindow(requestId, args, stdinText);
   try {
     return JSON.parse(result.stdout);
   } catch {
     throw new Error("Kimi bridge returned invalid JSON.");
   }
-}
-
-function sendProgress(progressToken, progress, message) {
-  if (progressToken === undefined || progressToken === null) return;
-  send({
-    jsonrpc: "2.0",
-    method: "notifications/progress",
-    params: { progressToken, progress, message }
-  });
 }
 
 async function startJob(requestId, input) {
@@ -218,152 +180,445 @@ async function startJob(requestId, input) {
     ],
     input.prompt
   );
+  if (!job.verified_k3 || job.server_reported_model !== K3_MODEL) {
+    throw new Error(`Kimi server did not verify ${K3_MODEL}.`);
+  }
   return { ...job, session_id: requireSessionId(job.session_id) };
 }
 
-function structuredJob(job, actionCount = 0) {
+function structuredJob(job) {
   return {
     session_id: job.session_id,
     status: normalizeStatus(job.state || job.status || "running"),
     mode: job.mode || null,
     focus: job.focus || null,
     server_reported_model: job.server_reported_model || job.explicit_model || null,
-    verified_k3: Boolean(job.verified_k3),
-    action_count: actionCount
+    verified_k3: Boolean(job.verified_k3)
   };
 }
 
-function actionTraceText(actions) {
-  return actions.length ? `## K3 actions\n\n${actions.join("\n")}\n\n` : "";
+function latestSessionId() {
+  const file = path.join(JOB_ROOT, "latest.json");
+  if (!fs.existsSync(file)) return null;
+  try {
+    return requireSessionId(JSON.parse(fs.readFileSync(file, "utf8")).session_id);
+  } catch {
+    return null;
+  }
 }
 
-async function collaborate(requestId, rawArguments, progressToken) {
-  const input = parseForegroundArguments(rawArguments);
-  const deadline = Date.now() + input.maxWaitSeconds * 1000;
-  let actions = input.sessionId ? readActionTrace(input.sessionId) : [];
-  let progress = 0;
-  let sessionId = input.sessionId;
-  let footer = { sessionId, status: "running", mode: input.mode ?? null, focus: input.focus ?? null };
-
-  if (!sessionId) {
-    const job = await startJob(requestId, input);
-    sessionId = job.session_id;
-    footer = {
-      sessionId,
-      status: normalizeStatus(job.state || "running"),
-      mode: job.mode || input.mode,
-      focus: job.focus || input.focus,
-      model: job.server_reported_model || job.explicit_model || null,
-      verifiedK3: Boolean(job.verified_k3)
-    };
-    actions = readActionTrace(sessionId);
-    sendProgress(progressToken, ++progress, `K3 session started: ${sessionId}`);
-  }
-
-  const onLine = (line) => {
-    if (!isActionLine(line)) return;
-    actions.push(line);
-    appendAction(sessionId, line);
-    sendProgress(progressToken, ++progress, line);
-  };
-
-  while (Date.now() < deadline && !TERMINAL_STATES.has(footer.status)) {
-    if (cancelledRequests.has(requestId)) throw new Error("MCP call cancelled; the persistent K3 session continues.");
-    const remainingSeconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
-    const waitSeconds = Math.min(WINDOW_SECONDS, remainingSeconds);
-    const window = await runBridgeWindow(
-      requestId,
-      ["watch", "--format", "text", "--session-id", sessionId, "--wait-seconds", String(waitSeconds)],
-      onLine
-    );
-    footer = { ...footer, ...parseBridgeFooter(window.stdout) };
-    sessionId = requireSessionId(footer.sessionId ?? sessionId);
-  }
-
-  const durable = await runBridgeWindow(
-    requestId,
-    ["watch", "--format", "text", "--session-id", sessionId, "--wait-seconds", "0"],
-    onLine
-  );
-  footer = { ...footer, ...parseBridgeFooter(durable.stdout) };
+function readPanelService() {
+  const lock = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+  const host = String(lock.host ?? "");
+  const port = Number(lock.port);
+  if (!LOOPBACK_HOSTS.has(host)) throw new Error(`Refusing non-loopback Kimi server host: ${host}`);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Kimi server lock has an invalid port.");
+  const token = fs.readFileSync(TOKEN_FILE, "utf8").trim();
+  if (!token) throw new Error("Kimi server token is empty.");
+  const urlHost = host === "::1" ? "[::1]" : host;
   return {
-    content: [{ type: "text", text: `${actionTraceText(actions)}${durable.stdout.trimStart()}` }],
-    structuredContent: {
-      session_id: sessionId,
-      status: footer.status,
-      mode: footer.mode,
-      focus: footer.focus,
-      server_reported_model: footer.model,
-      verified_k3: footer.verifiedK3,
-      action_count: actions.length
+    origin: `http://${urlHost}:${port}`,
+    token,
+    host,
+    port,
+    headers: { Authorization: `Bearer ${token}` }
+  };
+}
+
+async function ensurePanelService(requestId) {
+  try {
+    return readPanelService();
+  } catch {
+    await runBridgeJson(requestId, ["ensure", "--format", "json"]);
+    return readPanelService();
+  }
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function safeRelayError(error) {
+  return (error instanceof Error ? error.message : String(error))
+    .replace(/(authorization\s*:\s*bearer)\s+\S+/gi, "$1 [redacted]")
+    .slice(0, 500);
+}
+
+class SessionRelay {
+  constructor(sessionId) {
+    this.sessionId = sessionId;
+    this.generation = randomUUID();
+    this.buffer = [];
+    this.bufferBytes = 0;
+    this.localCursor = 0;
+    this.serverCursor = { seq: 0 };
+    this.durableKeys = new Set();
+    this.waiters = new Map();
+    this.websocket = null;
+    this.loop = null;
+    this.stopped = false;
+    this.outage = false;
+    this.lastReceiveAt = Date.now();
+  }
+
+  start() {
+    if (this.loop || this.stopped || transportClosed) return;
+    this.loop = this.run().finally(() => { this.loop = null; });
+  }
+
+  stop() {
+    this.stopped = true;
+    this.websocket?.close();
+    this.websocket = null;
+    for (const finish of [...this.waiters.values()]) finish();
+    if (relays.get(this.sessionId) === this) relays.delete(this.sessionId);
+  }
+
+  enqueue(frame) {
+    const bytes = Buffer.byteLength(JSON.stringify(frame), "utf8");
+    this.localCursor += 1;
+    this.buffer.push({ cursor: this.localCursor, frame, bytes });
+    this.bufferBytes += bytes;
+    while (
+      this.buffer.length > 1 &&
+      (this.buffer.length > MAX_RELAY_EVENTS || this.bufferBytes > MAX_RELAY_BUFFER_BYTES)
+    ) {
+      this.bufferBytes -= this.buffer.shift().bytes;
+    }
+    for (const finish of [...this.waiters.values()]) finish();
+  }
+
+  batch(afterCursor) {
+    const firstCursor = this.buffer[0]?.cursor ?? this.localCursor + 1;
+    const entries = [];
+    let batchBytes = 0;
+    for (const entry of this.buffer) {
+      if (entry.cursor <= afterCursor) continue;
+      if (entries.length >= MAX_EVENT_BATCH) break;
+      if (entries.length > 0 && batchBytes + entry.bytes > MAX_EVENT_BATCH_BYTES) break;
+      entries.push(entry);
+      batchBytes += entry.bytes;
+    }
+    return {
+      session_id: this.sessionId,
+      relay_generation: this.generation,
+      cursor: entries.at(-1)?.cursor ?? Math.max(afterCursor, this.localCursor),
+      events: entries.map((entry) => entry.frame),
+      dropped_before_cursor: afterCursor < firstCursor - 1 ? firstCursor : null
+    };
+  }
+
+  receive(requestId, afterCursor, waitMs) {
+    this.lastReceiveAt = Date.now();
+    const immediate = this.batch(afterCursor);
+    if (immediate.events.length > 0 || immediate.dropped_before_cursor != null || waitMs === 0) {
+      return Promise.resolve(immediate);
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.waiters.delete(requestId);
+        relayReceivers.delete(requestId);
+        resolve(this.batch(afterCursor));
+      };
+      const timer = setTimeout(finish, waitMs);
+      this.waiters.set(requestId, finish);
+      relayReceivers.set(requestId, finish);
+    });
+  }
+
+  updateServerCursor(frame) {
+    if (!Number.isInteger(frame?.seq) || frame.volatile === true) return;
+    if (frame.epoch && frame.epoch !== this.serverCursor.epoch) {
+      this.serverCursor = { seq: frame.seq, epoch: frame.epoch };
+      return;
+    }
+    this.serverCursor = {
+      seq: Math.max(this.serverCursor.seq || 0, frame.seq),
+      ...(frame.epoch || this.serverCursor.epoch ? { epoch: frame.epoch || this.serverCursor.epoch } : {})
+    };
+  }
+
+  isDuplicateDurable(frame) {
+    if (!Number.isInteger(frame?.seq) || frame.volatile === true) return false;
+    const key = `${frame.epoch || this.serverCursor.epoch || ""}:${frame.seq}:${frame.type || ""}`;
+    if (this.durableKeys.has(key)) return true;
+    this.durableKeys.add(key);
+    if (this.durableKeys.size > MAX_RELAY_EVENTS) this.durableKeys.delete(this.durableKeys.values().next().value);
+    return false;
+  }
+
+  async run() {
+    let reconnectDelay = 250;
+    let consecutiveFailures = 0;
+    while (!this.stopped && !transportClosed) {
+      if (Date.now() - this.lastReceiveAt >= RELAY_IDLE_MS) {
+        this.stop();
+        break;
+      }
+      let websocket;
+      try {
+        const service = await ensurePanelService(`relay:${this.sessionId}`);
+        const clientId = `codex-k3-relay-${process.pid}-${randomUUID()}`;
+        websocket = await connectLocalWebSocket({
+          host: service.host,
+          port: service.port,
+          headers: service.headers,
+          pathname: `/api/v1/ws?client_id=${encodeURIComponent(clientId)}`
+        });
+        this.websocket = websocket;
+        const helloId = randomUUID();
+        websocket.sendJson({
+          type: "client_hello",
+          id: helloId,
+          payload: {
+            client_id: clientId,
+            subscriptions: [this.sessionId],
+            cursors: { [this.sessionId]: this.serverCursor }
+          }
+        });
+        while (!this.stopped && !transportClosed) {
+          const message = await websocket.nextMessage(30000);
+          if (message == null) continue;
+          let frame;
+          try {
+            frame = JSON.parse(message);
+          } catch {
+            continue;
+          }
+          if (frame.type === "ping") {
+            websocket.sendJson({ type: "pong", payload: { nonce: String(frame.payload?.nonce || "") } });
+            continue;
+          }
+          const recovered = frame.session_id === this.sessionId || (
+            frame.type === "ack" && frame.id === helloId && Number(frame.code) === 0
+          );
+          if (recovered) {
+            if (this.outage) {
+              this.outage = false;
+              this.enqueue({
+                type: "relay.status",
+                session_id: this.sessionId,
+                volatile: true,
+                payload: { status: "connected", message: "K3 event relay reconnected." }
+              });
+            }
+            consecutiveFailures = 0;
+            reconnectDelay = 250;
+          }
+          if (frame.type === "ack" && frame.id === helloId) {
+            if (Number(frame.code) !== 0) {
+              const error = new Error(`Kimi WebSocket subscription failed: ${frame.msg || frame.code}`);
+              error.terminal = true;
+              throw error;
+            }
+            if (frame.payload?.resync_required?.includes(this.sessionId)) {
+              const cursor = frame.payload?.cursors?.[this.sessionId];
+              if (Number.isInteger(cursor?.seq)) this.serverCursor = cursor;
+            }
+          }
+          if (frame.type === "resync_required" && frame.payload?.session_id === this.sessionId) {
+            this.serverCursor = {
+              seq: Number(frame.payload.current_seq || 0),
+              ...(frame.payload.epoch ? { epoch: frame.payload.epoch } : {})
+            };
+          }
+          if (frame.session_id && frame.session_id !== this.sessionId) continue;
+          if (this.isDuplicateDurable(frame)) continue;
+          this.updateServerCursor(frame);
+          this.enqueue(frame);
+          if (frame.type === "error" && frame.payload?.fatal) {
+            throw new Error(`Kimi WebSocket error: ${frame.payload.msg || frame.payload.code}`);
+          }
+        }
+      } catch (error) {
+        if (this.stopped || transportClosed) break;
+        consecutiveFailures += 1;
+        const terminal = error?.terminal === true || consecutiveFailures >= MAX_RELAY_FAILURES;
+        if (!this.outage || terminal) {
+          this.enqueue({
+            type: "relay.status",
+            session_id: this.sessionId,
+            volatile: true,
+            payload: {
+              status: terminal ? "failed" : "reconnecting",
+              message: safeRelayError(error),
+              terminal
+            }
+          });
+        }
+        this.outage = true;
+        if (terminal) {
+          this.stop();
+          break;
+        }
+        try {
+          await runBridgeJson(`relay-ensure:${this.sessionId}`, ["ensure", "--format", "json"]);
+        } catch {
+          // The next reconnect attempt will retry service discovery.
+        }
+        await sleep(reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 4000);
+      } finally {
+        if (this.websocket === websocket) this.websocket = null;
+        websocket?.close();
+      }
+    }
+  }
+}
+
+function relayFor(sessionId) {
+  let relay = relays.get(sessionId);
+  if (!relay) {
+    relay = new SessionRelay(sessionId);
+    relays.set(sessionId, relay);
+  }
+  relay.start();
+  return relay;
+}
+
+function panelUrl(service, sessionId) {
+  const route = sessionId ? `/sessions/${encodeURIComponent(sessionId)}` : "/";
+  return `${service.origin}${route}#token=${encodeURIComponent(service.token)}`;
+}
+
+export function browserCommand(url, platform = process.platform) {
+  if (platform === "win32") return { command: "rundll32.exe", args: ["url.dll,FileProtocolHandler", url] };
+  if (platform === "darwin") return { command: "open", args: [url] };
+  if (platform === "linux") return { command: "xdg-open", args: [url] };
+  throw new Error(`Opening a browser is unsupported on ${platform}.`);
+}
+
+function launchBrowser(url) {
+  if (process.env.KIMI_K3_BROWSER_TEST === "1") return Promise.resolve();
+  const { command, args } = browserCommand(url);
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
+}
+
+function panelOrigins() {
+  const origins = new Set([DEFAULT_KIMI_ORIGIN, "http://localhost:58627"]);
+  try {
+    origins.add(readPanelService().origin);
+  } catch {
+    // The render tool starts Kimi before the panel is mounted.
+  }
+  return [...origins];
+}
+
+function panelToolResult(sessionId, service, details, text) {
+  const url = panelUrl(service, sessionId);
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: { ...details, session_id: sessionId, view: "kimi-event-stream" },
+    _meta: {
+      "kimi-k3/panelUrl": url,
+      "kimi-k3/sessionId": sessionId
     }
   };
 }
 
-function spawnBackgroundFollower(sessionId) {
-  if (process.env.KIMI_K3_DISABLE_BACKGROUND_WORKER === "1") return false;
-  const child = spawn(process.execPath, [THIS_FILE, "--follow-session", requireSessionId(sessionId)], {
-    cwd: ROOT,
-    env: process.env,
-    detached: true,
-    windowsHide: true,
-    stdio: "ignore"
-  });
-  child.unref();
-  return true;
-}
-
-async function startBackgroundJob(requestId, rawArguments) {
+async function startCollaboration(requestId, rawArguments) {
   const input = parseJobArguments(rawArguments);
   const job = await startJob(requestId, input);
-  const followerStarted = spawnBackgroundFollower(job.session_id);
-  const status = normalizeStatus(job.state || "running");
+  const service = await ensurePanelService(requestId);
+  relayFor(job.session_id);
+  const details = structuredJob(job);
   const text = [
-    "# Kimi K3 job started",
-    "",
+    "Kimi K3 collaboration started.",
     `Session: ${job.session_id}`,
-    `Mode: ${job.mode || input.mode}`,
-    `Focus: ${job.focus || input.focus}`,
-    `Status: ${status}`,
-    `Model: ${job.server_reported_model || job.explicit_model || "unknown"} (${job.verified_k3 ? "verified" : "NOT VERIFIED"})`,
-    "",
-    "The job is running independently. Do not poll automatically; use get_k3_status or get_k3_result only when the user asks."
+    `Mode: ${details.mode}`,
+    `Focus: ${details.focus}`,
+    `Model: ${details.server_reported_model} (${details.verified_k3 ? "verified" : "NOT VERIFIED"})`,
+    "The live panel renders Kimi's raw pushed frames through the server relay."
   ].join("\n");
+  return panelToolResult(job.session_id, service, details, text);
+}
+
+async function openPanel(requestId, rawArguments) {
+  const input = requireObject(rawArguments);
+  const sessionId = input.session_id ? requireSessionId(input.session_id) : latestSessionId();
+  const service = await ensurePanelService(requestId);
+  const details = sessionId
+    ? await runBridgeJson(requestId, ["status", "--format", "json", "--session-id", sessionId])
+    : { status: "idle", mode: null, focus: null, server_reported_model: null, verified_k3: false };
+  const text = sessionId
+    ? `Opened the direct Kimi K3 event stream.\nSession: ${sessionId}`
+    : "Opened Kimi K3. Start or select a session in the live panel.";
+  if (sessionId) relayFor(sessionId);
+  return panelToolResult(sessionId, service, structuredJob({ ...details, session_id: sessionId }), text);
+}
+
+async function openK3InBrowser(requestId, rawArguments) {
+  const { sessionId } = parseSessionArguments(rawArguments);
+  const service = await ensurePanelService(requestId);
+  await launchBrowser(panelUrl(service, sessionId));
   return {
-    content: [{ type: "text", text }],
-    structuredContent: { ...structuredJob(job), background_worker_started: followerStarted }
+    content: [{ type: "text", text: `Opened Kimi Code in the default browser.\nSession: ${sessionId}` }],
+    structuredContent: { session_id: sessionId, opened: true }
+  };
+}
+
+async function sendMessageToK3(requestId, rawArguments) {
+  const input = requireObject(rawArguments);
+  const sessionId = requireSessionId(input.session_id);
+  const prompt = requireString(input.prompt, "prompt");
+  const result = await runBridgeJson(
+    requestId,
+    ["send", "--format", "json", "--session-id", sessionId],
+    prompt
+  );
+  return {
+    content: [{ type: "text", text: `Follow-up sent directly to Kimi K3.\nSession: ${sessionId}` }],
+    structuredContent: structuredJob({ ...result, session_id: sessionId })
+  };
+}
+
+async function receiveK3Events(requestId, rawArguments) {
+  const input = requireObject(rawArguments);
+  const sessionId = requireSessionId(input.session_id);
+  const afterCursor = input.after_cursor ?? 0;
+  const waitMs = input.wait_ms ?? DEFAULT_RECEIVE_WAIT_MS;
+  if (!Number.isInteger(afterCursor) || afterCursor < 0) {
+    throw new Error("after_cursor must be a non-negative integer.");
+  }
+  if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 55000) {
+    throw new Error("wait_ms must be an integer from 0 through 55000.");
+  }
+  return {
+    content: [],
+    structuredContent: await relayFor(sessionId).receive(requestId, afterCursor, waitMs)
   };
 }
 
 async function getJobStatus(requestId, rawArguments) {
   const { sessionId } = parseSessionArguments(rawArguments);
   const status = await runBridgeJson(requestId, ["status", "--format", "json", "--session-id", sessionId]);
-  const actions = readActionTrace(sessionId);
   const state = normalizeStatus(status.state || "unknown");
-  const lines = [
-    "# Kimi K3 status",
-    "",
-    `Session: ${sessionId}`,
-    `Status: ${state}`,
-    `Activity: ${status.busy ? "working" : "idle"}`,
-    `Mode: ${status.mode || "unknown"}`,
-    `Focus: ${status.focus || "unknown"}`,
-    `Model: ${status.server_reported_model || status.explicit_model || "unknown"} (${status.verified_k3 ? "verified" : "NOT VERIFIED"})`,
-    `Captured actions: ${actions.length}`
-  ];
-  if (actions.length) lines.push("", "Latest actions:", ...actions.slice(-5).map((line) => `- ${line}`));
   return {
-    content: [{ type: "text", text: lines.join("\n") }],
-    structuredContent: {
-      session_id: sessionId,
-      status: state,
-      busy: Boolean(status.busy),
-      mode: status.mode || null,
-      focus: status.focus || null,
-      server_reported_model: status.server_reported_model || status.explicit_model || null,
-      verified_k3: Boolean(status.verified_k3),
-      action_count: actions.length
-    }
+    content: [{
+      type: "text",
+      text: [
+        "# Kimi K3 status",
+        "",
+        `Session: ${sessionId}`,
+        `Status: ${state}`,
+        `Activity: ${status.busy ? "working" : "idle"}`,
+        `Mode: ${status.mode || "unknown"}`,
+        `Focus: ${status.focus || "unknown"}`,
+        `Model: ${status.server_reported_model || status.explicit_model || "unknown"} (${status.verified_k3 ? "verified" : "NOT VERIFIED"})`
+      ].join("\n")
+    }],
+    structuredContent: { ...structuredJob({ ...status, session_id: sessionId }), busy: Boolean(status.busy) }
   };
 }
 
@@ -371,20 +626,18 @@ async function getJobResult(requestId, rawArguments) {
   const { sessionId } = parseSessionArguments(rawArguments);
   const durable = await runBridgeWindow(
     requestId,
-    ["watch", "--format", "text", "--session-id", sessionId, "--wait-seconds", "0"]
+    ["result", "--format", "text", "--session-id", sessionId, "--wait-seconds", "0"]
   );
   const footer = parseBridgeFooter(durable.stdout);
-  const actions = readActionTrace(sessionId);
   return {
-    content: [{ type: "text", text: `${actionTraceText(actions)}${durable.stdout.trimStart()}` }],
+    content: [{ type: "text", text: durable.stdout.trimStart() }],
     structuredContent: {
       session_id: sessionId,
       status: footer.status,
       mode: footer.mode,
       focus: footer.focus,
       server_reported_model: footer.model,
-      verified_k3: footer.verifiedK3,
-      action_count: actions.length
+      verified_k3: footer.verifiedK3
     }
   };
 }
@@ -420,35 +673,98 @@ const jobInputProperties = {
   }
 };
 
-export const toolDefinition = {
-  name: FOREGROUND_TOOL,
-  title: "Collaborate with Kimi K3",
-  description:
-    "Run one foreground Kimi K3 engineering/design collaboration. Waits on pushed events without model polling and returns genuine K3 actions plus the durable original Markdown report.",
+const panelMeta = {
+  ui: { resourceUri: PANEL_URI },
+  "openai/outputTemplate": PANEL_URI,
+  "openai/toolInvocation/invoking": "Opening Kimi K3",
+  "openai/toolInvocation/invoked": "Kimi K3 is ready"
+};
+
+export const startToolDefinition = {
+  name: "start_k3_collaboration",
+  title: "Start Kimi K3 Collaboration",
+  description: "Start one persistent K3 session and render the direct Kimi Code interface. Returns immediately without status polling.",
+  inputSchema: {
+    type: "object",
+    properties: jobInputProperties,
+    required: ["prompt", "cwd"],
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  _meta: panelMeta
+};
+
+const openPanelToolDefinition = {
+  name: "open_k3_panel",
+  title: "Open Kimi K3 Panel",
+  description: "Open the direct Kimi Code interface for a session, or the latest session when session_id is omitted.",
+  inputSchema: {
+    type: "object",
+    properties: { session_id: { type: "string", minLength: 1 } },
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  _meta: panelMeta
+};
+
+const sendToolDefinition = {
+  name: "send_k3_message",
+  title: "Send Message to Kimi K3",
+  description: "Send a Codex follow-up directly to an idle persistent K3 session. The reply appears in the Kimi Code panel.",
   inputSchema: {
     type: "object",
     properties: {
-      ...jobInputProperties,
-      session_id: { type: "string", minLength: 1, description: "Existing K3 session to resume after interruption." },
-      max_wait_seconds: {
-        type: "integer",
-        minimum: 1,
-        maximum: DEFAULT_MAX_WAIT_SECONDS,
-        default: DEFAULT_MAX_WAIT_SECONDS
-      }
+      session_id: { type: "string", minLength: 1 },
+      prompt: { type: "string", minLength: 1 }
     },
+    required: ["session_id", "prompt"],
     additionalProperties: false
   },
-  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  _meta: {
+    ui: { visibility: ["model", "app"] },
+    "openai/widgetAccessible": true
+  }
 };
 
-const startToolDefinition = {
-  name: START_TOOL,
-  title: "Start Kimi K3 Job",
-  description:
-    "Start a persistent Kimi K3 job and return immediately. A detached event follower records genuine actions; do not automatically poll status or result.",
-  inputSchema: { type: "object", properties: jobInputProperties, additionalProperties: false },
-  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
+export const receiveToolDefinition = {
+  name: "receive_k3_events",
+  title: "Receive Kimi K3 Events",
+  description: "App-only long-held receive for Kimi's pushed session events. Not available to the model.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", minLength: 1 },
+      after_cursor: { type: "integer", minimum: 0, default: 0 },
+      wait_ms: { type: "integer", minimum: 0, maximum: 55000, default: DEFAULT_RECEIVE_WAIT_MS }
+    },
+    required: ["session_id", "after_cursor"],
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  _meta: {
+    ui: { visibility: ["app"] },
+    "openai/visibility": "private",
+    "openai/widgetAccessible": true
+  }
+};
+
+export const browserToolDefinition = {
+  name: "open_k3_in_browser",
+  title: "Open Kimi K3 in Browser",
+  description: "App-only launcher for the authenticated Kimi Code session in the system browser.",
+  inputSchema: {
+    type: "object",
+    properties: { session_id: { type: "string", minLength: 1 } },
+    required: ["session_id"],
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  _meta: {
+    ui: { visibility: ["app"] },
+    "openai/visibility": "private",
+    "openai/widgetAccessible": true
+  }
 };
 
 function sessionToolDefinition(name, title, description, annotations) {
@@ -467,22 +783,25 @@ function sessionToolDefinition(name, title, description, annotations) {
 }
 
 export const toolDefinitions = [
-  toolDefinition,
   startToolDefinition,
+  openPanelToolDefinition,
+  sendToolDefinition,
+  receiveToolDefinition,
+  browserToolDefinition,
   sessionToolDefinition(
-    STATUS_TOOL,
+    "get_k3_status",
     "Get Kimi K3 Status",
-    "Read one K3 job status and its latest captured actions. Call only on explicit user request; never poll automatically.",
+    "Read one K3 status snapshot only when the user explicitly asks. Never poll automatically.",
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
   ),
   sessionToolDefinition(
-    RESULT_TOOL,
+    "get_k3_result",
     "Get Kimi K3 Result",
-    "Read captured K3 actions and the durable original Markdown result for one session. Call only on explicit user request.",
+    "Read the durable original Markdown result only when the user explicitly asks Codex to discuss it.",
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
   ),
   sessionToolDefinition(
-    CANCEL_TOOL,
+    "cancel_k3_job",
     "Cancel Kimi K3 Job",
     "Cancel the active prompt for one persistent K3 session.",
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true }
@@ -490,22 +809,56 @@ export const toolDefinitions = [
 ];
 
 const toolHandlers = new Map([
-  [FOREGROUND_TOOL, collaborate],
-  [START_TOOL, startBackgroundJob],
-  [STATUS_TOOL, getJobStatus],
-  [RESULT_TOOL, getJobResult],
-  [CANCEL_TOOL, cancelJob]
+  ["start_k3_collaboration", startCollaboration],
+  ["open_k3_panel", openPanel],
+  ["send_k3_message", sendMessageToK3],
+  ["receive_k3_events", receiveK3Events],
+  ["open_k3_in_browser", openK3InBrowser],
+  ["get_k3_status", getJobStatus],
+  ["get_k3_result", getJobResult],
+  ["cancel_k3_job", cancelJob]
 ]);
+
+export const panelResource = {
+  uri: PANEL_URI,
+  name: "kimi-k3-live-session",
+  title: "Kimi K3 Live Session",
+  description: "Direct pushed Kimi K3 events with authentic Markdown, tools, tasks, and subagent activity.",
+  mimeType: PANEL_MIME
+};
+
+function readPanelResource() {
+  const origins = panelOrigins();
+  return {
+    contents: [{
+      uri: PANEL_URI,
+      mimeType: PANEL_MIME,
+      text: fs.readFileSync(PANEL_FILE, "utf8"),
+      _meta: {
+        ui: {
+          prefersBorder: false,
+          csp: {}
+        },
+        "openai/widgetPrefersBorder": false,
+        "openai/widgetCSP": {
+          connect_domains: [],
+          resource_domains: [],
+          redirect_domains: origins
+        }
+      }
+    }]
+  };
+}
 
 async function handleMessage(message) {
   const { id, method, params } = message;
   if (method === "initialize") {
     sendResult(id, {
       protocolVersion: PROTOCOL_VERSION,
-      capabilities: { tools: {} },
+      capabilities: { tools: {}, resources: {} },
       serverInfo: { name: "Kimi K3 Collab", version: VERSION },
       instructions:
-        "Use collaborate_with_k3 for one foreground event-driven call. Use start_k3_job for background work, then get_k3_status/get_k3_result only when the user explicitly asks. Never create a model-driven polling loop."
+        "Use start_k3_collaboration once to start K3 and render its raw pushed-event panel through the app relay. Use send_k3_message for deliberate Codex follow-ups. Never poll status or result."
     });
     return;
   }
@@ -517,6 +870,22 @@ async function handleMessage(message) {
     sendResult(id, { tools: toolDefinitions });
     return;
   }
+  if (method === "resources/list") {
+    sendResult(id, { resources: [panelResource] });
+    return;
+  }
+  if (method === "resources/templates/list") {
+    sendResult(id, { resourceTemplates: [] });
+    return;
+  }
+  if (method === "resources/read") {
+    if (params?.uri !== PANEL_URI) {
+      sendError(id, -32602, `Unknown resource: ${params?.uri ?? ""}`);
+      return;
+    }
+    sendResult(id, readPanelResource());
+    return;
+  }
   if (method === "tools/call") {
     const handler = toolHandlers.get(params?.name);
     if (!handler) {
@@ -525,7 +894,7 @@ async function handleMessage(message) {
     }
     activeRequests.add(id);
     try {
-      const result = await handler(id, params.arguments, params?._meta?.progressToken);
+      const result = await handler(id, params.arguments);
       if (!cancelledRequests.has(id)) sendResult(id, result);
     } catch (error) {
       if (!cancelledRequests.has(id)) {
@@ -544,6 +913,7 @@ async function handleMessage(message) {
     const requestId = params?.requestId;
     if (activeRequests.has(requestId)) {
       cancelledRequests.add(requestId);
+      relayReceivers.get(requestId)?.();
       activeChildren.get(requestId)?.kill();
     }
     return;
@@ -552,20 +922,17 @@ async function handleMessage(message) {
 }
 
 async function main() {
-  if (process.argv[2] === "--follow-session") {
-    const sessionId = requireSessionId(process.argv[3]);
-    await collaborate(`background:${sessionId}`, { session_id: sessionId, max_wait_seconds: DEFAULT_MAX_WAIT_SECONDS });
-    return;
-  }
-
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  lines.on("close", closeTransport);
+  lines.on("close", () => {
+    closeTransport();
+    setImmediate(() => process.exit(0));
+  });
   lines.on("line", (line) => {
     if (!line.trim()) return;
     try {
       void handleMessage(JSON.parse(line));
     } catch {
-      // Ignore malformed transport lines; valid requests receive JSON-RPC errors above.
+      // Ignore malformed transport lines. Valid requests receive JSON-RPC errors above.
     }
   });
 }

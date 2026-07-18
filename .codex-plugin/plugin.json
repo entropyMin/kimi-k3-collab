@@ -1,7 +1,7 @@
 {
   "name": "kimi-k3-collab",
-  "version": "0.4.0+codex.20260717123932",
-  "description": "Collaborate with persistent Kimi K3 directly from Codex through foreground or durable background MCP jobs.",
+  "version": "0.5.0+codex.20260718094330",
+  "description": "Collaborate with persistent Kimi K3 through its direct live interface inside Codex.",
   "author": {
     "name": "entropyMin",
     "url": "https://github.com/entropyMin"
@@ -12,15 +12,15 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Kimi K3 Collab",
-    "shortDescription": "Direct foreground and background collaboration with Kimi K3.",
-    "longDescription": "Lets the main Codex task call persistent Kimi K3 directly for engineering, review, implementation, and visual-design work on Windows, macOS, and Linux. Foreground calls wait on pushed events; background jobs persist actions and results for explicit status, result, and cancellation requests without model-driven polling.",
+    "shortDescription": "See and talk with Kimi K3 directly inside Codex.",
+    "longDescription": "Starts persistent Kimi K3 engineering and design sessions, streams authentic Markdown and tool activity into a Codex MCP App, and supports direct follow-up messages without status polling or a forwarding subagent.",
     "developerName": "entropyMin",
     "category": "Productivity",
     "capabilities": [
       "Interactive",
       "Local delegation",
-      "MCP"
+      "MCP Apps"
     ],
-    "defaultPrompt": "Ask Kimi K3 directly for an independent engineering or visual-design review."
+    "defaultPrompt": "Start a direct Kimi K3 collaboration for an independent engineering or visual-design review."
   }
 }
