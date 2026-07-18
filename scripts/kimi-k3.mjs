@@ -81,7 +81,7 @@ function parseArgs(argv) {
     }
   }
 
-  if (!["ensure", "delegate", "latest", "start", "status", "watch", "result", "cancel"].includes(options.action)) {
+  if (!["ensure", "delegate", "latest", "start", "send", "status", "watch", "result", "cancel"].includes(options.action)) {
     throw new Error(`Unknown action: ${options.action}`);
   }
   if (!["analyze", "execute"].includes(options.mode)) {
@@ -140,6 +140,10 @@ function formatText(value) {
 
   if (value.kind === "kimi-k3-job") {
     return `Kimi K3 started.\nSession: ${sessionId}\n${contextBlock}Status: ${state}\nModel: ${model} (${verification})\n`;
+  }
+
+  if (value.kind === "kimi-k3-message") {
+    return `Follow-up sent to Kimi K3.\nSession: ${sessionId}\nStatus: ${state}\nModel: ${model} (${verification})\n`;
   }
 
   if (value.kind === "kimi-k3-job-status") {
@@ -427,7 +431,7 @@ function focusPrompt(focus) {
   return "Select the most relevant engineering, product, and visual criteria for the task. Treat the focus as a preference rather than a boundary.";
 }
 
-async function startJob(options) {
+function readPromptInput(options) {
   if (options.prompt && options.promptFile) {
     throw new Error("Use either --prompt or --prompt-file, not both.");
   }
@@ -437,6 +441,11 @@ async function startJob(options) {
   if (!prompt?.trim()) {
     throw new Error("A non-empty --prompt or --prompt-file is required.");
   }
+  return prompt.trim();
+}
+
+async function startJob(options) {
+  const prompt = readPromptInput(options);
 
   const root = path.resolve(options.cwd);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) {
@@ -499,7 +508,7 @@ async function startJob(options) {
     // Kimi Code 0.26 accepts profile system_prompt/tools fields but does not
     // apply them on its legacy REST route. Keep the profile fields for newer
     // servers and repeat the collaboration contract in the task for 0.26.
-    content: [{ type: "text", text: `${systemPrompt.trim()}\n\nTask from Codex:\n${prompt.trim()}` }],
+    content: [{ type: "text", text: `${systemPrompt.trim()}\n\nTask from Codex:\n${prompt}` }],
     metadata: { delegated_by: "codex", collaboration: options.focus },
     model: K3_MODEL,
     thinking: "max",
@@ -522,6 +531,55 @@ async function startJob(options) {
     read_only_tools: readOnly ? READ_ONLY_TOOLS : null,
     verified_k3: configured.model === K3_MODEL,
     persistent_server: true
+  };
+}
+
+async function sendMessage(options) {
+  const sessionId = requireSessionId(options);
+  const prompt = readPromptInput(options);
+  const record = readJobRecord(sessionId);
+  if (!record) {
+    throw new Error(`No persisted Kimi K3 job was found for ${sessionId}.`);
+  }
+  const status = await getJobStatus(sessionId);
+  if (!status.verified_k3 || status.server_reported_model !== K3_MODEL) {
+    throw new Error(`Refusing to continue ${sessionId}: the server did not verify ${K3_MODEL}.`);
+  }
+  if (status.busy) {
+    throw new Error(`Kimi K3 session ${sessionId} is already working. Wait for the current turn or cancel it first.`);
+  }
+
+  const readOnly = record.mode !== "execute";
+  const reminder = readOnly
+    ? "Continue in analysis-only mode. Do not modify files or run shell commands."
+    : "Continue within the previously authorized file scope and verify any changes.";
+  const submitted = await callApi("POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompts`, {
+    content: [{ type: "text", text: `${reminder}\n\nFollow-up from Codex:\n${prompt}` }],
+    metadata: { delegated_by: "codex", collaboration: record.focus || "general" },
+    model: K3_MODEL,
+    thinking: "max",
+    permission_mode: readOnly ? "manual" : "auto",
+    plan_mode: false,
+    swarm_mode: false
+  });
+
+  Object.assign(record, {
+    prompt_id: String(submitted.prompt_id),
+    state: String(submitted.status),
+    complete: false,
+    result: null,
+    updated_at: new Date().toISOString()
+  });
+  writeJobRecord(record);
+  return {
+    kind: "kimi-k3-message",
+    session_id: sessionId,
+    prompt_id: String(submitted.prompt_id),
+    state: String(submitted.status),
+    mode: record.mode,
+    focus: record.focus,
+    server_reported_model: status.server_reported_model,
+    verified_k3: true
   };
 }
 
@@ -933,6 +991,11 @@ async function main() {
     const job = await startJob(options);
     writeJobRecord(createJobRecord(job, options));
     printOutput(job, options.outputFormat);
+    return;
+  }
+
+  if (options.action === "send") {
+    printOutput(await sendMessage(options), options.outputFormat);
     return;
   }
 

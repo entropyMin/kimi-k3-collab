@@ -5,7 +5,7 @@ description: Proactively collaborate directly with persistent Kimi K3 for materi
 
 # Kimi K3 Collaboration
 
-Call the plugin MCP tools directly from the main Codex task. Do not spawn a Codex subagent as a K3 wrapper.
+Call the plugin MCP tools directly from the main Codex task. Do not spawn a Codex subagent as a K3 wrapper. K3 speaks and acts in the direct pushed-event panel; do not imitate K3 in Codex commentary.
 
 Select one focus:
 
@@ -16,11 +16,12 @@ Select one focus:
 ## Workflow
 
 1. Tell the user Kimi K3 is being called explicitly and state the mode and focus.
-2. Use `collaborate_with_k3` once for normal foreground work. It waits on pushed events internally and returns genuine K3 actions plus the durable original Markdown report.
-3. Use `start_k3_job` once when the user requests background execution or the task is likely to be long-running. Return its session ID and continue without polling.
-4. Call `get_k3_status`, `get_k3_result`, or `cancel_k3_job` only when the user explicitly asks about that background job. Never create an automatic status loop or spend model turns polling.
-5. Use `mode=analyze` for review, architecture, planning, and critique. Use `mode=execute` only after the user authorizes edits, and pass explicit `allowed_paths` under the absolute `cwd`.
-6. Keep K3's action trace and original Markdown visible. Then independently discuss agreements, disagreements, and resulting decisions. Report `session_id`, `focus`, `server_reported_model`, and `verified_k3` in readable text. Do not expose bridge JSON or hidden reasoning.
-7. After execute mode, compare the working-tree diff with `allowed_paths`; the allowlist is a K3 instruction, not an operating-system sandbox.
+2. Call `start_k3_collaboration` once. It creates a persistent K3 session, returns immediately, and renders Kimi's pushed Markdown and action events through MCP Apps.
+3. Let the user inspect K3 output, tools, subagents, and original Markdown in that panel. Do not narrate a fake K3 action stream in the Codex transcript.
+4. Use `send_k3_message` when Codex has a deliberate follow-up, challenge, or response for the same session. Do not send while K3 is already working.
+5. Use `open_k3_panel` to reopen an existing or latest session. Call `get_k3_status`, `get_k3_result`, or `cancel_k3_job` only when the user explicitly asks Codex to inspect, discuss, or stop the session. Never create an automatic status loop.
+6. Use `mode=analyze` for review, architecture, planning, and critique. Use `mode=execute` only after the user authorizes edits, and pass explicit `allowed_paths` under the absolute `cwd`.
+7. Report `session_id`, `focus`, `server_reported_model`, and `verified_k3` from the start result. Never claim K3 was used unless the server reports the exact model `kimi-code/k3` as verified.
+8. After execute mode, compare the working-tree diff with `allowed_paths`; the allowlist is a K3 instruction, not an operating-system sandbox.
 
-If a foreground call is interrupted, resume it once with `collaborate_with_k3 { session_id }`. Never claim K3 was used unless the result reports the exact model `kimi-code/k3` as verified.
+The MCP server owns Kimi's authenticated loopback-only WebSocket. The panel receives raw frames through a private app-only long-held host-bridge call, so it neither receives the bearer token nor needs loopback network access. This transport uses no model turns or status polling. If the host cannot render MCP Apps or make app-initiated tool calls, use the panel's Kimi Code browser fallback.

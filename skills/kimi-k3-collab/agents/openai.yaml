@@ -1,4 +1,4 @@
 interface:
   display_name: "Kimi K3 Collaboration"
-  short_description: "Collaborate directly on engineering and design"
-  default_prompt: "Use $kimi-k3-collab to collaborate directly with Kimi K3 on this engineering or design task."
+  short_description: "Open a direct K3 session for engineering and design"
+  default_prompt: "Use $kimi-k3-collab to start a direct Kimi K3 session and show its live panel."
