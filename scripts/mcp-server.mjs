@@ -38,6 +38,8 @@ const MAX_EVENT_BATCH_BYTES = 512 * 1024;
 const MAX_RELAY_FAILURES = 30;
 const RELAY_IDLE_MS = 3 * 60 * 1000;
 const DEFAULT_RECEIVE_WAIT_MS = 45000;
+const DEFAULT_MODEL_WAIT_SECONDS = 100;
+const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed", "error", "stopped"]);
 let transportClosed = false;
 
 function closeTransport() {
@@ -187,13 +189,59 @@ async function startJob(requestId, input) {
 }
 
 function structuredJob(job) {
+  const integration = job.integration || null;
   return {
     session_id: job.session_id,
     status: normalizeStatus(job.state || job.status || "running"),
     mode: job.mode || null,
     focus: job.focus || null,
     server_reported_model: job.server_reported_model || job.explicit_model || null,
-    verified_k3: Boolean(job.verified_k3)
+    verified_k3: Boolean(job.verified_k3),
+    isolation: job.workspace?.isolation || integration?.isolation || null,
+    integration_state: integration?.state || null,
+    branch: integration?.branch || job.workspace?.branch || null,
+    commit: integration?.commit || null
+  };
+}
+
+function integrationHandoff(record) {
+  const integration = record?.integration;
+  if (!integration) return { text: "", structured: {} };
+  if (integration.isolation === "single-writer") {
+    return {
+      text: `\n\n---\nExecution handoff: non-Git changes were made directly in ${integration.source_cwd} under the single-writer protocol.`,
+      structured: {
+        isolation: "single-writer",
+        integration_state: integration.state,
+        source_cwd: integration.source_cwd
+      }
+    };
+  }
+  const lines = [
+    "",
+    "---",
+    "K3 isolated Git handoff",
+    `State: ${integration.state}`,
+    integration.branch && `Branch: ${integration.branch}`,
+    integration.commit && `Commit: ${integration.commit}`,
+    integration.changed_paths?.length && `Changed paths: ${integration.changed_paths.join(", ")}`,
+    integration.overlapping_source_paths?.length && `Overlapping source changes: ${integration.overlapping_source_paths.join(", ")}`,
+    integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`,
+    integration.commit && "Review the commit before cherry-picking it; the plugin never merges automatically."
+  ].filter(Boolean);
+  return {
+    text: `\n${lines.join("\n")}`,
+    structured: {
+      isolation: integration.isolation,
+      integration_state: integration.state,
+      source_repo: integration.source_repo || null,
+      branch: integration.branch || null,
+      commit: integration.commit || null,
+      commits: integration.commits || [],
+      changed_paths: integration.changed_paths || [],
+      overlapping_source_paths: integration.overlapping_source_paths || [],
+      scope_violations: integration.scope_violations || []
+    }
   };
 }
 
@@ -245,8 +293,9 @@ function safeRelayError(error) {
 }
 
 class SessionRelay {
-  constructor(sessionId) {
+  constructor(sessionId, mode = null) {
     this.sessionId = sessionId;
+    this.mode = mode;
     this.generation = randomUUID();
     this.buffer = [];
     this.bufferBytes = 0;
@@ -430,6 +479,37 @@ class SessionRelay {
           if (this.isDuplicateDurable(frame)) continue;
           this.updateServerCursor(frame);
           this.enqueue(frame);
+          if (this.mode === "analyze" && frame.type === "event.approval.requested") {
+            const approvalId = String(frame.payload?.approval_id || "").trim();
+            if (!approvalId) {
+              this.enqueue({
+                type: "relay.policy",
+                session_id: this.sessionId,
+                volatile: true,
+                payload: { status: "failed", message: "K3 approval request omitted approval_id." }
+              });
+            } else {
+              try {
+                await runBridgeJson(
+                  `relay-approval:${this.sessionId}:${approvalId}`,
+                  ["reject-approval", "--format", "json", "--session-id", this.sessionId, "--approval-id", approvalId]
+                );
+                this.enqueue({
+                  type: "relay.policy",
+                  session_id: this.sessionId,
+                  volatile: true,
+                  payload: { status: "rejected", message: "Denied an approval-gated tool in read-only analysis." }
+                });
+              } catch (error) {
+                this.enqueue({
+                  type: "relay.policy",
+                  session_id: this.sessionId,
+                  volatile: true,
+                  payload: { status: "failed", message: safeRelayError(error) }
+                });
+              }
+            }
+          }
           if (frame.type === "error" && frame.payload?.fatal) {
             throw new Error(`Kimi WebSocket error: ${frame.payload.msg || frame.payload.code}`);
           }
@@ -470,12 +550,13 @@ class SessionRelay {
   }
 }
 
-function relayFor(sessionId) {
+function relayFor(sessionId, mode = null) {
   let relay = relays.get(sessionId);
   if (!relay) {
-    relay = new SessionRelay(sessionId);
+    relay = new SessionRelay(sessionId, mode);
     relays.set(sessionId, relay);
   }
+  if (mode) relay.mode = mode;
   relay.start();
   return relay;
 }
@@ -531,7 +612,7 @@ async function startCollaboration(requestId, rawArguments) {
   const input = parseJobArguments(rawArguments);
   const job = await startJob(requestId, input);
   const service = await ensurePanelService(requestId);
-  relayFor(job.session_id);
+  relayFor(job.session_id, job.mode);
   const details = structuredJob(job);
   const text = [
     "Kimi K3 collaboration started.",
@@ -554,7 +635,7 @@ async function openPanel(requestId, rawArguments) {
   const text = sessionId
     ? `Opened the direct Kimi K3 event stream.\nSession: ${sessionId}`
     : "Opened Kimi K3. Start or select a session in the live panel.";
-  if (sessionId) relayFor(sessionId);
+  if (sessionId) relayFor(sessionId, details.mode);
   return panelToolResult(sessionId, service, structuredJob({ ...details, session_id: sessionId }), text);
 }
 
@@ -642,6 +723,46 @@ async function getJobResult(requestId, rawArguments) {
   };
 }
 
+async function awaitK3Result(requestId, rawArguments) {
+  const input = requireObject(rawArguments);
+  const sessionId = requireSessionId(input.session_id);
+  const waitSeconds = input.wait_seconds ?? DEFAULT_MODEL_WAIT_SECONDS;
+  if (!Number.isInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > 100) {
+    throw new Error("wait_seconds must be an integer from 1 through 100.");
+  }
+  const record = await runBridgeJson(
+    requestId,
+    ["result", "--format", "json", "--session-id", sessionId, "--wait-seconds", String(waitSeconds)]
+  );
+  const model = record.server_reported_model || record.explicit_model || null;
+  if (!record.verified_k3 || model !== K3_MODEL) {
+    throw new Error(`Kimi result did not verify ${K3_MODEL}.`);
+  }
+  const status = normalizeStatus(record.state || record.status || "running");
+  const complete = Boolean(record.complete) || TERMINAL_STATUSES.has(status);
+  const handoffReady = complete || status === "blocked";
+  const report = handoffReady && typeof record.result === "string" && record.result.trim()
+    ? record.result.trim()
+    : handoffReady
+      ? `Kimi K3 returned ${status} without a Markdown report.`
+      : "Kimi K3 is still working. If useful independent Codex work remains, do only that. Otherwise let the trusted Stop hook perform the longer event wait. If the hook is unavailable, make one later await without filler work; if K3 is still running, tell the user once and ask whether to keep waiting or cancel. During automatic waiting, do not narrate the same waiting state, inspect Git/status as filler, or use get_k3_status/get_k3_result for polling.";
+  const handoff = handoffReady ? integrationHandoff(record) : { text: "", structured: {} };
+  return {
+    content: [{ type: "text", text: `${report}${handoff.text}` }],
+    structuredContent: {
+      session_id: sessionId,
+      status,
+      complete,
+      handoff_ready: handoffReady,
+      mode: record.mode || null,
+      focus: record.focus || null,
+      server_reported_model: model,
+      verified_k3: true,
+      ...handoff.structured
+    }
+  };
+}
+
 async function cancelJob(requestId, rawArguments) {
   const { sessionId } = parseSessionArguments(rawArguments);
   const result = await runBridgeJson(requestId, ["cancel", "--format", "json", "--session-id", sessionId]);
@@ -656,7 +777,8 @@ async function cancelJob(requestId, rawArguments) {
       session_id: sessionId,
       aborted: Boolean(result.aborted),
       prompt_id: result.prompt_id || null,
-      reason: result.reason || null
+      reason: result.reason || null,
+      ...integrationHandoff(result).structured
     }
   };
 }
@@ -669,7 +791,7 @@ const jobInputProperties = {
   allowed_paths: {
     type: "array",
     items: { type: "string", minLength: 1 },
-    description: "Execute-mode paths allowed under cwd."
+    description: "Execute-mode paths allowed under cwd. Git projects use an isolated worktree; non-Git projects use a single-writer lock."
   }
 };
 
@@ -683,7 +805,7 @@ const panelMeta = {
 export const startToolDefinition = {
   name: "start_k3_collaboration",
   title: "Start Kimi K3 Collaboration",
-  description: "Start one persistent K3 session and render the direct Kimi Code interface. Returns immediately without status polling.",
+  description: "Start one persistent K3 session and render the direct Kimi Code interface. Execute mode isolates Git writes in a temporary branch/worktree; non-Git execution is single-writer. Returns immediately without status polling.",
   inputSchema: {
     type: "object",
     properties: jobInputProperties,
@@ -725,6 +847,22 @@ const sendToolDefinition = {
     ui: { visibility: ["model", "app"] },
     "openai/widgetAccessible": true
   }
+};
+
+export const awaitToolDefinition = {
+  name: "await_k3_result",
+  title: "Await Kimi K3 Result",
+  description: "Wait event-first for K3 to finish, then return K3's original Markdown and any isolated Git commit handoff directly to Codex. Use after Codex completes its separate subtask and before the final response; this is not status polling.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", minLength: 1 },
+      wait_seconds: { type: "integer", minimum: 1, maximum: 100, default: DEFAULT_MODEL_WAIT_SECONDS }
+    },
+    required: ["session_id"],
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
 };
 
 export const receiveToolDefinition = {
@@ -786,6 +924,7 @@ export const toolDefinitions = [
   startToolDefinition,
   openPanelToolDefinition,
   sendToolDefinition,
+  awaitToolDefinition,
   receiveToolDefinition,
   browserToolDefinition,
   sessionToolDefinition(
@@ -812,6 +951,7 @@ const toolHandlers = new Map([
   ["start_k3_collaboration", startCollaboration],
   ["open_k3_panel", openPanel],
   ["send_k3_message", sendMessageToK3],
+  ["await_k3_result", awaitK3Result],
   ["receive_k3_events", receiveK3Events],
   ["open_k3_in_browser", openK3InBrowser],
   ["get_k3_status", getJobStatus],
@@ -858,7 +998,7 @@ async function handleMessage(message) {
       capabilities: { tools: {}, resources: {} },
       serverInfo: { name: "Kimi K3 Collab", version: VERSION },
       instructions:
-        "Use start_k3_collaboration once to start K3 and render its raw pushed-event panel through the app relay. Use send_k3_message for deliberate Codex follow-ups. Never poll status or result."
+        "Use start_k3_collaboration once to give K3 a separate subtask, continue Codex's own work, then call await_k3_result before the final response so K3 reports directly back to Codex. If it is still running and no useful Codex work remains, let the trusted Stop hook perform the longer event wait. If that hook is unavailable, make only one later await before asking the user whether to keep waiting or cancel. Never narrate repeated waiting, run filler checks, or poll status/result during automatic waiting."
     });
     return;
   }

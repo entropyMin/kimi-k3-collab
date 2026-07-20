@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +12,8 @@ import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
 const K3_MODEL = "kimi-code/k3";
 const KIMI_HOME = path.resolve(process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code"));
 const JOB_ROOT = path.join(KIMI_HOME, "codex-jobs");
+const WORKTREE_ROOT = path.join(KIMI_HOME, "codex-worktrees");
+const WRITE_LOCK_ROOT = path.join(JOB_ROOT, "write-locks");
 const LOCK_FILE = path.join(KIMI_HOME, "server", "lock");
 const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
@@ -21,7 +23,8 @@ const READ_ONLY_TOOLS = [
   "Read", "ReadMediaFile", "Glob", "Grep", "WebSearch", "FetchURL", "TodoList",
   "Agent", "Skill", "TaskList", "TaskOutput", "GetGoal"
 ];
-const TERMINAL_EVENTS = new Set(["turn.ended", "prompt.completed", "prompt.aborted"]);
+const PROMPT_TERMINAL_EVENTS = new Set(["prompt.completed", "prompt.aborted"]);
+const CHECKPOINT_EVENTS = new Set(["turn.ended", ...PROMPT_TERMINAL_EVENTS]);
 const PROCESS_DEADLINE = Date.now() + 115000;
 const STREAM_EXIT_RESERVE_MS = 10000;
 
@@ -60,6 +63,7 @@ function parseArgs(argv) {
     ["--prompt-file", "promptFile"],
     ["--allowed-path", "allowedPaths"],
     ["--session-id", "sessionId"],
+    ["--approval-id", "approvalId"],
     ["--format", "outputFormat"],
     ["--wait-seconds", "waitSeconds"],
     ["--max-wait-seconds", "maxWaitSeconds"]
@@ -81,7 +85,7 @@ function parseArgs(argv) {
     }
   }
 
-  if (!["ensure", "delegate", "latest", "start", "send", "status", "watch", "result", "cancel"].includes(options.action)) {
+  if (!["ensure", "delegate", "latest", "start", "send", "status", "watch", "result", "cancel", "reject-approval"].includes(options.action)) {
     throw new Error(`Unknown action: ${options.action}`);
   }
   if (!["analyze", "execute"].includes(options.mode)) {
@@ -117,6 +121,24 @@ function formatFooter(value) {
   const context = [value.mode && `Mode: ${value.mode}`, value.focus && `Focus: ${value.focus}`].filter(Boolean).join("\n");
   const contextBlock = context ? `${context}\n` : "";
   return `---\nKimi K3 session: ${sessionId}\n${contextBlock}Status: ${state}\nModel: ${model} (${verification})\n`;
+}
+
+function formatIntegration(value) {
+  const integration = value.integration || value.record?.integration;
+  if (!integration) return "";
+  if (integration.isolation === "single-writer") {
+    return `\n\n---\nExecution handoff: non-Git single-writer changes were made directly in ${integration.source_cwd}.`;
+  }
+  return `\n\n${[
+    "---",
+    "K3 isolated Git handoff",
+    `State: ${integration.state}`,
+    integration.branch && `Branch: ${integration.branch}`,
+    integration.commit && `Commit: ${integration.commit}`,
+    integration.changed_paths?.length && `Changed paths: ${integration.changed_paths.join(", ")}`,
+    integration.overlapping_source_paths?.length && `Overlapping source changes: ${integration.overlapping_source_paths.join(", ")}`,
+    integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`
+  ].filter(Boolean).join("\n")}`;
 }
 
 function formatText(value) {
@@ -162,7 +184,7 @@ function formatText(value) {
   } else if (value.complete) {
     report = "Kimi K3 completed without a text report.";
   }
-  return `${report}\n\n${formatFooter(value)}`;
+  return `${report}${formatIntegration(value)}\n\n${formatFooter(value)}`;
 }
 
 function printOutput(value, outputFormat) {
@@ -195,9 +217,125 @@ function runCommand(command, args, options = {}) {
     encoding: "utf8",
     windowsHide: true,
     shell: process.platform === "win32" && command === "kimi",
+    cwd: options.cwd,
+    input: options.input,
     timeout: boundedTimeout(options.timeout ?? 20000),
-    maxBuffer: 4 * 1024 * 1024
+    maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024
   });
+}
+
+function checkedCommand(command, args, options = {}) {
+  const result = runCommand(command, args, options);
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error((result.stderr || result.stdout || `${command} exited with ${result.status}`).trim());
+  }
+  return result.stdout;
+}
+
+function runGit(cwd, args, options = {}) {
+  return checkedCommand("git", ["-C", cwd, ...args], options);
+}
+
+function gitPath(value) {
+  const normalized = String(value || "").split(path.sep).join("/").replace(/^\.\//, "").replace(/\/$/, "");
+  return normalized || ".";
+}
+
+export function pathsOverlap(left, right) {
+  const a = gitPath(left);
+  const b = gitPath(right);
+  return a === "." || b === "." || a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+export function scopeViolations(changedPaths, allowedPaths) {
+  return changedPaths.filter((changed) => !allowedPaths.some((allowed) => {
+    const file = gitPath(changed);
+    const scope = gitPath(allowed);
+    return scope === "." || file === scope || file.startsWith(`${scope}/`);
+  }));
+}
+
+function nullList(value) {
+  return String(value || "").split("\0").filter(Boolean).map(gitPath);
+}
+
+function gitDirtyPaths(repo) {
+  return [...new Set([
+    ...nullList(runGit(repo, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"])),
+    ...nullList(runGit(repo, ["ls-files", "--others", "--exclude-standard", "-z"]))
+  ])];
+}
+
+function gitChangedPaths(repo, baseCommit) {
+  return [...new Set([
+    ...nullList(runGit(repo, ["diff", "--name-only", "--no-renames", "-z", baseCommit, "--"])),
+    ...nullList(runGit(repo, ["ls-files", "--others", "--exclude-standard", "-z"]))
+  ])];
+}
+
+function findGitRepo(cwd) {
+  const result = runCommand("git", ["-C", cwd, "rev-parse", "--show-toplevel"]);
+  if (result.error || result.status !== 0) return null;
+  return path.resolve(result.stdout.trim());
+}
+
+function removeGitWorktree(workspace, deleteBranch = false) {
+  if (!workspace?.source_repo || !workspace?.worktree_root) return;
+  const expectedRoot = path.resolve(WORKTREE_ROOT);
+  const target = path.resolve(workspace.worktree_root);
+  const relative = path.relative(expectedRoot, target);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Refusing to remove unexpected K3 worktree path: ${target}`);
+  }
+  if (fs.existsSync(target)) {
+    runGit(workspace.source_repo, ["worktree", "remove", "--force", target]);
+  }
+  runCommand("git", ["-C", workspace.source_repo, "worktree", "prune"]);
+  if (deleteBranch && workspace.branch) {
+    runGit(workspace.source_repo, ["branch", "-D", workspace.branch]);
+  }
+  workspace.worktree_active = false;
+}
+
+function releaseSingleWriter(workspace) {
+  if (!workspace?.lock_path || !fs.existsSync(workspace.lock_path)) return;
+  const ownerFile = path.join(workspace.lock_path, "owner.json");
+  let owner = null;
+  try {
+    owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+  } catch {}
+  if (owner?.token && owner.token !== workspace.lock_token) return;
+  fs.rmSync(workspace.lock_path, { recursive: true, force: true });
+  workspace.lock_active = false;
+}
+
+function acquireSingleWriter(cwd) {
+  fs.mkdirSync(WRITE_LOCK_ROOT, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(WRITE_LOCK_ROOT, createHash("sha256").update(path.resolve(cwd)).digest("hex"));
+  if (fs.existsSync(lockPath)) {
+    const ownerFile = path.join(lockPath, "owner.json");
+    let owner = null;
+    try {
+      owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+    } catch {}
+    const record = owner?.session_id ? readJobRecord(owner.session_id) : null;
+    const age = Date.now() - fs.statSync(lockPath).mtimeMs;
+    if (record?.complete || (!record && age > 120000)) {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    } else {
+      throw new Error(`A K3 execute session already owns the non-Git directory: ${path.resolve(cwd)}`);
+    }
+  }
+  fs.mkdirSync(lockPath);
+  const token = randomUUID();
+  writeJsonFile(path.join(lockPath, "owner.json"), {
+    token,
+    cwd: path.resolve(cwd),
+    session_id: null,
+    created_at: new Date().toISOString()
+  });
+  return { lock_path: lockPath, lock_token: token, lock_active: true };
 }
 
 function resolveKimiCommand() {
@@ -353,7 +491,10 @@ function createJobRecord(job, options) {
     complete: false,
     mode: options.mode,
     focus: options.focus,
-    cwd: path.resolve(options.cwd),
+    cwd: job.workspace?.cwd || path.resolve(options.cwd),
+    source_cwd: path.resolve(options.cwd),
+    allowed_paths: job.workspace?.allowed_paths || [],
+    workspace: job.workspace || null,
     explicit_model: job.explicit_model,
     server_reported_model: job.server_reported_model,
     verified_k3: job.verified_k3,
@@ -384,6 +525,239 @@ function verifyWithinRoot(root, candidate) {
     return resolved;
   }
   throw new Error(`Allowed path is outside the working directory: ${candidate}`);
+}
+
+export function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths) {
+  const sourceRoot = path.resolve(sourceCwd);
+  const repo = findGitRepo(sourceRoot);
+  if (!repo) {
+    const lock = acquireSingleWriter(sourceRoot);
+    return {
+      cwd: sourceRoot,
+      allowed: allowedAbsolutePaths,
+      workspace: {
+        isolation: "single-writer",
+        source_cwd: sourceRoot,
+        cwd: sourceRoot,
+        allowed_paths: allowedAbsolutePaths,
+        ...lock
+      }
+    };
+  }
+
+  const sourceSubdir = path.relative(repo, sourceRoot);
+  if (sourceSubdir.startsWith("..") || path.isAbsolute(sourceSubdir)) {
+    throw new Error(`Working directory is outside its reported Git root: ${sourceRoot}`);
+  }
+  const allowedRepoPaths = allowedAbsolutePaths.map((item) => gitPath(path.relative(repo, item)));
+  const dirtyPaths = gitDirtyPaths(repo);
+  const overlaps = dirtyPaths.filter((dirty) => allowedRepoPaths.some((allowed) => pathsOverlap(dirty, allowed)));
+  if (overlaps.length > 0) {
+    throw new Error(
+      `Source checkout has uncommitted changes overlapping K3 allowed_paths: ${overlaps.join(", ")}. ` +
+      "Commit, stash, or choose non-overlapping paths before parallel execute mode."
+    );
+  }
+
+  const baseCommit = runGit(repo, ["rev-parse", "HEAD"]).trim();
+  const id = `${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const branch = `codex-k3/${id}`;
+  const worktreeRoot = path.join(WORKTREE_ROOT, id);
+  fs.mkdirSync(WORKTREE_ROOT, { recursive: true, mode: 0o700 });
+  const workspace = {
+    isolation: "git-worktree",
+    source_cwd: sourceRoot,
+    source_repo: repo,
+    source_subdir: gitPath(sourceSubdir),
+    source_head_at_start: baseCommit,
+    source_dirty_paths_at_start: dirtyPaths,
+    cwd: path.join(worktreeRoot, sourceSubdir),
+    worktree_root: worktreeRoot,
+    worktree_active: false,
+    branch,
+    base_commit: baseCommit,
+    allowed_repo_paths: allowedRepoPaths,
+    commits: []
+  };
+  try {
+    runGit(repo, ["worktree", "add", "-b", branch, worktreeRoot, baseCommit], { timeout: 60000 });
+    workspace.worktree_active = true;
+    if (!fs.statSync(workspace.cwd, { throwIfNoEntry: false })?.isDirectory()) {
+      throw new Error(`The working directory is not present in the committed Git snapshot: ${sourceRoot}`);
+    }
+    const allowed = allowedAbsolutePaths.map((item) => path.join(worktreeRoot, path.relative(repo, item)));
+    workspace.allowed_paths = allowed;
+    return { cwd: workspace.cwd, allowed, workspace };
+  } catch (error) {
+    try {
+      removeGitWorktree(workspace, true);
+    } catch {}
+    throw error;
+  }
+}
+
+function bindSingleWriter(workspace, sessionId) {
+  if (workspace?.isolation !== "single-writer" || !workspace.lock_active) return;
+  writeJsonFile(path.join(workspace.lock_path, "owner.json"), {
+    token: workspace.lock_token,
+    cwd: workspace.source_cwd,
+    session_id: sessionId,
+    created_at: new Date().toISOString()
+  });
+}
+
+export function restoreExecutionWorkspace(record) {
+  const workspace = record?.workspace;
+  if (workspace?.isolation === "single-writer") {
+    const lock = acquireSingleWriter(workspace.source_cwd);
+    Object.assign(workspace, lock);
+    return;
+  }
+  if (workspace?.isolation !== "git-worktree") return;
+  if (workspace.worktree_active && fs.existsSync(workspace.worktree_root)) return;
+  workspace.worktree_active = false;
+  runGit(workspace.source_repo, ["worktree", "add", workspace.worktree_root, workspace.branch], { timeout: 60000 });
+  workspace.worktree_active = true;
+  workspace.cwd = path.join(
+    workspace.worktree_root,
+    workspace.source_subdir === "." ? "" : workspace.source_subdir.split("/").join(path.sep)
+  );
+  workspace.allowed_paths = workspace.allowed_repo_paths.map((item) =>
+    path.join(workspace.worktree_root, item === "." ? "" : item.split("/").join(path.sep))
+  );
+}
+
+export function finalizeExecutionWorkspace(record) {
+  const workspace = record?.workspace;
+  if (record?.mode !== "execute" || !workspace || workspace.turn_finalized_for === record.prompt_id) {
+    return record?.integration || null;
+  }
+
+  if (workspace.isolation === "single-writer") {
+    releaseSingleWriter(workspace);
+    workspace.turn_finalized_for = record.prompt_id;
+    record.integration = {
+      isolation: "single-writer",
+      state: "direct_changes",
+      source_cwd: workspace.source_cwd,
+      note: "Non-Git execution changed the source directory directly while holding the advisory single-writer lock."
+    };
+    return record.integration;
+  }
+
+  if (workspace.isolation !== "git-worktree") return null;
+  const baseCommit = workspace.base_commit;
+  const changedPaths = gitChangedPaths(workspace.worktree_root, baseCommit);
+  const violations = scopeViolations(changedPaths, workspace.allowed_repo_paths);
+  if (violations.length > 0) {
+    workspace.turn_finalized_for = record.prompt_id;
+    record.integration = {
+      isolation: "git-worktree",
+      state: "scope_violation",
+      branch: workspace.branch,
+      base_commit: baseCommit,
+      worktree_root: workspace.worktree_root,
+      changed_paths: changedPaths,
+      scope_violations: violations
+    };
+    record.state = "error";
+    record.complete = true;
+    record.error = `K3 changed files outside allowed_paths: ${violations.join(", ")}. The isolated worktree was preserved for review.`;
+    return record.integration;
+  }
+
+  if (changedPaths.length === 0) {
+    workspace.turn_finalized_for = record.prompt_id;
+    record.integration = {
+      isolation: "git-worktree",
+      state: "no_changes",
+      branch: workspace.branch,
+      base_commit: baseCommit,
+      changed_paths: []
+    };
+    try {
+      removeGitWorktree(workspace);
+    } catch (error) {
+      record.integration.cleanup_error = error instanceof Error ? error.message : String(error);
+    }
+    return record.integration;
+  }
+
+  const currentHead = runGit(workspace.worktree_root, ["rev-parse", "HEAD"]).trim();
+  if (currentHead !== baseCommit) {
+    runGit(workspace.worktree_root, ["reset", "--soft", baseCommit]);
+  }
+  runGit(workspace.worktree_root, ["add", "--all"]);
+  runGit(workspace.worktree_root, [
+    "-c", "user.name=Kimi K3",
+    "-c", "user.email=kimi-k3-collab@local",
+    "commit", "--no-verify", "-m", `K3 isolated changes (${record.session_id})`
+  ], { timeout: 60000 });
+  const commit = runGit(workspace.worktree_root, ["rev-parse", "HEAD"]).trim();
+  workspace.commits = [...new Set([...(workspace.commits || []), commit])];
+  workspace.base_commit = commit;
+  workspace.turn_finalized_for = record.prompt_id;
+
+  const sourceHead = runGit(workspace.source_repo, ["rev-parse", "HEAD"]).trim();
+  const sourceDirty = gitDirtyPaths(workspace.source_repo);
+  const sourceCommitted = sourceHead === workspace.source_head_at_start
+    ? []
+    : nullList(runGit(workspace.source_repo, [
+        "diff", "--name-only", "--no-renames", "-z", workspace.source_head_at_start, sourceHead, "--"
+      ]));
+  const overlappingSourcePaths = [...new Set([...sourceDirty, ...sourceCommitted])]
+    .filter((sourcePath) => changedPaths.some((changed) => pathsOverlap(sourcePath, changed)));
+  const state = overlappingSourcePaths.length > 0
+    ? "conflict_likely"
+    : sourceHead === workspace.source_head_at_start
+      ? "ready"
+      : "review_required";
+  record.integration = {
+    isolation: "git-worktree",
+    state,
+    source_repo: workspace.source_repo,
+    branch: workspace.branch,
+    base_commit: baseCommit,
+    commit,
+    commits: workspace.commits,
+    changed_paths: changedPaths,
+    source_head: sourceHead,
+    source_head_changed: sourceHead !== workspace.source_head_at_start,
+    source_committed_paths: sourceCommitted,
+    overlapping_source_paths: overlappingSourcePaths,
+    worktree_root: workspace.worktree_root
+  };
+  try {
+    removeGitWorktree(workspace);
+  } catch (error) {
+    record.integration.cleanup_error = error instanceof Error ? error.message : String(error);
+  }
+  return record.integration;
+}
+
+function finalizeExecutionSafely(record) {
+  try {
+    return finalizeExecutionWorkspace(record);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    record.state = "error";
+    record.complete = true;
+    record.error = `K3 execution handoff failed: ${message}`;
+    record.integration = {
+      ...(record.integration || {}),
+      isolation: record.workspace?.isolation || null,
+      state: "integration_error",
+      branch: record.workspace?.branch || null,
+      worktree_root: record.workspace?.worktree_root || null,
+      error: message
+    };
+    return record.integration;
+  }
+}
+
+function cleanupPreparedWorkspace(workspace) {
+  if (workspace?.isolation === "git-worktree") removeGitWorktree(workspace, true);
+  if (workspace?.isolation === "single-writer") releaseSingleWriter(workspace);
 }
 
 async function getJobStatus(sessionId) {
@@ -447,28 +821,35 @@ function readPromptInput(options) {
 async function startJob(options) {
   const prompt = readPromptInput(options);
 
-  const root = path.resolve(options.cwd);
-  if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) {
-    throw new Error(`Working directory does not exist: ${root}`);
+  const sourceRoot = path.resolve(options.cwd);
+  if (!fs.statSync(sourceRoot, { throwIfNoEntry: false })?.isDirectory()) {
+    throw new Error(`Working directory does not exist: ${sourceRoot}`);
   }
   const readOnly = options.mode === "analyze";
   const planMode = false;
   const permissionMode = readOnly ? "manual" : "auto";
+  let root = sourceRoot;
+  let workspace = null;
   let scopeText = "";
   if (!readOnly) {
     const items = options.allowedPaths.flatMap((value) => value.split(";")).map((value) => value.trim()).filter(Boolean);
     if (items.length === 0) {
       throw new Error("Execution mode requires at least one --allowed-path.");
     }
-    const allowed = items.map((item) => verifyWithinRoot(root, item));
+    const allowedOriginal = items.map((item) => verifyWithinRoot(sourceRoot, item));
+    const prepared = prepareExecutionWorkspace(sourceRoot, allowedOriginal);
+    root = prepared.cwd;
+    workspace = prepared.workspace;
+    const allowed = prepared.allowed;
     scopeText = `\nYou may edit only these paths:\n- ${allowed.join("\n- ")}`;
   }
 
   const systemPrompt = readOnly
     ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Do not call Bash, Shell, or another command-execution tool; use the configured read-only inspection tools instead. You may use TodoList to organize the review. Inspect relevant project files and assets as needed.\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
-    : `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe user has authorized the scoped implementation described in the task. Inspect before editing, preserve unrelated user changes, and do not touch files outside the allowed paths.${scopeText}\nImplement the requested work, verify it with appropriate tests, static checks, or rendered evidence, and return the files changed, decisions made, and verification results.`;
+    : `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe user has authorized the scoped implementation described in the task. Inspect before editing, preserve unrelated user changes, and do not touch files outside the allowed paths.${scopeText}\n${workspace?.isolation === "git-worktree" ? `You are inside an isolated Git worktree on branch ${workspace.branch}. Do not create commits, branches, merges, or additional worktrees; the collaboration bridge owns integration.` : "This is a non-Git single-writer session. Codex must pause local writes until your turn completes."}\nImplement the requested work, verify it with appropriate tests, static checks, or rendered evidence, and return the files changed, decisions made, and verification results.`;
 
-  const session = await callApi("POST", "/api/v1/sessions", {
+  try {
+    const session = await callApi("POST", "/api/v1/sessions", {
     title: `Codex K3 collaboration (${options.focus}, ${options.mode})`,
     metadata: { cwd: root, focus: options.focus, mode: options.mode },
     agent_config: {
@@ -481,8 +862,8 @@ async function startJob(options) {
       swarm_mode: false
     }
   });
-  const escaped = encodeURIComponent(String(session.id));
-  const profile = {
+    const escaped = encodeURIComponent(String(session.id));
+    const profile = {
     agent_config: {
       model: K3_MODEL,
       system_prompt: systemPrompt.trim(),
@@ -493,18 +874,19 @@ async function startJob(options) {
       ...(readOnly ? { tools: READ_ONLY_TOOLS } : {})
     }
   };
-  await callApi("POST", `/api/v1/sessions/${escaped}/profile`, profile);
-  const configured = await callApi("GET", `/api/v1/sessions/${escaped}/status`);
-  if (
-    configured.model !== K3_MODEL ||
-    configured.thinking_level !== "max" ||
-    configured.permission !== permissionMode ||
-    Boolean(configured.plan_mode)
-  ) {
-    throw new Error(`Kimi session configuration verification failed for ${session.id}.`);
-  }
+    await callApi("POST", `/api/v1/sessions/${escaped}/profile`, profile);
+    const configured = await callApi("GET", `/api/v1/sessions/${escaped}/status`);
+    if (
+      configured.model !== K3_MODEL ||
+      configured.thinking_level !== "max" ||
+      configured.permission !== permissionMode ||
+      Boolean(configured.plan_mode)
+    ) {
+      throw new Error(`Kimi session configuration verification failed for ${session.id}.`);
+    }
 
-  const submitted = await callApi("POST", `/api/v1/sessions/${escaped}/prompts`, {
+    bindSingleWriter(workspace, String(session.id));
+    const submitted = await callApi("POST", `/api/v1/sessions/${escaped}/prompts`, {
     // Kimi Code 0.26 accepts profile system_prompt/tools fields but does not
     // apply them on its legacy REST route. Keep the profile fields for newer
     // servers and repeat the collaboration contract in the task for 0.26.
@@ -517,21 +899,30 @@ async function startJob(options) {
     swarm_mode: false
   });
 
-  return {
-    kind: "kimi-k3-job",
-    session_id: String(session.id),
-    prompt_id: String(submitted.prompt_id),
-    state: String(submitted.status),
-    mode: options.mode,
-    focus: options.focus,
-    explicit_model: K3_MODEL,
-    server_reported_model: String(configured.model),
-    thinking: String(configured.thinking_level),
-    plan_mode: Boolean(configured.plan_mode),
-    read_only_tools: readOnly ? READ_ONLY_TOOLS : null,
-    verified_k3: configured.model === K3_MODEL,
-    persistent_server: true
-  };
+    return {
+      kind: "kimi-k3-job",
+      session_id: String(session.id),
+      prompt_id: String(submitted.prompt_id),
+      state: String(submitted.status),
+      mode: options.mode,
+      focus: options.focus,
+      explicit_model: K3_MODEL,
+      server_reported_model: String(configured.model),
+      thinking: String(configured.thinking_level),
+      plan_mode: Boolean(configured.plan_mode),
+      read_only_tools: readOnly ? READ_ONLY_TOOLS : null,
+      verified_k3: configured.model === K3_MODEL,
+      persistent_server: true,
+      workspace
+    };
+  } catch (error) {
+    if (workspace) {
+      try {
+        cleanupPreparedWorkspace(workspace);
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 async function sendMessage(options) {
@@ -550,18 +941,54 @@ async function sendMessage(options) {
   }
 
   const readOnly = record.mode !== "execute";
+  let previousIntegration = null;
+  if (!readOnly) {
+    if (["scope_violation", "integration_error"].includes(record.integration?.state)) {
+      throw new Error(`K3 execute workspace requires manual review after ${record.integration.state}; refusing a follow-up turn.`);
+    }
+    if (record.integration) {
+      previousIntegration = record.integration;
+      record.integration_history = [...(record.integration_history || []), record.integration];
+      record.integration = null;
+    }
+    restoreExecutionWorkspace(record);
+    if (record.workspace?.isolation === "git-worktree") {
+      record.workspace.base_commit = runGit(record.workspace.worktree_root, ["rev-parse", "HEAD"]).trim();
+    }
+    record.workspace.turn_finalized_for = null;
+    bindSingleWriter(record.workspace, sessionId);
+    writeJobRecord(record);
+  }
   const reminder = readOnly
     ? "Continue in analysis-only mode. Do not modify files or run shell commands."
     : "Continue within the previously authorized file scope and verify any changes.";
-  const submitted = await callApi("POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompts`, {
-    content: [{ type: "text", text: `${reminder}\n\nFollow-up from Codex:\n${prompt}` }],
-    metadata: { delegated_by: "codex", collaboration: record.focus || "general" },
-    model: K3_MODEL,
-    thinking: "max",
-    permission_mode: readOnly ? "manual" : "auto",
-    plan_mode: false,
-    swarm_mode: false
-  });
+  let submitted;
+  try {
+    submitted = await callApi("POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompts`, {
+      content: [{ type: "text", text: `${reminder}\n\nFollow-up from Codex:\n${prompt}` }],
+      metadata: { delegated_by: "codex", collaboration: record.focus || "general" },
+      model: K3_MODEL,
+      thinking: "max",
+      permission_mode: readOnly ? "manual" : "auto",
+      plan_mode: false,
+      swarm_mode: false
+    });
+  } catch (error) {
+    if (!readOnly) {
+      if (previousIntegration) {
+        record.integration = previousIntegration;
+        record.integration_history = (record.integration_history || []).slice(0, -1);
+      }
+      if (record.workspace?.isolation === "single-writer") releaseSingleWriter(record.workspace);
+      if (record.workspace?.isolation === "git-worktree") {
+        try {
+          removeGitWorktree(record.workspace);
+        } catch {}
+      }
+      writeJobRecord(record);
+    }
+    throw error;
+  }
 
   Object.assign(record, {
     prompt_id: String(submitted.prompt_id),
@@ -652,12 +1079,13 @@ async function syncJobRecord(sessionId, record = readJobRecord(sessionId), settl
     mode: next.mode || status.mode,
     focus: next.focus || status.focus
   });
+  if (next.complete) finalizeExecutionSafely(next);
   writeJobRecord(next);
   return {
     kind: "kimi-k3-job-result",
     session_id: sessionId,
     status,
-    complete,
+    complete: Boolean(next.complete),
     result: text,
     record: next
   };
@@ -760,6 +1188,12 @@ function isNewEvent(record, event) {
   return event.seq > record.cursor.seq;
 }
 
+export function eventMatchesCurrentPrompt(record, event) {
+  const eventPromptId = String(event?.payload?.promptId || event?.payload?.prompt_id || "").trim();
+  const recordPromptId = String(record?.prompt_id || "").trim();
+  return !eventPromptId || !recordPromptId || eventPromptId === recordPromptId;
+}
+
 export function applyK3Event(record, event) {
   if (Number.isInteger(event?.seq)) {
     record.cursor = { seq: event.seq, ...(event.epoch ? { epoch: event.epoch } : {}) };
@@ -771,8 +1205,8 @@ export function applyK3Event(record, event) {
     record.state = "running";
     record.complete = false;
   } else if (event?.type === "turn.ended") {
-    record.state = String(payload.reason || "completed");
-    record.complete = payload.reason !== "blocked";
+    record.state = payload.reason === "blocked" ? "blocked" : "running";
+    record.complete = false;
   } else if (event?.type === "prompt.completed") {
     record.state = String(payload.reason || "completed");
     record.complete = true;
@@ -792,7 +1226,8 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
   let record = readJobRecord(sessionId);
   if (record?.complete) {
     const synced = await syncJobRecord(sessionId, record);
-    return { record: synced.record, assistantStreamed: false };
+    record = synced.record;
+    if (record.complete) return { record, assistantStreamed: false };
   }
   if (waitSeconds === 0) {
     const synced = await syncJobRecord(sessionId, record);
@@ -867,6 +1302,12 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
           const synced = await syncJobRecord(sessionId, null);
           record = synced.record;
         }
+        if (PROMPT_TERMINAL_EVENTS.has(frame.type) && !eventMatchesCurrentPrompt(record, frame)) {
+          record.cursor = { seq: frame.seq, ...(frame.epoch ? { epoch: frame.epoch } : {}) };
+          record.updated_at = new Date().toISOString();
+          writeJobRecord(record);
+          continue;
+        }
         if (record.mode === "analyze" && frame.type === "event.approval.requested") {
           await rejectAnalysisApproval(sessionId, frame.payload);
           const toolCallId = String(frame.payload.tool_call_id || "");
@@ -906,14 +1347,17 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
         applyK3Event(record, frame);
         const rendered = renderK3Event(frame, renderState);
         if (rendered) onText(rendered);
-        if (!frame.volatile || Date.now() - lastWrite >= 500 || TERMINAL_EVENTS.has(frame.type)) {
+        if (!frame.volatile || Date.now() - lastWrite >= 500 || CHECKPOINT_EVENTS.has(frame.type)) {
           writeJobRecord(record);
           lastWrite = Date.now();
         }
-        if (TERMINAL_EVENTS.has(frame.type)) {
+        if (CHECKPOINT_EVENTS.has(frame.type)) {
           const synced = await syncJobRecord(sessionId, record, true);
-          websocket.close();
-          return { record: synced.record, assistantStreamed: renderState.assistantStreamed };
+          record = synced.record;
+          if (PROMPT_TERMINAL_EVENTS.has(frame.type) || record.complete || record.state === "blocked" || FAILURE_STATES.has(record.state)) {
+            websocket.close();
+            return { record, assistantStreamed: renderState.assistantStreamed };
+          }
         }
       }
     } catch (error) {
@@ -1004,6 +1448,20 @@ async function main() {
     return;
   }
 
+  if (options.action === "reject-approval") {
+    const sessionId = requireSessionId(options);
+    const approvalId = String(options.approvalId || "").trim();
+    if (!approvalId) throw new Error("--approval-id is required.");
+    printOutput({
+      kind: "kimi-k3-approval",
+      session_id: sessionId,
+      approval_id: approvalId,
+      decision: "rejected",
+      ...await rejectAnalysisApproval(sessionId, { approval_id: approvalId })
+    }, options.outputFormat);
+    return;
+  }
+
   if (options.action === "watch" || options.action === "result") {
     const outcome = await streamJob(
       requireSessionId(options),
@@ -1020,7 +1478,23 @@ async function main() {
 
   if (options.action === "cancel") {
     const sessionId = requireSessionId(options);
-    printOutput({ kind: "kimi-k3-job-cancel", session_id: sessionId, ...await abortActivePrompt(sessionId) }, options.outputFormat);
+    const cancellation = await abortActivePrompt(sessionId);
+    const record = readJobRecord(sessionId);
+    if (record?.mode === "execute") {
+      Object.assign(record, {
+        state: "cancelled",
+        complete: true,
+        updated_at: new Date().toISOString()
+      });
+      finalizeExecutionSafely(record);
+      writeJobRecord(record);
+    }
+    printOutput({
+      kind: "kimi-k3-job-cancel",
+      session_id: sessionId,
+      ...cancellation,
+      integration: record?.integration || null
+    }, options.outputFormat);
     return;
   }
 

@@ -13,20 +13,37 @@ const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.dirname(scriptsDir);
 const bridge = path.join(scriptsDir, "kimi-k3.mjs");
 const mcpServer = path.join(scriptsDir, "mcp-server.mjs");
+const handoffHook = path.join(scriptsDir, "k3-codex-hook.mjs");
 const websocketModule = path.join(scriptsDir, "lib", "local-websocket.mjs");
 const selfTest = path.join(scriptsDir, "self-test.mjs");
 
-for (const script of [bridge, mcpServer, websocketModule, selfTest]) {
+for (const script of [bridge, mcpServer, handoffHook, websocketModule, selfTest]) {
   const checked = spawnSync(process.execPath, ["--check", script], { encoding: "utf8" });
   if (checked.status !== 0) {
     throw new Error(checked.stderr || `Syntax check failed for ${script}`);
   }
 }
 
-const { applyK3Event, createRenderState, renderK3Event } = await import(pathToFileURL(bridge));
+const bridgeUnitHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-bridge-unit-"));
+const originalKimiHome = process.env.KIMI_CODE_HOME;
+process.env.KIMI_CODE_HOME = bridgeUnitHome;
+const {
+  applyK3Event,
+  createRenderState,
+  eventMatchesCurrentPrompt,
+  finalizeExecutionWorkspace,
+  pathsOverlap,
+  prepareExecutionWorkspace,
+  renderK3Event,
+  restoreExecutionWorkspace,
+  scopeViolations
+} = await import(pathToFileURL(bridge));
+if (originalKimiHome == null) delete process.env.KIMI_CODE_HOME;
+else process.env.KIMI_CODE_HOME = originalKimiHome;
 const {
   browserCommand,
   browserToolDefinition,
+  awaitToolDefinition,
   panelResource,
   parseBridgeFooter,
   receiveToolDefinition,
@@ -44,9 +61,15 @@ if (
   startToolDefinition._meta?.["openai/outputTemplate"] !== panelResource.uri ||
   panelResource.mimeType !== "text/html;profile=mcp-app" ||
   toolDefinitions.map((tool) => tool.name).join(",") !==
-    "start_k3_collaboration,open_k3_panel,send_k3_message,receive_k3_events,open_k3_in_browser,get_k3_status,get_k3_result,cancel_k3_job"
+    "start_k3_collaboration,open_k3_panel,send_k3_message,await_k3_result,receive_k3_events,open_k3_in_browser,get_k3_status,get_k3_result,cancel_k3_job"
 ) {
   throw new Error("The direct MCP Apps tool contract is invalid.");
+}
+if (
+  awaitToolDefinition.inputSchema?.properties?.wait_seconds?.default !== 100 ||
+  awaitToolDefinition.inputSchema?.properties?.wait_seconds?.maximum !== 100
+) {
+  throw new Error("The model-visible K3-to-Codex handoff does not use one bounded event wait.");
 }
 if (
   browserToolDefinition._meta?.ui?.visibility?.join(",") !== "app" ||
@@ -71,6 +94,147 @@ if (
   receiveToolDefinition._meta?.["openai/widgetAccessible"] !== true
 ) {
   throw new Error("The pushed K3 event receiver is not private and app-only.");
+}
+
+if (
+  !pathsOverlap("src", "src/app.js") ||
+  pathsOverlap("src", "scripts/app.js") ||
+  scopeViolations(["src/app.js", "README.md"], ["src"]).join(",") !== "README.md"
+) {
+  throw new Error("The execute-mode path overlap guard is invalid.");
+}
+
+function checkedGit(cwd, args) {
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true });
+  if (result.status !== 0) throw new Error(result.stderr || result.stdout || `git ${args.join(" ")} failed`);
+  return result.stdout.trim();
+}
+
+const isolationFixture = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-isolation-"));
+try {
+  checkedGit(isolationFixture, ["init"]);
+  checkedGit(isolationFixture, ["config", "user.name", "Portable Check"]);
+  checkedGit(isolationFixture, ["config", "user.email", "portable-check@local"]);
+  fs.mkdirSync(path.join(isolationFixture, "src"));
+  fs.mkdirSync(path.join(isolationFixture, "docs"));
+  fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "base\n");
+  fs.writeFileSync(path.join(isolationFixture, "docs", "guide.txt"), "guide\n");
+  checkedGit(isolationFixture, ["add", "--all"]);
+  checkedGit(isolationFixture, ["commit", "-m", "fixture"]);
+  fs.writeFileSync(path.join(isolationFixture, "docs", "local.txt"), "unrelated local change\n");
+
+  const prepared = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  if (prepared.workspace.isolation !== "git-worktree" || !fs.existsSync(prepared.workspace.worktree_root)) {
+    throw new Error("Git execute mode did not create an isolated worktree.");
+  }
+  fs.writeFileSync(path.join(prepared.cwd, "src", "feature.txt"), "k3 isolated change\n");
+  const record = {
+    session_id: "session_isolation_fixture",
+    prompt_id: "prompt_isolation_fixture",
+    mode: "execute",
+    workspace: prepared.workspace
+  };
+  const handoff = finalizeExecutionWorkspace(record);
+  if (
+    handoff.state !== "ready" ||
+    !handoff.commit ||
+    fs.existsSync(prepared.workspace.worktree_root) ||
+    fs.readFileSync(path.join(isolationFixture, "src", "feature.txt"), "utf8") !== "base\n" ||
+    checkedGit(isolationFixture, ["show", `${handoff.commit}:src/feature.txt`]) !== "k3 isolated change"
+  ) {
+    throw new Error("The isolated Git handoff changed the source checkout or lost its commit.");
+  }
+
+  restoreExecutionWorkspace(record);
+  record.prompt_id = "prompt_isolation_followup";
+  record.workspace.base_commit = checkedGit(record.workspace.worktree_root, ["rev-parse", "HEAD"]);
+  record.workspace.turn_finalized_for = null;
+  fs.writeFileSync(path.join(record.workspace.cwd, "src", "feature.txt"), "k3 follow-up change\n");
+  const followupHandoff = finalizeExecutionWorkspace(record);
+  if (
+    followupHandoff.commits.length !== 2 ||
+    fs.existsSync(record.workspace.worktree_root) ||
+    checkedGit(isolationFixture, ["show", `${followupHandoff.commit}:src/feature.txt`]) !== "k3 follow-up change"
+  ) {
+    throw new Error("An execute-mode follow-up did not recreate and finalize the isolated worktree.");
+  }
+
+  fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "overlapping local change\n");
+  let overlapRejected = false;
+  try {
+    prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  } catch (error) {
+    overlapRejected = String(error).includes("overlapping K3 allowed_paths");
+  }
+  if (!overlapRejected) throw new Error("Parallel execute mode accepted overlapping source changes.");
+
+  fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "base\n");
+  const scoped = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  fs.writeFileSync(path.join(scoped.workspace.worktree_root, "README.md"), "outside scope\n");
+  const scopedRecord = {
+    session_id: "session_scope_fixture",
+    prompt_id: "prompt_scope_fixture",
+    mode: "execute",
+    workspace: scoped.workspace
+  };
+  const scopedHandoff = finalizeExecutionWorkspace(scopedRecord);
+  if (scopedHandoff.state !== "scope_violation" || !fs.existsSync(scoped.workspace.worktree_root)) {
+    throw new Error("A scope violation was not blocked and preserved for review.");
+  }
+  checkedGit(isolationFixture, ["worktree", "remove", "--force", scoped.workspace.worktree_root]);
+  checkedGit(isolationFixture, ["branch", "-D", scoped.workspace.branch]);
+
+  const conflicting = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  fs.writeFileSync(path.join(conflicting.cwd, "src", "feature.txt"), "k3 conflict\n");
+  fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "codex conflict\n");
+  checkedGit(isolationFixture, ["add", "src/feature.txt"]);
+  checkedGit(isolationFixture, ["commit", "-m", "concurrent Codex change"]);
+  const conflictHandoff = finalizeExecutionWorkspace({
+    session_id: "session_conflict_fixture",
+    prompt_id: "prompt_conflict_fixture",
+    mode: "execute",
+    workspace: conflicting.workspace
+  });
+  if (
+    conflictHandoff.state !== "conflict_likely" ||
+    conflictHandoff.overlapping_source_paths.join(",") !== "src/feature.txt" ||
+    conflictHandoff.source_committed_paths.join(",") !== "src/feature.txt" ||
+    fs.readFileSync(path.join(isolationFixture, "src", "feature.txt"), "utf8") !== "codex conflict\n"
+  ) {
+    throw new Error("The handoff did not flag a source/K3 path conflict without overwriting Codex changes.");
+  }
+
+  const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-single-writer-"));
+  try {
+    const first = prepareExecutionWorkspace(nonGit, [nonGit]);
+    let secondRejected = false;
+    try {
+      prepareExecutionWorkspace(nonGit, [nonGit]);
+    } catch (error) {
+      secondRejected = String(error).includes("already owns the non-Git directory");
+    }
+    if (!secondRejected || first.workspace.isolation !== "single-writer") {
+      throw new Error("The non-Git single-writer lock accepted a concurrent writer.");
+    }
+    finalizeExecutionWorkspace({
+      session_id: "session_single_writer_fixture",
+      prompt_id: "prompt_single_writer_fixture",
+      mode: "execute",
+      workspace: first.workspace
+    });
+    const reacquired = prepareExecutionWorkspace(nonGit, [nonGit]);
+    finalizeExecutionWorkspace({
+      session_id: "session_single_writer_reacquired",
+      prompt_id: "prompt_single_writer_reacquired",
+      mode: "execute",
+      workspace: reacquired.workspace
+    });
+  } finally {
+    fs.rmSync(nonGit, { recursive: true, force: true });
+  }
+} finally {
+  fs.rmSync(isolationFixture, { recursive: true, force: true });
+  fs.rmSync(bridgeUnitHome, { recursive: true, force: true });
 }
 
 function websocketFrame(value) {
@@ -120,15 +284,16 @@ relayServer.on("upgrade", (request, socket) => {
         { type: "turn.started", session_id: "session_portable_mcp", seq: 1, payload: { turnId: "turn_fixture" } },
         { type: "assistant.delta", session_id: "session_portable_mcp", seq: 2, volatile: true, offset: 0, payload: { turnId: "turn_fixture", delta: "A" } },
         { type: "assistant.delta", session_id: "session_portable_mcp", seq: 2, volatile: true, offset: 1, payload: { turnId: "turn_fixture", delta: "B" } },
-        sharedToolStart
+        sharedToolStart,
+        { type: "event.approval.requested", session_id: "session_portable_mcp", seq: 4, payload: { approval_id: "approval_fixture", tool_call_id: "tool_bash", tool_name: "Bash" } }
       ]
     : [
         { type: "server_hello", payload: { protocol_version: 1 } },
         sharedToolStart,
-        { type: "tool.progress", session_id: "session_portable_mcp", seq: 4, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "x".repeat(300000) } } },
-        { type: "tool.progress", session_id: "session_portable_mcp", seq: 4, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "y".repeat(300000) } } },
-        { type: "tool.result", session_id: "session_portable_mcp", seq: 5, payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
-        { type: "turn.ended", session_id: "session_portable_mcp", seq: 6, payload: { turnId: "turn_fixture", reason: "completed" } }
+        { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "x".repeat(300000) } } },
+        { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "y".repeat(300000) } } },
+        { type: "tool.result", session_id: "session_portable_mcp", seq: 6, payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
+        { type: "turn.ended", session_id: "session_portable_mcp", seq: 7, payload: { turnId: "turn_fixture", reason: "completed" } }
       ];
   socket.write(Buffer.concat([headers, ...frames.map(websocketFrame)]));
   if (relayConnectionCount === 1) setTimeout(() => socket.destroy(), 20);
@@ -144,8 +309,11 @@ fs.writeFileSync(
 fs.writeFileSync(path.join(mcpFixtureHome, "server.token"), fixtureToken, "utf8");
 fs.writeFileSync(stubBridge, `
 import fs from "node:fs";
-const [action] = process.argv.slice(2);
+if (process.env.KIMI_K3_HOOK_FAIL === "1") process.exit(4);
+const [action, ...args] = process.argv.slice(2);
+const value = (flag) => args[args.indexOf(flag) + 1];
 const session = "session_portable_mcp";
+const requestedSession = value("--session-id") || session;
 const footer = (status) => \`---\\nKimi K3 session: \${session}\\nMode: analyze\\nFocus: engineering\\nStatus: \${status}\\nModel: kimi-code/k3 (verified)\\n\`;
 if (action === "start") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
@@ -156,7 +324,14 @@ if (action === "start") {
 } else if (action === "status") {
   process.stdout.write(JSON.stringify({ session_id: session, state: "completed", busy: false, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "result") {
-  process.stdout.write(\`# Stub K3 report\\n\\nOriginal Markdown.\\n\\n\${footer("completed")}\`);
+  process.stdout.write(value("--format") === "json"
+    ? JSON.stringify(requestedSession === "session_running"
+      ? { session_id: requestedSession, state: "running", complete: false, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
+      : { session_id: requestedSession, state: "max_tokens", complete: true, result: "# Stub K3 report\\n\\nOriginal Markdown.", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true })
+    : \`# Stub K3 report\\n\\nOriginal Markdown.\\n\\n\${footer("completed")}\`);
+} else if (action === "reject-approval") {
+  fs.writeFileSync(process.env.KIMI_CODE_HOME + "/approval-rejected", "1");
+  process.stdout.write(JSON.stringify({ session_id: session, approval_id: "approval_fixture", decision: "rejected", resolved: true }));
 } else if (action === "cancel") {
   process.stdout.write(JSON.stringify({ session_id: session, prompt_id: "prompt_stub", aborted: true }));
 } else if (action === "ensure") {
@@ -239,6 +414,14 @@ try {
     name: "open_k3_in_browser",
     arguments: { session_id: "session_portable_mcp" }
   });
+  const awaited = await request(nextRequestId++, "tools/call", {
+    name: "await_k3_result",
+    arguments: { session_id: "session_portable_mcp", wait_seconds: 1 }
+  });
+  const runningAwaited = await request(nextRequestId++, "tools/call", {
+    name: "await_k3_result",
+    arguments: { session_id: "session_running", wait_seconds: 1 }
+  });
   const messaged = await request(nextRequestId++, "tools/call", {
     name: "send_k3_message",
     arguments: { session_id: "session_portable_mcp", prompt: "Challenge the retry policy." }
@@ -262,7 +445,7 @@ try {
 
   if (
     initialized.result?.serverInfo?.name !== "Kimi K3 Collab" ||
-    listed.result?.tools?.length !== 8 ||
+    listed.result?.tools?.length !== 9 ||
     resources.result?.resources?.[0]?.uri !== panelResource.uri ||
     panel.result?.contents?.[0]?.mimeType !== panelResource.mimeType ||
     !panel.result?.contents?.[0]?.text?.includes("Kimi K3 live session") ||
@@ -273,6 +456,7 @@ try {
     !panel.result?.contents?.[0]?.text?.includes("receive_k3_events") ||
     !panel.result?.contents?.[0]?.text?.includes("open_k3_in_browser") ||
     !panel.result?.contents?.[0]?.text?.includes("send_k3_message") ||
+    !panel.result?.contents?.[0]?.text?.includes("relay.policy") ||
     !panel.result?.contents?.[0]?.text?.includes("stream gap: resumed at source offset") ||
     panel.result?.contents?.[0]?.text?.includes("<iframe") ||
     panel.result?.contents?.[0]?._meta?.ui?.csp?.connectDomains !== undefined ||
@@ -305,6 +489,12 @@ try {
     privateOrigin !== undefined ||
     openedPanelUrl !== privatePanelUrl ||
     browserOpened.result?.structuredContent?.opened !== true ||
+    awaited.result?.structuredContent?.complete !== true ||
+    !awaited.result?.content?.[0]?.text?.includes("# Stub K3 report") ||
+    runningAwaited.result?.structuredContent?.complete !== false ||
+    !runningAwaited.result?.content?.[0]?.text?.includes("do not narrate the same waiting state") ||
+    !runningAwaited.result?.content?.[0]?.text?.includes("inspect Git/status as filler") ||
+    !runningAwaited.result?.content?.[0]?.text?.includes("for polling") ||
     JSON.stringify(browserOpened.result?.structuredContent).includes(fixtureToken) ||
     modelVisible.includes(fixtureToken) ||
     JSON.stringify(opened.result?.structuredContent).includes(fixtureToken) ||
@@ -318,9 +508,11 @@ try {
     relayedFrames.filter((frame) => frame.type === "assistant.delta" && frame.seq === 2).length !== 2 ||
     relayedFrames.filter((frame) => frame.type === "tool.call.started" && frame.seq === 3).length !== 1 ||
     !relayedFrames.some((frame) => frame.type === "tool.result") ||
+    !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.status === "rejected") ||
+    !fs.existsSync(path.join(mcpFixtureHome, "approval-rejected")) ||
     maxRelayedBatchBytes > 520000 ||
     relayCursor < relayedFrames.length ||
-    [started, opened, browserOpened, messaged, status, result, cancelled].some((message) =>
+    [started, opened, browserOpened, awaited, runningAwaited, messaged, status, result, cancelled].some((message) =>
       message.result?.content?.[0]?.text?.trimStart().startsWith("{")
     )
   ) {
@@ -328,6 +520,196 @@ try {
   }
   if (!invalid.result?.isError || invalid.error) {
     throw new Error("MCP tool execution errors are not returned with the MCP isError result shape.");
+  }
+
+  const hookData = path.join(mcpFixtureHome, "hook-data");
+  const hookEnvironment = {
+    ...process.env,
+    PLUGIN_ROOT: root,
+    PLUGIN_DATA: hookData,
+    KIMI_K3_HOOK_BRIDGE: stubBridge,
+    KIMI_CODE_HOME: mcpFixtureHome,
+    KIMI_K3_STOP_MAX_WAIT_SECONDS: "1"
+  };
+  const runHook = (input, env = {}) => spawnSync(process.execPath, [handoffHook], {
+    cwd: root,
+    env: { ...hookEnvironment, ...env },
+    input: JSON.stringify(input),
+    encoding: "utf8",
+    timeout: 5000
+  });
+  const tracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: "codex_fixture",
+    turn_id: "codex_turn",
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_portable_mcp", status: "running" } }
+  });
+  const handedOff = runHook({
+    hook_event_name: "Stop",
+    session_id: "codex_fixture",
+    turn_id: "codex_turn",
+    stop_hook_active: false
+  });
+  const released = runHook({
+    hook_event_name: "Stop",
+    session_id: "codex_fixture",
+    turn_id: "codex_turn_2",
+    stop_hook_active: true
+  });
+  const guardSession = "codex_guard_fixture";
+  const guardTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: guardSession,
+    turn_id: "codex_guard_turn",
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_portable_mcp", status: "running" } }
+  });
+  const guardFile = path.join(hookData, "handoffs", `${createHash("sha256").update(guardSession).digest("hex")}.json`);
+  const guardState = JSON.parse(fs.readFileSync(guardFile, "utf8"));
+  fs.writeFileSync(guardFile, JSON.stringify({ ...guardState, stopContinuationIssued: true }), "utf8");
+  const guarded = runHook({
+    hook_event_name: "Stop",
+    session_id: guardSession,
+    turn_id: "codex_guard_turn_2"
+  });
+  const cancelSession = "codex_cancel_fixture";
+  const cancelTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: cancelSession,
+    turn_id: "codex_cancel_turn",
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_portable_mcp", status: "running" } }
+  });
+  const cancelHandled = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: cancelSession,
+    turn_id: "codex_cancel_turn",
+    tool_name: "mcp__kimi_k3__cancel_k3_job",
+    tool_response: { structuredContent: { session_id: "session_portable_mcp", aborted: true } }
+  });
+  const cancelStop = runHook({
+    hook_event_name: "Stop",
+    session_id: cancelSession,
+    turn_id: "codex_cancel_turn_2"
+  });
+  const transcriptSession = "codex_transcript_fixture";
+  const transcript = path.join(mcpFixtureHome, "codex-transcript.jsonl");
+  const transcriptEvent = (server, tool, result, args = {}) => JSON.stringify({
+    type: "event_msg",
+    payload: {
+      type: "mcp_tool_call_end",
+      invocation: { server, tool, arguments: args },
+      result
+    }
+  });
+  fs.writeFileSync(transcript, [
+    "x".repeat(2 * 1024 * 1024 + 16),
+    transcriptEvent("kimi-k3", "await_k3_result", { Ok: { structuredContent: { session_id: "session_old", status: "completed", complete: true } } }),
+    transcriptEvent("kimi-k3", "start_k3_collaboration", { Ok: { structuredContent: { session_id: "session_portable_mcp", status: "running" } } }),
+    transcriptEvent("other-server", "start_k3_collaboration", { Ok: { structuredContent: { session_id: "session_other", status: "running" } } })
+  ].join("\n"), "utf8");
+  const transcriptHandoff = runHook({
+    hook_event_name: "Stop",
+    session_id: transcriptSession,
+    turn_id: "codex_transcript_turn",
+    transcript_path: transcript
+  });
+  const transcriptFile = path.join(hookData, "handoffs", `${createHash("sha256").update(transcriptSession).digest("hex")}.json`);
+  const transcriptState = JSON.parse(fs.readFileSync(transcriptFile, "utf8"));
+  const retrySession = "codex_retry_fixture";
+  const retryTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: retrySession,
+    turn_id: "codex_retry_turn",
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_portable_mcp", status: "running" } }
+  });
+  const failedOnce = runHook({
+    hook_event_name: "Stop",
+    session_id: retrySession,
+    turn_id: "codex_retry_turn_2"
+  }, { KIMI_K3_HOOK_FAIL: "1" });
+  const retryFile = path.join(hookData, "handoffs", `${createHash("sha256").update(retrySession).digest("hex")}.json`);
+  const retryState = JSON.parse(fs.readFileSync(retryFile, "utf8"));
+  const retried = runHook({
+    hook_event_name: "Stop",
+    session_id: retrySession,
+    turn_id: "codex_retry_turn_3"
+  });
+  const persistentFailureSession = "codex_persistent_failure_fixture";
+  const persistentFailureTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: persistentFailureSession,
+    turn_id: "codex_persistent_failure_turn",
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_portable_mcp", status: "running" } }
+  });
+  const persistentFailureFirst = runHook({
+    hook_event_name: "Stop",
+    session_id: persistentFailureSession,
+    turn_id: "codex_persistent_failure_turn_2"
+  }, { KIMI_K3_HOOK_FAIL: "1" });
+  const persistentFailureSecond = runHook({
+    hook_event_name: "Stop",
+    session_id: persistentFailureSession,
+    turn_id: "codex_persistent_failure_turn_3"
+  }, { KIMI_K3_HOOK_FAIL: "1" });
+  const persistentFailureFile = path.join(hookData, "handoffs", `${createHash("sha256").update(persistentFailureSession).digest("hex")}.json`);
+  const persistentFailureState = JSON.parse(fs.readFileSync(persistentFailureFile, "utf8"));
+  const malformed = spawnSync(process.execPath, [handoffHook], {
+    cwd: root,
+    env: hookEnvironment,
+    input: "not-json",
+    encoding: "utf8",
+    timeout: 5000
+  });
+  const nullPayload = spawnSync(process.execPath, [handoffHook], {
+    cwd: root,
+    env: hookEnvironment,
+    input: "null",
+    encoding: "utf8",
+    timeout: 5000
+  });
+  if (
+    tracked.status !== 0 ||
+    handedOff.status !== 0 ||
+    released.status !== 0 ||
+    guardTracked.status !== 0 ||
+    guarded.status !== 0 ||
+    cancelTracked.status !== 0 ||
+    cancelHandled.status !== 0 ||
+    cancelStop.status !== 0 ||
+    transcriptHandoff.status !== 0 ||
+    retryTracked.status !== 0 ||
+    failedOnce.status !== 0 ||
+    retried.status !== 0 ||
+    persistentFailureTracked.status !== 0 ||
+    persistentFailureFirst.status !== 0 ||
+    persistentFailureSecond.status !== 0 ||
+    malformed.status !== 0 ||
+    nullPayload.status !== 0 ||
+    JSON.parse(handedOff.stdout).decision !== "block" ||
+    !JSON.parse(handedOff.stdout).reason.includes("# Stub K3 report") ||
+    JSON.parse(released.stdout).continue !== true ||
+    JSON.parse(guarded.stdout).continue !== true ||
+    JSON.parse(cancelStop.stdout).continue !== true ||
+    JSON.parse(transcriptHandoff.stdout).decision !== "block" ||
+    !JSON.parse(transcriptHandoff.stdout).reason.includes("# Stub K3 report") ||
+    transcriptState.k3SessionId !== "session_portable_mcp" ||
+    JSON.parse(failedOnce.stdout).decision !== "block" ||
+    retryState.handoffFailures !== 1 ||
+    retryState.stopContinuationIssued !== false ||
+    JSON.parse(retried.stdout).decision !== "block" ||
+    !JSON.parse(retried.stdout).reason.includes("# Stub K3 report") ||
+    JSON.parse(persistentFailureFirst.stdout).decision !== "block" ||
+    JSON.parse(persistentFailureSecond.stdout).continue !== true ||
+    persistentFailureState.handoffFailures !== 2 ||
+    persistentFailureState.stopContinuationIssued !== true ||
+    Object.keys(JSON.parse(malformed.stdout)).length !== 0 ||
+    Object.keys(JSON.parse(nullPayload.stdout)).length !== 0
+  ) {
+    throw new Error("The Stop hook did not deliver exactly once, break loops, or honor cancellation.");
   }
   const cancelledReceiveId = nextRequestId++;
   mcpChild.stdin.write(`${JSON.stringify({
@@ -386,8 +768,23 @@ applyK3Event(cursorRecord, {
   epoch: "epoch_portable",
   payload: { reason: "completed" }
 });
-if (cursorRecord.cursor?.seq !== 42 || cursorRecord.cursor?.epoch !== "epoch_portable" || !cursorRecord.complete) {
-  throw new Error("The durable event cursor or terminal state was not advanced.");
+if (cursorRecord.cursor?.seq !== 42 || cursorRecord.cursor?.epoch !== "epoch_portable" || cursorRecord.complete) {
+  throw new Error("The bridge treated a turn checkpoint as full prompt completion.");
+}
+applyK3Event(cursorRecord, {
+  type: "prompt.completed",
+  seq: 43,
+  epoch: "epoch_portable",
+  payload: { reason: "completed" }
+});
+if (!cursorRecord.complete || cursorRecord.state !== "completed") {
+  throw new Error("The durable prompt terminal state was not advanced.");
+}
+if (
+  eventMatchesCurrentPrompt({ prompt_id: "prompt_new" }, { payload: { promptId: "prompt_old" } }) ||
+  !eventMatchesCurrentPrompt({ prompt_id: "prompt_new" }, { payload: { promptId: "prompt_new" } })
+) {
+  throw new Error("Late terminal events can be attributed to the wrong K3 prompt.");
 }
 
 const websocketServer = http.createServer();
@@ -449,9 +846,26 @@ const skillContract = fs.readFileSync(path.join(root, "skills", "kimi-k3-collab"
 if (
   /kimi-k3\.mjs|--wait-seconds|17 event-stream windows/i.test(skillContract) ||
   !skillContract.includes("Do not spawn a Codex subagent") ||
-  !skillContract.includes("Never create an automatic status loop")
+  !skillContract.includes("await_k3_result") ||
+  !skillContract.includes("Stop hook") ||
+  !skillContract.includes("isolated worktree") ||
+  !skillContract.includes("isolation=single-writer")
 ) {
-  throw new Error("The direct MCP skill still depends on a subagent or model-driven polling.");
+  throw new Error("The direct MCP skill lacks parallel work or the K3-to-Codex handoff contract.");
+}
+
+const hooksManifest = JSON.parse(fs.readFileSync(path.join(root, "hooks", "hooks.json"), "utf8"));
+const hookText = fs.readFileSync(handoffHook, "utf8");
+if (
+  hooksManifest.hooks?.Stop?.[0]?.hooks?.[0]?.timeout !== 600 ||
+  !hooksManifest.hooks?.PostToolUse?.[0]?.matcher?.includes("await_k3_result") ||
+  !hooksManifest.hooks?.PostToolUse?.[0]?.matcher?.includes("cancel_k3_job") ||
+  !hooksManifest.hooks?.Stop?.[0]?.hooks?.[0]?.commandWindows ||
+  !hookText.includes('decision: "block"') ||
+  !hookText.includes("|| 540") ||
+  !hookText.includes("authentic K3-to-Codex collaborator output")
+) {
+  throw new Error("The plugin-bundled K3-to-Codex Stop handoff is invalid.");
 }
 
 const pluginManifest = JSON.parse(fs.readFileSync(path.join(root, ".codex-plugin", "plugin.json"), "utf8"));
@@ -491,7 +905,11 @@ if (
   mcpServerText.includes('"kimi-k3/token"') ||
   mcpServerText.includes('"kimi-k3/origin"') ||
   !mcpServerText.includes('name: "receive_k3_events"') ||
+  !mcpServerText.includes('name: "await_k3_result"') ||
   !mcpServerText.includes('name: "open_k3_in_browser"') ||
+  !mcpServerText.includes("isolated Git commit handoff") ||
+  !mcpServerText.includes('frame.type === "event.approval.requested"') ||
+  !mcpServerText.includes('"reject-approval"') ||
   !mcpServerText.includes('visibility: ["app"]') ||
   !mcpServerText.includes("MAX_RELAY_BUFFER_BYTES") ||
   !mcpServerText.includes("MAX_EVENT_BATCH_BYTES") ||
@@ -501,7 +919,13 @@ if (
 ) {
   throw new Error("The MCP server still contains the old polling/iframe path or lacks the private event panel contract.");
 }
-if (!bridgeText.includes('"TodoList"') || !bridgeText.includes("Do not call Bash")) {
+if (
+  !bridgeText.includes('"TodoList"') ||
+  !bridgeText.includes("Do not call Bash") ||
+  !bridgeText.includes('isolation: "git-worktree"') ||
+  !bridgeText.includes('isolation: "single-writer"') ||
+  !bridgeText.includes('state: "scope_violation"')
+) {
   throw new Error("Analysis mode does not allow safe planning while forbidding shell execution.");
 }
 if (!bridgeText.includes("PROCESS_DEADLINE = Date.now() + 115000") || !bridgeText.includes("cursor: { seq: 0 }")) {

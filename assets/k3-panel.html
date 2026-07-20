@@ -605,6 +605,10 @@
           }
           return;
         }
+        if (frame.type === "relay.policy") {
+          addNotice(frame.payload?.message || "K3 read-only policy handled an approval request.", frame.payload?.status === "failed");
+          return;
+        }
         if (frame.type === "error" && !frame.session_id) {
           addNotice(frame.payload?.msg || "Kimi WebSocket error", true);
           if (frame.payload?.fatal) {
@@ -623,7 +627,12 @@
           addNotice("K3 turn started");
           return;
         }
-        if (frame.type === "turn.ended" || frame.type === "prompt.completed" || frame.type === "prompt.aborted") {
+        if (frame.type === "turn.ended") {
+          addNotice(`K3 turn ended: ${payload.reason || "completed"}`);
+          setConnection("K3 is continuing", "busy");
+          return;
+        }
+        if (frame.type === "prompt.completed" || frame.type === "prompt.aborted") {
           const reason = payload.reason || frame.type.split(".").at(-1);
           const assistant = state.assistants.get(payload.turnId || state.currentTurnId);
           if (assistant) { assistant.card.classList.remove("running"); assistant.card.classList.add(reason === "completed" ? "success" : ""); }

@@ -3,7 +3,7 @@
   "version": "0.5.0",
   "private": true,
   "type": "module",
-  "description": "Direct Kimi K3 collaboration panel for Codex.",
+  "description": "Concurrent Codex and Kimi K3 collaboration with direct results and isolated Git execution.",
   "repository": {
     "type": "git",
     "url": "https://github.com/entropyMin/kimi-k3-collab.git"
