@@ -921,6 +921,14 @@ async function startJob(options) {
     throw new Error(`Working directory does not exist: ${sourceRoot}`);
   }
   const readOnly = options.mode === "analyze";
+  let allowedOriginal = null;
+  if (!readOnly) {
+    const items = options.allowedPaths.flatMap((value) => value.split(";")).map((value) => value.trim()).filter(Boolean);
+    if (items.length === 0) {
+      throw new Error("Execution mode requires at least one --allowed-path.");
+    }
+    allowedOriginal = items.map((item) => verifyWithinRoot(sourceRoot, item));
+  }
   const service = await ensureService();
   const compatibility = kimiCompatibility(service.version);
   const models = await callApi("GET", "/api/v1/models");
@@ -933,11 +941,6 @@ async function startJob(options) {
   let workspace = null;
   let scopeText = "";
   if (!readOnly) {
-    const items = options.allowedPaths.flatMap((value) => value.split(";")).map((value) => value.trim()).filter(Boolean);
-    if (items.length === 0) {
-      throw new Error("Execution mode requires at least one --allowed-path.");
-    }
-    const allowedOriginal = items.map((item) => verifyWithinRoot(sourceRoot, item));
     const prepared = prepareExecutionWorkspace(sourceRoot, allowedOriginal);
     root = prepared.cwd;
     workspace = prepared.workspace;
