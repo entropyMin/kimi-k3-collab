@@ -4,17 +4,19 @@ Kimi K3 Collab lets Codex and persistent `kimi-code/k3` work on complementary ta
 
 The plugin is cross-platform and uses only the Node.js standard library. It does not add a forwarding model, a React build, or a status polling loop.
 
+![K3 result handoff and edit handoff](docs/images/k3-handoff-flow.svg)
+
 ## How it works
 
 1. Codex splits the work and calls `start_k3_collaboration` with K3's independent subtask. The verified K3 session returns immediately.
 2. The plugin's MCP server keeps one authenticated loopback WebSocket open for that Kimi session.
 3. Codex renders `ui://kimi-k3/live-session-v3.html` as an MCP App component.
 4. The component receives raw Kimi frames through the official MCP Apps host bridge and renders Markdown, tools, tasks, subagents, and state changes inside Codex.
-5. Codex continues its own different subtask, then calls `await_k3_result`. One event-driven wait returns K3's original Markdown into Codex's model context.
-6. The user or Codex can respond to K3 with `send_k3_message`; the next K3 result returns through the same handoff.
+5. Codex continues its own different subtask, then calls `await_k3_result`. One event-driven wait completes the **result handoff** by returning K3's original Markdown into Codex's model context.
+6. The user or Codex can respond to K3 with `send_k3_message`; the next K3 result returns through the same result handoff.
 7. A plugin-bundled Stop hook prevents Codex from silently ending while a started K3 session still has an undelivered result.
 
-For `execute` mode in a Git project, the bridge creates a per-session temporary branch and worktree. K3 never writes the source checkout. When the turn finishes, the bridge rejects out-of-scope changes, squashes the allowed changes into one local commit, checks for overlapping source changes, removes the temporary worktree, and returns the branch/commit to Codex for review. It never merges or cherry-picks automatically.
+For the separate **edit handoff** in `execute` mode, the bridge creates a per-session temporary branch and worktree. K3 never writes the source checkout. When the turn finishes, the bridge rejects out-of-scope changes, squashes the allowed changes into one local commit, checks for overlapping source changes, removes the temporary worktree, and returns the branch/commit to Codex for review. It never merges or cherry-picks automatically.
 
 The Kimi server remains the source of truth. Session snapshots are stored under `$KIMI_CODE_HOME/codex-jobs` and active isolated checkouts under `$KIMI_CODE_HOME/codex-worktrees` (default root: `~/.kimi-code`).
 
@@ -26,6 +28,24 @@ The Kimi server remains the source of truth. Session snapshots are stored under 
 - K3's completed report delivered directly into Codex for reconciliation
 - An isolated Git branch/commit handoff for authorized K3 edits
 - Full-screen and browser fallbacks
+
+### Embedded panel in Codex
+
+![The full-width K3 event panel inside Codex](docs/images/codex-k3-live-panel.png)
+
+_The embedded panel keeps K3's original prompt, tool events, completion state, and direct-reply composer visible at full content width._
+
+### Result handoff back to Codex
+
+![A real K3 panel completion followed by Codex reconciliation](docs/images/codex-k3-handoff-demo.png)
+
+_An analysis-only README review: K3 completes in the live panel, then Codex reconciles the result delivered by `await_k3_result`. No panel copy/paste is required._
+
+### Kimi Code Web fallback
+
+![The same collaboration in Kimi Code Web](docs/images/kimi-code-web-session.png)
+
+_The authenticated Web view opens the same K3 session with its original Markdown, workspace context, and direct-reply composer._
 
 This is an MCP App panel plus a model-visible result handoff, not a native Codex subagent identity. Codex and K3 can own different work while the user sees Kimi's original event stream directly.
 
