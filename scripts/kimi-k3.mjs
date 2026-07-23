@@ -8,8 +8,10 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
+import { READ_ONLY_TOOLS, isReadOnlyTool } from "./lib/k3-policy.mjs";
 
 const K3_MODEL = "kimi-code/k3";
+const TESTED_KIMI_CODE_VERSIONS = new Set(["0.26.0"]);
 const KIMI_HOME = path.resolve(process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code"));
 const JOB_ROOT = path.join(KIMI_HOME, "codex-jobs");
 const WORKTREE_ROOT = path.join(KIMI_HOME, "codex-worktrees");
@@ -19,10 +21,6 @@ const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMPLETE_STATES = new Set(["completed", "cancelled", "failed", "error", "stopped", "end_turn"]);
 const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped"]);
-const READ_ONLY_TOOLS = [
-  "Read", "ReadMediaFile", "Glob", "Grep", "WebSearch", "FetchURL", "TodoList",
-  "Agent", "Skill", "TaskList", "TaskOutput", "GetGoal"
-];
 const PROMPT_TERMINAL_EVENTS = new Set(["prompt.completed", "prompt.aborted"]);
 const CHECKPOINT_EVENTS = new Set(["turn.ended", ...PROMPT_TERMINAL_EVENTS]);
 const PROCESS_DEADLINE = Date.now() + 115000;
@@ -136,6 +134,8 @@ function formatIntegration(value) {
     integration.branch && `Branch: ${integration.branch}`,
     integration.commit && `Commit: ${integration.commit}`,
     integration.changed_paths?.length && `Changed paths: ${integration.changed_paths.join(", ")}`,
+    integration.ignored_paths?.length && `Ignored paths requiring review: ${integration.ignored_paths.join(", ")}`,
+    integration.symlink_paths?.length && `Symbolic links or junctions: ${integration.symlink_paths.join(", ")}`,
     integration.overlapping_source_paths?.length && `Overlapping source changes: ${integration.overlapping_source_paths.join(", ")}`,
     integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`
   ].filter(Boolean).join("\n")}`;
@@ -260,6 +260,26 @@ function nullList(value) {
   return String(value || "").split("\0").filter(Boolean).map(gitPath);
 }
 
+function canonicalPath(value) {
+  const missing = [];
+  let current = path.resolve(value);
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) throw new Error(`Path has no existing ancestor: ${value}`);
+    missing.unshift(path.basename(current));
+    current = parent;
+  }
+  return path.join(fs.realpathSync.native(current), ...missing);
+}
+
+function kimiCompatibility(version) {
+  const normalized = String(version || "").match(/\d+\.\d+\.\d+/)?.[0] || null;
+  return {
+    version: normalized,
+    status: normalized && TESTED_KIMI_CODE_VERSIONS.has(normalized) ? "tested" : "untested"
+  };
+}
+
 function gitDirtyPaths(repo) {
   return [...new Set([
     ...nullList(runGit(repo, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"])),
@@ -274,10 +294,39 @@ function gitChangedPaths(repo, baseCommit) {
   ])];
 }
 
+function gitIgnoredPaths(repo) {
+  return [...new Set(nullList(runGit(repo, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])))];
+}
+
+function symlinkPathsWithinScopes(root, scopes) {
+  const links = new Set();
+  const pending = scopes.map((scope) => ({
+    absolute: path.join(root, ...gitPath(scope).split("/")),
+    relative: gitPath(scope)
+  }));
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const stat = fs.lstatSync(current.absolute, { throwIfNoEntry: false });
+    if (!stat) continue;
+    if (stat.isSymbolicLink()) {
+      links.add(current.relative);
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    for (const entry of fs.readdirSync(current.absolute)) {
+      pending.push({
+        absolute: path.join(current.absolute, entry),
+        relative: gitPath(path.posix.join(current.relative, entry))
+      });
+    }
+  }
+  return [...links].sort();
+}
+
 function findGitRepo(cwd) {
   const result = runCommand("git", ["-C", cwd, "rev-parse", "--show-toplevel"]);
   if (result.error || result.status !== 0) return null;
-  return path.resolve(result.stdout.trim());
+  return canonicalPath(result.stdout.trim());
 }
 
 function removeGitWorktree(workspace, deleteBranch = false) {
@@ -311,8 +360,9 @@ function releaseSingleWriter(workspace) {
 }
 
 function acquireSingleWriter(cwd) {
+  const canonicalCwd = canonicalPath(cwd);
   fs.mkdirSync(WRITE_LOCK_ROOT, { recursive: true, mode: 0o700 });
-  const lockPath = path.join(WRITE_LOCK_ROOT, createHash("sha256").update(path.resolve(cwd)).digest("hex"));
+  const lockPath = path.join(WRITE_LOCK_ROOT, createHash("sha256").update(canonicalCwd).digest("hex"));
   if (fs.existsSync(lockPath)) {
     const ownerFile = path.join(lockPath, "owner.json");
     let owner = null;
@@ -324,14 +374,14 @@ function acquireSingleWriter(cwd) {
     if (record?.complete || (!record && age > 120000)) {
       fs.rmSync(lockPath, { recursive: true, force: true });
     } else {
-      throw new Error(`A K3 execute session already owns the non-Git directory: ${path.resolve(cwd)}`);
+      throw new Error(`A K3 execute session already owns the non-Git directory: ${canonicalCwd}`);
     }
   }
   fs.mkdirSync(lockPath);
   const token = randomUUID();
   writeJsonFile(path.join(lockPath, "owner.json"), {
     token,
-    cwd: path.resolve(cwd),
+    cwd: canonicalCwd,
     session_id: null,
     created_at: new Date().toISOString()
   });
@@ -497,6 +547,8 @@ function createJobRecord(job, options) {
     workspace: job.workspace || null,
     explicit_model: job.explicit_model,
     server_reported_model: job.server_reported_model,
+    kimi_code_version: job.kimi_code_version || null,
+    compatibility_status: job.compatibility_status || "untested",
     verified_k3: job.verified_k3,
     started_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -519,8 +571,9 @@ function requireSessionId(options) {
 }
 
 function verifyWithinRoot(root, candidate) {
-  const resolved = path.resolve(root, candidate);
-  const relative = path.relative(root, resolved);
+  const canonicalRoot = canonicalPath(root);
+  const resolved = canonicalPath(path.resolve(canonicalRoot, candidate));
+  const relative = path.relative(canonicalRoot, resolved);
   if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
     return resolved;
   }
@@ -528,18 +581,19 @@ function verifyWithinRoot(root, candidate) {
 }
 
 export function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths) {
-  const sourceRoot = path.resolve(sourceCwd);
+  const sourceRoot = canonicalPath(sourceCwd);
+  const allowedSourcePaths = allowedAbsolutePaths.map((item) => verifyWithinRoot(sourceRoot, item));
   const repo = findGitRepo(sourceRoot);
   if (!repo) {
     const lock = acquireSingleWriter(sourceRoot);
     return {
       cwd: sourceRoot,
-      allowed: allowedAbsolutePaths,
+      allowed: allowedSourcePaths,
       workspace: {
         isolation: "single-writer",
         source_cwd: sourceRoot,
         cwd: sourceRoot,
-        allowed_paths: allowedAbsolutePaths,
+        allowed_paths: allowedSourcePaths,
         ...lock
       }
     };
@@ -549,7 +603,7 @@ export function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths) {
   if (sourceSubdir.startsWith("..") || path.isAbsolute(sourceSubdir)) {
     throw new Error(`Working directory is outside its reported Git root: ${sourceRoot}`);
   }
-  const allowedRepoPaths = allowedAbsolutePaths.map((item) => gitPath(path.relative(repo, item)));
+  const allowedRepoPaths = allowedSourcePaths.map((item) => gitPath(path.relative(repo, item)));
   const dirtyPaths = gitDirtyPaths(repo);
   const overlaps = dirtyPaths.filter((dirty) => allowedRepoPaths.some((allowed) => pathsOverlap(dirty, allowed)));
   if (overlaps.length > 0) {
@@ -585,7 +639,11 @@ export function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths) {
     if (!fs.statSync(workspace.cwd, { throwIfNoEntry: false })?.isDirectory()) {
       throw new Error(`The working directory is not present in the committed Git snapshot: ${sourceRoot}`);
     }
-    const allowed = allowedAbsolutePaths.map((item) => path.join(worktreeRoot, path.relative(repo, item)));
+    const symlinkPaths = symlinkPathsWithinScopes(worktreeRoot, allowedRepoPaths);
+    if (symlinkPaths.length > 0) {
+      throw new Error(`K3 allowed_paths contain symbolic links or junctions: ${symlinkPaths.join(", ")}`);
+    }
+    const allowed = allowedSourcePaths.map((item) => path.join(worktreeRoot, path.relative(repo, item)));
     workspace.allowed_paths = allowed;
     return { cwd: workspace.cwd, allowed, workspace };
   } catch (error) {
@@ -647,8 +705,28 @@ export function finalizeExecutionWorkspace(record) {
 
   if (workspace.isolation !== "git-worktree") return null;
   const baseCommit = workspace.base_commit;
+  const symlinkPaths = symlinkPathsWithinScopes(workspace.worktree_root, workspace.allowed_repo_paths);
+  if (symlinkPaths.length > 0) {
+    workspace.turn_finalized_for = record.prompt_id;
+    record.integration = {
+      isolation: "git-worktree",
+      state: "scope_violation",
+      branch: workspace.branch,
+      base_commit: baseCommit,
+      worktree_root: workspace.worktree_root,
+      changed_paths: symlinkPaths,
+      symlink_paths: symlinkPaths,
+      scope_violations: symlinkPaths
+    };
+    record.state = "error";
+    record.complete = true;
+    record.error = `K3 allowed_paths contain symbolic links or junctions: ${symlinkPaths.join(", ")}. The isolated worktree was preserved for review.`;
+    return record.integration;
+  }
   const changedPaths = gitChangedPaths(workspace.worktree_root, baseCommit);
-  const violations = scopeViolations(changedPaths, workspace.allowed_repo_paths);
+  const ignoredPaths = gitIgnoredPaths(workspace.worktree_root);
+  const observedPaths = [...new Set([...changedPaths, ...ignoredPaths])];
+  const violations = scopeViolations(observedPaths, workspace.allowed_repo_paths);
   if (violations.length > 0) {
     workspace.turn_finalized_for = record.prompt_id;
     record.integration = {
@@ -657,12 +735,27 @@ export function finalizeExecutionWorkspace(record) {
       branch: workspace.branch,
       base_commit: baseCommit,
       worktree_root: workspace.worktree_root,
-      changed_paths: changedPaths,
+      changed_paths: observedPaths,
+      ignored_paths: ignoredPaths,
       scope_violations: violations
     };
     record.state = "error";
     record.complete = true;
     record.error = `K3 changed files outside allowed_paths: ${violations.join(", ")}. The isolated worktree was preserved for review.`;
+    return record.integration;
+  }
+
+  if (ignoredPaths.length > 0) {
+    workspace.turn_finalized_for = record.prompt_id;
+    record.integration = {
+      isolation: "git-worktree",
+      state: "unintegrated_ignored_files",
+      branch: workspace.branch,
+      base_commit: baseCommit,
+      worktree_root: workspace.worktree_root,
+      changed_paths: observedPaths,
+      ignored_paths: ignoredPaths
+    };
     return record.integration;
   }
 
@@ -788,6 +881,8 @@ async function getJobStatus(sessionId) {
     thinking: String(runtime.thinking_level || ""),
     plan_mode: planMode,
     permission_mode: String(runtime.permission || ""),
+    kimi_code_version: record?.kimi_code_version || null,
+    compatibility_status: record?.compatibility_status || "untested",
     verified_k3: String(runtime.model || "") === K3_MODEL,
     message_count: Number(session.message_count || 0),
     mode: mode || "",
@@ -826,17 +921,26 @@ async function startJob(options) {
     throw new Error(`Working directory does not exist: ${sourceRoot}`);
   }
   const readOnly = options.mode === "analyze";
+  let allowedOriginal = null;
+  if (!readOnly) {
+    const items = options.allowedPaths.flatMap((value) => value.split(";")).map((value) => value.trim()).filter(Boolean);
+    if (items.length === 0) {
+      throw new Error("Execution mode requires at least one --allowed-path.");
+    }
+    allowedOriginal = items.map((item) => verifyWithinRoot(sourceRoot, item));
+  }
+  const service = await ensureService();
+  const compatibility = kimiCompatibility(service.version);
+  const models = await callApi("GET", "/api/v1/models");
+  if (!models.items?.some((item) => item.model === K3_MODEL)) {
+    throw new Error(`The local Kimi service does not advertise required capability ${K3_MODEL}.`);
+  }
   const planMode = false;
   const permissionMode = readOnly ? "manual" : "auto";
   let root = sourceRoot;
   let workspace = null;
   let scopeText = "";
   if (!readOnly) {
-    const items = options.allowedPaths.flatMap((value) => value.split(";")).map((value) => value.trim()).filter(Boolean);
-    if (items.length === 0) {
-      throw new Error("Execution mode requires at least one --allowed-path.");
-    }
-    const allowedOriginal = items.map((item) => verifyWithinRoot(sourceRoot, item));
     const prepared = prepareExecutionWorkspace(sourceRoot, allowedOriginal);
     root = prepared.cwd;
     workspace = prepared.workspace;
@@ -911,6 +1015,8 @@ async function startJob(options) {
       thinking: String(configured.thinking_level),
       plan_mode: Boolean(configured.plan_mode),
       read_only_tools: readOnly ? READ_ONLY_TOOLS : null,
+      kimi_code_version: compatibility.version,
+      compatibility_status: compatibility.status,
       verified_k3: configured.model === K3_MODEL,
       persistent_server: true,
       workspace
@@ -942,12 +1048,14 @@ async function sendMessage(options) {
 
   const readOnly = record.mode !== "execute";
   let previousIntegration = null;
+  let preserveWorktreeOnSendFailure = false;
   if (!readOnly) {
     if (["scope_violation", "integration_error"].includes(record.integration?.state)) {
       throw new Error(`K3 execute workspace requires manual review after ${record.integration.state}; refusing a follow-up turn.`);
     }
     if (record.integration) {
       previousIntegration = record.integration;
+      preserveWorktreeOnSendFailure = record.integration.state === "unintegrated_ignored_files";
       record.integration_history = [...(record.integration_history || []), record.integration];
       record.integration = null;
     }
@@ -980,7 +1088,7 @@ async function sendMessage(options) {
         record.integration_history = (record.integration_history || []).slice(0, -1);
       }
       if (record.workspace?.isolation === "single-writer") releaseSingleWriter(record.workspace);
-      if (record.workspace?.isolation === "git-worktree") {
+      if (record.workspace?.isolation === "git-worktree" && !preserveWorktreeOnSendFailure) {
         try {
           removeGitWorktree(record.workspace);
         } catch {}
@@ -1019,7 +1127,7 @@ async function rejectAnalysisApproval(sessionId, approval) {
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(approvalId)}`,
       {
         decision: "rejected",
-        feedback: "Codex requested read-only analysis. Use Read, Grep, Glob, ReadMediaFile, WebSearch, or FetchURL instead."
+        feedback: "Codex requested read-only analysis. Use Read, Grep, Glob, or ReadMediaFile instead."
       }
     );
   } catch (error) {
@@ -1330,7 +1438,7 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
           writeJobRecord(record);
           continue;
         }
-        if (record.mode === "analyze" && frame.type === "tool.call.started" && !READ_ONLY_TOOLS.includes(frame.payload.name)) {
+        if (record.mode === "analyze" && frame.type === "tool.call.started" && !isReadOnlyTool(frame.payload.name)) {
           applyK3Event(record, frame);
           const cancellation = await abortActivePrompt(sessionId);
           Object.assign(record, {
@@ -1406,6 +1514,7 @@ async function main() {
     if (!model) {
       throw new Error(`The local Kimi service does not advertise ${K3_MODEL}.`);
     }
+    const compatibility = kimiCompatibility(service.version);
     printOutput({
       kind: "kimi-k3-service",
       healthy: true,
@@ -1414,6 +1523,8 @@ async function main() {
       port: service.port,
       pid: service.pid,
       version: service.version,
+      kimi_code_version: compatibility.version,
+      compatibility_status: compatibility.status,
       model: model.model,
       display_name: model.display_name,
       max_context_size: model.max_context_size

@@ -2,7 +2,7 @@
 
 Kimi K3 Collab lets Codex and persistent `kimi-code/k3` work on complementary tasks at the same time. It streams K3's authentic Markdown, tool calls, tasks, and subagents into an MCP App, then hands K3's completed report directly back to Codex for discussion and synthesis.
 
-The plugin is cross-platform and uses only the Node.js standard library. It does not add a forwarding model, a React build, or a status polling loop.
+The plugin targets Windows, macOS, and Linux, and its CI runs the portable and fake-Kimi integration checks on all three platforms. It uses only the Node.js standard library and does not add a forwarding model, a React build, or a status polling loop.
 
 ![K3 result handoff and edit handoff](docs/images/k3-handoff-flow.svg)
 
@@ -16,7 +16,7 @@ The plugin is cross-platform and uses only the Node.js standard library. It does
 6. The user or Codex can respond to K3 with `send_k3_message`; the next K3 result returns through the same result handoff.
 7. A plugin-bundled Stop hook prevents Codex from silently ending while a started K3 session still has an undelivered result.
 
-For the separate **edit handoff** in `execute` mode, the bridge creates a per-session temporary branch and worktree. K3 never writes the source checkout. When the turn finishes, the bridge rejects out-of-scope changes, squashes the allowed changes into one local commit, checks for overlapping source changes, removes the temporary worktree, and returns the branch/commit to Codex for review. It never merges or cherry-picks automatically.
+For the separate **edit handoff** in `execute` mode, the bridge creates a per-session temporary branch and worktree. K3 never writes the source checkout. When the turn finishes, the bridge rejects out-of-scope changes, squashes committable allowed changes into one local commit, checks for overlapping source changes, and returns the branch/commit to Codex for review. Worktrees containing scope violations, symbolic links/junctions, ignored outputs, or integration failures are preserved instead of silently discarded. The plugin never merges or cherry-picks automatically.
 
 The Kimi server remains the source of truth. Session snapshots are stored under `$KIMI_CODE_HOME/codex-jobs` and active isolated checkouts under `$KIMI_CODE_HOME/codex-worktrees` (default root: `~/.kimi-code`).
 
@@ -71,14 +71,17 @@ Normal collaboration has no model-driven status loop or token-consuming retries:
 - The MCP App makes no loopback HTTP, WebSocket, or iframe connection. Its CSP has no loopback connect allowlist.
 - `receive_k3_events` is private, app-only, and unavailable to the model.
 - The panel does not embed Kimi Code as an iframe. **Open Kimi Code** remains an authenticated browser fallback.
-- Kimi Code 0.26 may still advertise write-capable tools in `analyze` mode. The plugin uses manual permission mode, rejects approval-gated tools, and aborts any observed non-read-only tool call; this is a safety guard, not an operating-system sandbox.
-- Git execute mode rejects source changes that already overlap `allowed_paths`, validates K3's final changed paths, and preserves a violating worktree for inspection. The worktree is isolation, not an operating-system sandbox; Codex must still review the returned commit.
+- Kimi Code 0.26 may still advertise write-capable tools in `analyze` mode. The plugin uses manual permission mode, a local-only read-tool allowlist, approval rejection, and the same non-read-only tool check in both the live relay and result stream. This is a safety guard, not an operating-system sandbox.
+- `WebSearch` and `FetchURL` are not enabled in `analyze` mode. Repository content is still sent to the configured Kimi model when K3 reads it; the loopback Kimi service is a local coordinator and does not imply local model inference.
+- Git execute mode canonicalizes the source/Git roots, rejects symbolic links or junctions inside `allowed_paths`, validates final changed paths, and preserves a violating worktree for inspection.
+- Ignored outputs are reported as `unintegrated_ignored_files` and preserved. They are not force-added because ignored files may contain secrets or disposable build state.
+- The worktree is not an operating-system sandbox. Absolute-path writes, writes outside the repository, and create-use-delete link races cannot be prevented by this plugin alone; Codex must review the result and use an OS sandbox/container when prevention is required.
 - If `cwd` is not in Git, execute mode changes it directly under a persistent single-writer lock. Codex must pause all local writes until K3 completes or is cancelled. The lock prevents a second K3 writer but cannot technically lock Codex itself.
 
 ## Requirements
 
 - Node.js 18.18 or newer on Windows, macOS, or Linux
-- Kimi Code CLI with local-server and Web UI support (`0.26.0` tested), installed and authenticated
+- Kimi Code CLI with local-server and Web UI support, installed and authenticated. `0.26.0` is tested; other versions are capability-checked but currently marked untested. See [compatibility](docs/compatibility.md).
 - A Codex or ChatGPT host with personal plugins, MCP, and MCP Apps UI support
 - Codex lifecycle-hook support for the automatic stop-time handoff safety net
 - Git on `PATH` for isolated parallel `execute` mode; non-Git directories fall back to the single-writer protocol
@@ -124,6 +127,7 @@ In a Git project, `allowed_paths` are translated into K3's isolated worktree. Ex
 - `ready`: source `HEAD` did not move and no source changes overlap K3's files.
 - `review_required`: source `HEAD` moved; inspect the returned commit against the new base.
 - `conflict_likely`: source working-tree changes overlap K3's changed files.
+- `unintegrated_ignored_files`: ignored outputs exist; the worktree is preserved and no commit is created.
 - `scope_violation` or `integration_error`: nothing is merged and the isolated worktree is preserved for manual inspection.
 
 Review the returned commit with Git, then cherry-pick it only when appropriate. The plugin intentionally performs no automatic integration. Follow-up K3 turns recreate the same isolated worktree from the handoff branch and produce another scoped commit.
@@ -172,7 +176,10 @@ CLI clients without MCP Apps UI still expose the control tools and readable fall
 ```sh
 git clone https://github.com/entropyMin/kimi-k3-collab.git kimi-k3-collab
 cd kimi-k3-collab
-node scripts/self-test.mjs
+npm run check
+npm test
 ```
+
+`npm test` uses a fake Kimi REST/WebSocket server and requires no Kimi login. Run `npm run test:real-kimi` for the optional check against the installed, authenticated Kimi Code service.
 
 Register that directory as `kimi-k3-collab` in the personal Codex marketplace, install `kimi-k3-collab@personal`, and start a new Codex task so the updated skill, tools, and MCP resource are loaded.
