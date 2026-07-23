@@ -13,6 +13,7 @@
   },
   "scripts": {
     "check": "node scripts/portable-check.mjs",
-    "test": "node scripts/self-test.mjs"
+    "test": "node scripts/self-test.mjs",
+    "test:real-kimi": "node scripts/real-kimi-test.mjs"
   }
 }

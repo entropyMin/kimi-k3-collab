@@ -10,6 +10,7 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
+import { isReadOnlyTool } from "./lib/k3-policy.mjs";
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = path.dirname(path.dirname(THIS_FILE));
@@ -195,6 +196,8 @@ function structuredJob(job) {
     status: normalizeStatus(job.state || job.status || "running"),
     mode: job.mode || null,
     focus: job.focus || null,
+    kimi_code_version: job.kimi_code_version || null,
+    compatibility_status: job.compatibility_status || "untested",
     server_reported_model: job.server_reported_model || job.explicit_model || null,
     verified_k3: Boolean(job.verified_k3),
     isolation: job.workspace?.isolation || integration?.isolation || null,
@@ -225,6 +228,8 @@ function integrationHandoff(record) {
     integration.branch && `Branch: ${integration.branch}`,
     integration.commit && `Commit: ${integration.commit}`,
     integration.changed_paths?.length && `Changed paths: ${integration.changed_paths.join(", ")}`,
+    integration.ignored_paths?.length && `Ignored paths requiring review: ${integration.ignored_paths.join(", ")}`,
+    integration.symlink_paths?.length && `Symbolic links or junctions: ${integration.symlink_paths.join(", ")}`,
     integration.overlapping_source_paths?.length && `Overlapping source changes: ${integration.overlapping_source_paths.join(", ")}`,
     integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`,
     integration.commit && "Review the commit before cherry-picking it; the plugin never merges automatically."
@@ -239,6 +244,8 @@ function integrationHandoff(record) {
       commit: integration.commit || null,
       commits: integration.commits || [],
       changed_paths: integration.changed_paths || [],
+      ignored_paths: integration.ignored_paths || [],
+      symlink_paths: integration.symlink_paths || [],
       overlapping_source_paths: integration.overlapping_source_paths || [],
       scope_violations: integration.scope_violations || []
     }
@@ -510,6 +517,34 @@ class SessionRelay {
               }
             }
           }
+          if (
+            this.mode === "analyze" &&
+            frame.type === "tool.call.started" &&
+            !isReadOnlyTool(frame.payload?.name)
+          ) {
+            try {
+              await runBridgeJson(
+                `relay-cancel:${this.sessionId}:${frame.payload?.toolCallId || randomUUID()}`,
+                ["cancel", "--format", "json", "--session-id", this.sessionId]
+              );
+              this.enqueue({
+                type: "relay.policy",
+                session_id: this.sessionId,
+                volatile: true,
+                payload: {
+                  status: "failed",
+                  message: `Stopped disallowed tool in read-only analysis: ${frame.payload?.name || "unknown"}.`
+                }
+              });
+            } catch (error) {
+              this.enqueue({
+                type: "relay.policy",
+                session_id: this.sessionId,
+                volatile: true,
+                payload: { status: "failed", message: safeRelayError(error) }
+              });
+            }
+          }
           if (frame.type === "error" && frame.payload?.fatal) {
             throw new Error(`Kimi WebSocket error: ${frame.payload.msg || frame.payload.code}`);
           }
@@ -705,20 +740,35 @@ async function getJobStatus(requestId, rawArguments) {
 
 async function getJobResult(requestId, rawArguments) {
   const { sessionId } = parseSessionArguments(rawArguments);
-  const durable = await runBridgeWindow(
+  const record = await runBridgeJson(
     requestId,
-    ["result", "--format", "text", "--session-id", sessionId, "--wait-seconds", "0"]
+    ["result", "--format", "json", "--session-id", sessionId, "--wait-seconds", "0"]
   );
-  const footer = parseBridgeFooter(durable.stdout);
+  const model = record.server_reported_model || record.explicit_model || null;
+  if (!record.verified_k3 || model !== K3_MODEL) {
+    throw new Error(`Kimi result did not verify ${K3_MODEL}.`);
+  }
+  const status = normalizeStatus(record.state || record.status || "running");
+  const complete = Boolean(record.complete) || TERMINAL_STATUSES.has(status);
+  const report = typeof record.result === "string" && record.result.trim()
+    ? record.result.trim()
+    : complete
+      ? `Kimi K3 returned ${status} without a Markdown report.`
+      : "Kimi K3 is still working.";
+  const handoff = complete ? integrationHandoff(record) : { text: "", structured: {} };
   return {
-    content: [{ type: "text", text: durable.stdout.trimStart() }],
+    content: [{ type: "text", text: `${report}${handoff.text}` }],
     structuredContent: {
       session_id: sessionId,
-      status: footer.status,
-      mode: footer.mode,
-      focus: footer.focus,
-      server_reported_model: footer.model,
-      verified_k3: footer.verifiedK3
+      status,
+      complete,
+      handoff_ready: complete,
+      mode: record.mode || null,
+      focus: record.focus || null,
+      server_reported_model: model,
+      verified_k3: true,
+      result_markdown: typeof record.result === "string" && record.result.trim() ? record.result.trim() : null,
+      ...handoff.structured
     }
   };
 }
@@ -758,6 +808,9 @@ async function awaitK3Result(requestId, rawArguments) {
       focus: record.focus || null,
       server_reported_model: model,
       verified_k3: true,
+      result_markdown: handoffReady && typeof record.result === "string" && record.result.trim()
+        ? record.result.trim()
+        : null,
       ...handoff.structured
     }
   };

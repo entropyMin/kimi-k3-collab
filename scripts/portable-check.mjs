@@ -15,9 +15,11 @@ const bridge = path.join(scriptsDir, "kimi-k3.mjs");
 const mcpServer = path.join(scriptsDir, "mcp-server.mjs");
 const handoffHook = path.join(scriptsDir, "k3-codex-hook.mjs");
 const websocketModule = path.join(scriptsDir, "lib", "local-websocket.mjs");
+const policyModule = path.join(scriptsDir, "lib", "k3-policy.mjs");
 const selfTest = path.join(scriptsDir, "self-test.mjs");
+const realKimiTest = path.join(scriptsDir, "real-kimi-test.mjs");
 
-for (const script of [bridge, mcpServer, handoffHook, websocketModule, selfTest]) {
+for (const script of [bridge, mcpServer, handoffHook, websocketModule, policyModule, selfTest, realKimiTest]) {
   const checked = spawnSync(process.execPath, ["--check", script], { encoding: "utf8" });
   if (checked.status !== 0) {
     throw new Error(checked.stderr || `Syntax check failed for ${script}`);
@@ -119,9 +121,33 @@ try {
   fs.mkdirSync(path.join(isolationFixture, "docs"));
   fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "base\n");
   fs.writeFileSync(path.join(isolationFixture, "docs", "guide.txt"), "guide\n");
+  fs.writeFileSync(path.join(isolationFixture, ".gitignore"), "*.generated\nignored/\n");
   checkedGit(isolationFixture, ["add", "--all"]);
   checkedGit(isolationFixture, ["commit", "-m", "fixture"]);
   fs.writeFileSync(path.join(isolationFixture, "docs", "local.txt"), "unrelated local change\n");
+
+  const linkedFixture = `${isolationFixture}-link`;
+  fs.symlinkSync(isolationFixture, linkedFixture, process.platform === "win32" ? "junction" : "dir");
+  try {
+    const linked = prepareExecutionWorkspace(linkedFixture, [path.join(linkedFixture, "src")]);
+    if (
+      linked.workspace.source_cwd !== fs.realpathSync.native(isolationFixture) ||
+      linked.workspace.source_subdir !== "."
+    ) {
+      throw new Error("A symlinked working directory was not canonicalized.");
+    }
+    const linkedHandoff = finalizeExecutionWorkspace({
+      session_id: "session_linked_cwd_fixture",
+      prompt_id: "prompt_linked_cwd_fixture",
+      mode: "execute",
+      workspace: linked.workspace
+    });
+    if (linkedHandoff.state !== "no_changes" || fs.existsSync(linked.workspace.worktree_root)) {
+      throw new Error("A canonicalized working directory did not finalize cleanly.");
+    }
+  } finally {
+    fs.unlinkSync(linkedFixture);
+  }
 
   const prepared = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   if (prepared.workspace.isolation !== "git-worktree" || !fs.existsSync(prepared.workspace.worktree_root)) {
@@ -183,6 +209,88 @@ try {
   }
   checkedGit(isolationFixture, ["worktree", "remove", "--force", scoped.workspace.worktree_root]);
   checkedGit(isolationFixture, ["branch", "-D", scoped.workspace.branch]);
+
+  const ignored = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  fs.writeFileSync(path.join(ignored.cwd, "src", "result.generated"), "ignored result\n");
+  const ignoredHandoff = finalizeExecutionWorkspace({
+    session_id: "session_ignored_fixture",
+    prompt_id: "prompt_ignored_fixture",
+    mode: "execute",
+    workspace: ignored.workspace
+  });
+  if (
+    ignoredHandoff.state !== "unintegrated_ignored_files" ||
+    ignoredHandoff.ignored_paths.join(",") !== "src/result.generated" ||
+    !fs.existsSync(ignored.workspace.worktree_root)
+  ) {
+    throw new Error("An ignored result was not reported and preserved for review.");
+  }
+  checkedGit(isolationFixture, ["worktree", "remove", "--force", ignored.workspace.worktree_root]);
+  checkedGit(isolationFixture, ["branch", "-D", ignored.workspace.branch]);
+
+  const ignoredOutsideScope = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  fs.mkdirSync(path.join(ignoredOutsideScope.workspace.worktree_root, "ignored"));
+  fs.writeFileSync(path.join(ignoredOutsideScope.workspace.worktree_root, "ignored", "outside.txt"), "outside scope\n");
+  const ignoredOutsideHandoff = finalizeExecutionWorkspace({
+    session_id: "session_ignored_scope_fixture",
+    prompt_id: "prompt_ignored_scope_fixture",
+    mode: "execute",
+    workspace: ignoredOutsideScope.workspace
+  });
+  if (
+    ignoredOutsideHandoff.state !== "scope_violation" ||
+    ignoredOutsideHandoff.ignored_paths.join(",") !== "ignored/outside.txt" ||
+    ignoredOutsideHandoff.scope_violations.join(",") !== "ignored/outside.txt" ||
+    !fs.existsSync(ignoredOutsideScope.workspace.worktree_root)
+  ) {
+    throw new Error("An ignored result outside allowed_paths was not blocked.");
+  }
+  checkedGit(isolationFixture, ["worktree", "remove", "--force", ignoredOutsideScope.workspace.worktree_root]);
+  checkedGit(isolationFixture, ["branch", "-D", ignoredOutsideScope.workspace.branch]);
+
+  const externalTarget = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-external-"));
+  const symlinkEscape = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const escapingLink = path.join(symlinkEscape.cwd, "src", "linked");
+  try {
+    fs.symlinkSync(externalTarget, escapingLink, process.platform === "win32" ? "junction" : "dir");
+    fs.writeFileSync(path.join(escapingLink, "escaped.txt"), "outside worktree\n");
+    const symlinkHandoff = finalizeExecutionWorkspace({
+      session_id: "session_symlink_escape_fixture",
+      prompt_id: "prompt_symlink_escape_fixture",
+      mode: "execute",
+      workspace: symlinkEscape.workspace
+    });
+    if (
+      symlinkHandoff.state !== "scope_violation" ||
+      symlinkHandoff.symlink_paths.join(",") !== "src/linked" ||
+      !fs.existsSync(path.join(externalTarget, "escaped.txt")) ||
+      !fs.existsSync(symlinkEscape.workspace.worktree_root)
+    ) {
+      throw new Error("A symlink escape was not reported and preserved for review.");
+    }
+  } finally {
+    if (fs.lstatSync(escapingLink, { throwIfNoEntry: false })?.isSymbolicLink()) fs.unlinkSync(escapingLink);
+    checkedGit(isolationFixture, ["worktree", "remove", "--force", symlinkEscape.workspace.worktree_root]);
+    checkedGit(isolationFixture, ["branch", "-D", symlinkEscape.workspace.branch]);
+    fs.rmSync(externalTarget, { recursive: true, force: true });
+  }
+
+  if (process.platform !== "win32") {
+    const committedLink = path.join(isolationFixture, "src", "committed-link");
+    fs.symlinkSync("../docs", committedLink, "dir");
+    checkedGit(isolationFixture, ["add", "src/committed-link"]);
+    checkedGit(isolationFixture, ["commit", "-m", "add committed symlink fixture"]);
+    let committedLinkRejected = false;
+    try {
+      prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+    } catch (error) {
+      committedLinkRejected = String(error).includes("contain symbolic links or junctions");
+    }
+    if (!committedLinkRejected) throw new Error("A committed symlink inside allowed_paths was accepted.");
+    fs.unlinkSync(committedLink);
+    checkedGit(isolationFixture, ["add", "src/committed-link"]);
+    checkedGit(isolationFixture, ["commit", "-m", "remove committed symlink fixture"]);
+  }
 
   const conflicting = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   fs.writeFileSync(path.join(conflicting.cwd, "src", "feature.txt"), "k3 conflict\n");
@@ -293,7 +401,8 @@ relayServer.on("upgrade", (request, socket) => {
         { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "x".repeat(300000) } } },
         { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "y".repeat(300000) } } },
         { type: "tool.result", session_id: "session_portable_mcp", seq: 6, payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
-        { type: "turn.ended", session_id: "session_portable_mcp", seq: 7, payload: { turnId: "turn_fixture", reason: "completed" } }
+        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 7, payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
+        { type: "turn.ended", session_id: "session_portable_mcp", seq: 8, payload: { turnId: "turn_fixture", reason: "completed" } }
       ];
   socket.write(Buffer.concat([headers, ...frames.map(websocketFrame)]));
   if (relayConnectionCount === 1) setTimeout(() => socket.destroy(), 20);
@@ -490,6 +599,7 @@ try {
     openedPanelUrl !== privatePanelUrl ||
     browserOpened.result?.structuredContent?.opened !== true ||
     awaited.result?.structuredContent?.complete !== true ||
+    !awaited.result?.structuredContent?.result_markdown?.includes("# Stub K3 report") ||
     !awaited.result?.content?.[0]?.text?.includes("# Stub K3 report") ||
     runningAwaited.result?.structuredContent?.complete !== false ||
     !runningAwaited.result?.content?.[0]?.text?.includes("do not narrate the same waiting state") ||
@@ -500,6 +610,7 @@ try {
     JSON.stringify(opened.result?.structuredContent).includes(fixtureToken) ||
     messaged.result?.structuredContent?.status !== "running" ||
     status.result?.structuredContent?.status !== "completed" ||
+    !result.result?.structuredContent?.result_markdown?.includes("# Stub K3 report") ||
     !result.result?.content?.[0]?.text?.includes("# Stub K3 report") ||
     !cancelled.result?.structuredContent?.aborted ||
     !relayAuthenticated ||
@@ -509,6 +620,7 @@ try {
     relayedFrames.filter((frame) => frame.type === "tool.call.started" && frame.seq === 3).length !== 1 ||
     !relayedFrames.some((frame) => frame.type === "tool.result") ||
     !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.status === "rejected") ||
+    !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.message?.includes("Stopped disallowed tool")) ||
     !fs.existsSync(path.join(mcpFixtureHome, "approval-rejected")) ||
     maxRelayedBatchBytes > 520000 ||
     relayCursor < relayedFrames.length ||
@@ -883,6 +995,7 @@ if (
 }
 
 const bridgeText = fs.readFileSync(bridge, "utf8");
+const policyText = fs.readFileSync(policyModule, "utf8");
 if (
   !bridgeText.includes("const planMode = false") ||
   !bridgeText.includes('const permissionMode = readOnly ? "manual" : "auto"') ||
@@ -914,13 +1027,16 @@ if (
   !mcpServerText.includes("MAX_RELAY_BUFFER_BYTES") ||
   !mcpServerText.includes("MAX_EVENT_BATCH_BYTES") ||
   !mcpServerText.includes("relay_generation") ||
+  !mcpServerText.includes("isReadOnlyTool") ||
   mcpServerText.includes("frameDomains") ||
   mcpServerText.includes("frame_domains")
 ) {
   throw new Error("The MCP server still contains the old polling/iframe path or lacks the private event panel contract.");
 }
 if (
-  !bridgeText.includes('"TodoList"') ||
+  !policyText.includes('"TodoList"') ||
+  policyText.includes('"WebSearch"') ||
+  policyText.includes('"FetchURL"') ||
   !bridgeText.includes("Do not call Bash") ||
   !bridgeText.includes('isolation: "git-worktree"') ||
   !bridgeText.includes('isolation: "single-writer"') ||
