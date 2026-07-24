@@ -301,7 +301,10 @@ function canonicalPath(value) {
 }
 
 function pathIdentity(value) {
-  const resolved = path.resolve(value);
+  let resolved = path.resolve(value);
+  try {
+    resolved = fs.realpathSync.native(resolved);
+  } catch {}
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
@@ -759,17 +762,17 @@ function readJobRecords() {
 }
 
 function registeredGitWorktrees(repo) {
-  const result = runCommand("git", ["-C", repo, "worktree", "list", "--porcelain"]);
+  const result = runCommand("git", ["-C", repo, "worktree", "list", "--porcelain", "-z"]);
   if (result.error || result.status !== 0) return [];
   const worktrees = [];
   let current = null;
-  for (const line of result.stdout.split(/\r?\n/)) {
-    if (line.startsWith("worktree ")) {
+  for (const field of result.stdout.split("\0")) {
+    if (field.startsWith("worktree ")) {
       if (current) worktrees.push(current);
-      current = { worktree_root: line.slice(9), branch: null };
-    } else if (current && line.startsWith("branch refs/heads/")) {
-      current.branch = line.slice("branch refs/heads/".length);
-    } else if (!line && current) {
+      current = { worktree_root: field.slice(9), branch: null };
+    } else if (current && field.startsWith("branch refs/heads/")) {
+      current.branch = field.slice("branch refs/heads/".length);
+    } else if (!field && current) {
       worktrees.push(current);
       current = null;
     }
