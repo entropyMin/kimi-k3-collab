@@ -15,8 +15,13 @@ const temporaryHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-e2e-"));
 const fixtureCwd = path.join(temporaryHome, "project");
 const token = "fake-kimi-token";
 const sessionId = "session_fake_e2e";
-const promptId = "prompt_fake_e2e";
+const successPromptId = "prompt_fake_e2e";
+const failurePromptId = "prompt_fake_provider_failure";
+const recoveredPromptId = "prompt_fake_provider_recovered";
 let complete = false;
+let scenario = "success";
+let promptCount = 0;
+let activePromptId = successPromptId;
 let approvalRejected = false;
 let authenticated = true;
 let profile = null;
@@ -75,7 +80,7 @@ const server = http.createServer(async (request, response) => {
     return reply(response, {
       metadata: { mode: "analyze", focus: "engineering" },
       pending_interaction: "none",
-      last_turn_reason: complete ? "completed" : "",
+      last_turn_reason: complete && scenario !== "failure" ? "completed" : "",
       agent_config: { model: "kimi-code/k3" },
       message_count: complete ? 1 : 0
     });
@@ -91,10 +96,18 @@ const server = http.createServer(async (request, response) => {
   }
   if (pathname === `/api/v1/sessions/${sessionId}/prompts` && request.method === "POST") {
     await readBody(request);
-    return reply(response, { prompt_id: promptId, status: "running" });
+    promptCount += 1;
+    scenario = promptCount === 1 ? "success" : promptCount === 2 ? "failure" : "recovered";
+    complete = false;
+    activePromptId = scenario === "success"
+      ? successPromptId
+      : scenario === "failure"
+        ? failurePromptId
+        : recoveredPromptId;
+    return reply(response, { prompt_id: activePromptId, status: "running" });
   }
   if (pathname === `/api/v1/sessions/${sessionId}/prompts`) {
-    return reply(response, { active: complete ? null : { prompt_id: promptId } });
+    return reply(response, { active: complete ? null : { prompt_id: activePromptId } });
   }
   if (pathname === `/api/v1/sessions/${sessionId}/approvals/approval_fake` && request.method === "POST") {
     const body = await readBody(request);
@@ -106,7 +119,12 @@ const server = http.createServer(async (request, response) => {
       items: complete
         ? [{
             created_at: new Date().toISOString(),
-            content: [{ type: "text", text: "# Fake K3 report\n\nProtocol handoff completed." }]
+            content: [{
+              type: "text",
+              text: scenario === "recovered"
+                ? "# Recovered K3 report\n\nTransient Provider overload recovered."
+                : "# Fake K3 report\n\nProtocol handoff completed."
+            }]
           }]
         : []
     });
@@ -116,6 +134,8 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.on("upgrade", (request, socket) => {
+  const websocketScenario = scenario;
+  const websocketPromptId = activePromptId;
   upgradedSockets.add(socket);
   socket.once("close", () => upgradedSockets.delete(socket));
   authenticated &&= request.headers.authorization === `Bearer ${token}`;
@@ -132,39 +152,103 @@ server.on("upgrade", (request, socket) => {
   ].join("\r\n"));
   setTimeout(() => {
     complete = true;
-    const frames = [
-      { type: "server_hello", payload: { protocol_version: 1 } },
-      {
-        type: "event.approval.requested",
-        session_id: sessionId,
-        seq: 1,
-        payload: { approval_id: "approval_fake", tool_call_id: "tool_bash", tool_name: "Bash" }
-      },
-      {
-        type: "tool.call.started",
-        session_id: sessionId,
-        seq: 2,
-        payload: { toolCallId: "tool_bash", name: "Bash", args: { command: "echo denied" } }
-      },
-      {
-        type: "tool.result",
-        session_id: sessionId,
-        seq: 3,
-        payload: { toolCallId: "tool_bash", output: "denied", isError: true }
-      },
-      {
-        type: "assistant.delta",
-        session_id: sessionId,
-        seq: 4,
-        payload: { delta: "# Fake K3 report\n\nProtocol handoff completed." }
-      },
-      {
-        type: "prompt.completed",
-        session_id: sessionId,
-        seq: 5,
-        payload: { promptId, reason: "completed" }
-      }
-    ];
+    const frames = websocketScenario === "failure"
+      ? [
+          { type: "server_hello", payload: { protocol_version: 1 } },
+          {
+            type: "turn.started",
+            session_id: sessionId,
+            seq: 6,
+            payload: { turnId: 1 }
+          },
+          {
+            type: "turn.step.retrying",
+            session_id: sessionId,
+            seq: 7,
+            payload: {
+              errorName: "APIProviderRateLimitError",
+              errorMessage: "429 The engine is overloaded",
+              statusCode: 429
+            }
+          },
+          {
+            type: "error",
+            session_id: sessionId,
+            seq: 8,
+            payload: {
+              code: "provider.rate_limit",
+              message: "429 The engine is overloaded",
+              name: "APIProviderRateLimitError",
+              retryable: true,
+              fatal: true
+            }
+          }
+        ]
+      : websocketScenario === "recovered"
+        ? [
+            { type: "server_hello", payload: { protocol_version: 1 } },
+            {
+              type: "turn.started",
+              session_id: sessionId,
+              seq: 9,
+              payload: { turnId: 2 }
+            },
+            {
+              type: "error",
+              session_id: sessionId,
+              seq: 10,
+              payload: {
+                code: "provider.overloaded",
+                message: "Temporary Provider overload",
+                fatal: false
+              }
+            },
+            {
+              type: "assistant.delta",
+              session_id: sessionId,
+              seq: 11,
+              payload: { delta: "# Recovered K3 report\n\nTransient Provider overload recovered." }
+            },
+            {
+              type: "prompt.completed",
+              session_id: sessionId,
+              seq: 12,
+              payload: { promptId: websocketPromptId, reason: "completed" }
+            }
+          ]
+        : [
+          { type: "server_hello", payload: { protocol_version: 1 } },
+          {
+            type: "event.approval.requested",
+            session_id: sessionId,
+            seq: 1,
+            payload: { approval_id: "approval_fake", tool_call_id: "tool_bash", tool_name: "Bash" }
+          },
+          {
+            type: "tool.call.started",
+            session_id: sessionId,
+            seq: 2,
+            payload: { toolCallId: "tool_bash", name: "Bash", args: { command: "echo denied" } }
+          },
+          {
+            type: "tool.result",
+            session_id: sessionId,
+            seq: 3,
+            payload: { toolCallId: "tool_bash", output: "denied", isError: true }
+          },
+          {
+            type: "assistant.delta",
+            session_id: sessionId,
+            seq: 4,
+            payload: { delta: "# Fake K3 report\n\nProtocol handoff completed." }
+          },
+          {
+            type: "prompt.completed",
+            session_id: sessionId,
+            seq: 5,
+            payload: { promptId: websocketPromptId, reason: "completed" }
+          }
+        ];
     socket.write(Buffer.concat(frames.map(websocketFrame)));
     setTimeout(() => socket.destroy(), 500);
   }, 25);
@@ -197,7 +281,7 @@ try {
   const port = server.address().port;
   fs.writeFileSync(
     path.join(temporaryHome, "server", "lock"),
-    JSON.stringify({ host: "127.0.0.1", port, pid: process.pid, version: "0.26.0" })
+    JSON.stringify({ host: "127.0.0.1", port, pid: process.pid, host_version: "0.26.0" })
   );
   fs.writeFileSync(path.join(temporaryHome, "server.token"), token);
 
@@ -208,6 +292,26 @@ try {
     service.compatibility_status !== "tested"
   ) {
     throw new Error("The fake Kimi service did not pass model verification.");
+  }
+  fs.rmSync(path.join(temporaryHome, "server", "lock"));
+  fs.mkdirSync(path.join(temporaryHome, "server", "instances"));
+  fs.writeFileSync(
+    path.join(temporaryHome, "server", "instances", "fake-instance.json"),
+    JSON.stringify({
+      server_id: "fake-server",
+      host: "127.0.0.1",
+      port,
+      pid: process.pid,
+      heartbeat_at: Date.now(),
+      host_version: "0.29.0"
+    })
+  );
+  const currentService = await runBridge(["ensure"]);
+  if (
+    currentService.kimi_code_version !== "0.29.0" ||
+    currentService.compatibility_status !== "tested"
+  ) {
+    throw new Error("The current Kimi instance discovery/version contract failed.");
   }
   const started = await runBridge([
     "start",
@@ -234,6 +338,61 @@ try {
     profile?.agent_config?.tools?.includes("FetchURL")
   ) {
     throw new Error("The fake Kimi REST/WebSocket handoff contract failed.");
+  }
+  const sent = await runBridge([
+    "send",
+    "--session-id", sessionId,
+    "--prompt", "Trigger the fake Provider failure."
+  ]);
+  if (sent.state !== "running" || sent.prompt_id !== failurePromptId) {
+    throw new Error("The fake Kimi follow-up did not start.");
+  }
+  const failedResult = await runBridge([
+    "result",
+    "--session-id", sessionId,
+    "--wait-seconds", "5"
+  ]);
+  if (
+    !failedResult.complete ||
+    failedResult.state !== "failed" ||
+    failedResult.error_code !== "provider.rate_limit" ||
+    !failedResult.error?.includes("429 The engine is overloaded") ||
+    failedResult.result
+  ) {
+    throw new Error("A terminal Kimi Provider error did not become an immediate failed handoff.");
+  }
+  const rereadFailedResult = await runBridge([
+    "result",
+    "--session-id", sessionId,
+    "--wait-seconds", "0"
+  ]);
+  if (
+    !rereadFailedResult.complete ||
+    rereadFailedResult.state !== "failed" ||
+    rereadFailedResult.error_code !== "provider.rate_limit"
+  ) {
+    throw new Error("A durable Kimi Provider failure was resurrected by a non-settle REST read.");
+  }
+  const recovered = await runBridge([
+    "send",
+    "--session-id", sessionId,
+    "--prompt", "Recover from a transient fake Provider overload."
+  ]);
+  if (recovered.state !== "running" || recovered.prompt_id !== recoveredPromptId) {
+    throw new Error("The transient Provider recovery follow-up did not start.");
+  }
+  const recoveredResult = await runBridge([
+    "result",
+    "--session-id", sessionId,
+    "--wait-seconds", "5"
+  ]);
+  if (
+    !recoveredResult.complete ||
+    recoveredResult.state !== "completed" ||
+    recoveredResult.error ||
+    !recoveredResult.result?.includes("# Recovered K3 report")
+  ) {
+    throw new Error("A transient Kimi Provider error was treated as terminal.");
   }
   process.stdout.write(`Fake Kimi REST/WebSocket test passed on ${process.platform}.\n`);
 } finally {

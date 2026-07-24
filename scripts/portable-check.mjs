@@ -34,6 +34,7 @@ const {
   createRenderState,
   eventMatchesCurrentPrompt,
   finalizeExecutionWorkspace,
+  kimiServerLaunchSpec,
   pathsOverlap,
   prepareExecutionWorkspace,
   renderK3Event,
@@ -42,6 +43,16 @@ const {
 } = await import(pathToFileURL(bridge));
 if (originalKimiHome == null) delete process.env.KIMI_CODE_HOME;
 else process.env.KIMI_CODE_HOME = originalKimiHome;
+const legacyServerLaunch = kimiServerLaunchSpec("Commands:\n  run [options]   Start the Kimi server");
+const currentServerLaunch = kimiServerLaunchSpec("Commands:\n  kill   Stop a legacy Kimi server");
+if (
+  legacyServerLaunch.detached ||
+  legacyServerLaunch.args.join(" ") !== "server run --keep-alive --log-level warn" ||
+  !currentServerLaunch.detached ||
+  currentServerLaunch.args.join(" ") !== "web --no-open --log-level warn"
+) {
+  throw new Error("Kimi server startup capability negotiation is invalid.");
+}
 const {
   browserCommand,
   browserToolDefinition,
@@ -129,7 +140,7 @@ try {
   const linkedFixture = `${isolationFixture}-link`;
   fs.symlinkSync(isolationFixture, linkedFixture, process.platform === "win32" ? "junction" : "dir");
   try {
-    const linked = prepareExecutionWorkspace(linkedFixture, [path.join(linkedFixture, "src")]);
+    const linked = await prepareExecutionWorkspace(linkedFixture, [path.join(linkedFixture, "src")]);
     if (
       linked.workspace.source_cwd !== fs.realpathSync.native(isolationFixture) ||
       linked.workspace.source_subdir !== "."
@@ -149,7 +160,7 @@ try {
     fs.unlinkSync(linkedFixture);
   }
 
-  const prepared = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const prepared = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   if (prepared.workspace.isolation !== "git-worktree" || !fs.existsSync(prepared.workspace.worktree_root)) {
     throw new Error("Git execute mode did not create an isolated worktree.");
   }
@@ -171,7 +182,7 @@ try {
     throw new Error("The isolated Git handoff changed the source checkout or lost its commit.");
   }
 
-  restoreExecutionWorkspace(record);
+  await restoreExecutionWorkspace(record);
   record.prompt_id = "prompt_isolation_followup";
   record.workspace.base_commit = checkedGit(record.workspace.worktree_root, ["rev-parse", "HEAD"]);
   record.workspace.turn_finalized_for = null;
@@ -188,14 +199,14 @@ try {
   fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "overlapping local change\n");
   let overlapRejected = false;
   try {
-    prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+    await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   } catch (error) {
     overlapRejected = String(error).includes("overlapping K3 allowed_paths");
   }
   if (!overlapRejected) throw new Error("Parallel execute mode accepted overlapping source changes.");
 
   fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "base\n");
-  const scoped = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const scoped = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   fs.writeFileSync(path.join(scoped.workspace.worktree_root, "README.md"), "outside scope\n");
   const scopedRecord = {
     session_id: "session_scope_fixture",
@@ -210,7 +221,7 @@ try {
   checkedGit(isolationFixture, ["worktree", "remove", "--force", scoped.workspace.worktree_root]);
   checkedGit(isolationFixture, ["branch", "-D", scoped.workspace.branch]);
 
-  const ignored = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const ignored = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   fs.writeFileSync(path.join(ignored.cwd, "src", "result.generated"), "ignored result\n");
   const ignoredHandoff = finalizeExecutionWorkspace({
     session_id: "session_ignored_fixture",
@@ -228,7 +239,7 @@ try {
   checkedGit(isolationFixture, ["worktree", "remove", "--force", ignored.workspace.worktree_root]);
   checkedGit(isolationFixture, ["branch", "-D", ignored.workspace.branch]);
 
-  const ignoredOutsideScope = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const ignoredOutsideScope = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   fs.mkdirSync(path.join(ignoredOutsideScope.workspace.worktree_root, "ignored"));
   fs.writeFileSync(path.join(ignoredOutsideScope.workspace.worktree_root, "ignored", "outside.txt"), "outside scope\n");
   const ignoredOutsideHandoff = finalizeExecutionWorkspace({
@@ -249,7 +260,7 @@ try {
   checkedGit(isolationFixture, ["branch", "-D", ignoredOutsideScope.workspace.branch]);
 
   const externalTarget = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-external-"));
-  const symlinkEscape = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const symlinkEscape = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   const escapingLink = path.join(symlinkEscape.cwd, "src", "linked");
   try {
     fs.symlinkSync(externalTarget, escapingLink, process.platform === "win32" ? "junction" : "dir");
@@ -282,7 +293,7 @@ try {
     checkedGit(isolationFixture, ["commit", "-m", "add committed symlink fixture"]);
     let committedLinkRejected = false;
     try {
-      prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+      await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
     } catch (error) {
       committedLinkRejected = String(error).includes("contain symbolic links or junctions");
     }
@@ -292,7 +303,7 @@ try {
     checkedGit(isolationFixture, ["commit", "-m", "remove committed symlink fixture"]);
   }
 
-  const conflicting = prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const conflicting = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   fs.writeFileSync(path.join(conflicting.cwd, "src", "feature.txt"), "k3 conflict\n");
   fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "codex conflict\n");
   checkedGit(isolationFixture, ["add", "src/feature.txt"]);
@@ -312,12 +323,86 @@ try {
     throw new Error("The handoff did not flag a source/K3 path conflict without overwriting Codex changes.");
   }
 
+  const providerWorkspace = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const providerRecord = {
+    session_id: "session_provider_execute_fixture",
+    prompt_id: "prompt_provider_execute_fixture",
+    state: "running",
+    complete: false,
+    mode: "execute",
+    workspace: providerWorkspace.workspace
+  };
+  fs.writeFileSync(path.join(providerWorkspace.cwd, "src", "provider.txt"), "partial provider result\n");
+  applyK3Event(providerRecord, {
+    type: "error",
+    session_id: providerRecord.session_id,
+    seq: 1,
+    payload: {
+      code: "provider.rate_limit",
+      message: "429 overloaded",
+      fatal: true
+    }
+  });
+  const firstProviderHandoff = finalizeExecutionWorkspace(providerRecord);
+  const secondProviderHandoff = finalizeExecutionWorkspace(providerRecord);
+  if (
+    !providerRecord.complete ||
+    providerRecord.state !== "failed" ||
+    firstProviderHandoff?.state !== "ready" ||
+    !firstProviderHandoff.commit ||
+    secondProviderHandoff?.commit !== firstProviderHandoff.commit ||
+    providerRecord.workspace.turn_finalized_for !== providerRecord.prompt_id
+  ) {
+    throw new Error("A Provider failure did not finalize its partial execute handoff exactly once.");
+  }
+
   const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-single-writer-"));
   try {
-    const first = prepareExecutionWorkspace(nonGit, [nonGit]);
+    const bindFixtureOwner = (prepared, sessionId, {
+      complete = false,
+      createdAt = new Date().toISOString(),
+      persistRecord = true
+    } = {}) => {
+      fs.writeFileSync(
+        path.join(prepared.workspace.lock_path, "owner.json"),
+        JSON.stringify({
+          token: prepared.workspace.lock_token,
+          cwd: prepared.workspace.source_cwd,
+          session_id: sessionId,
+          created_at: createdAt
+        })
+      );
+      if (!persistRecord) return;
+      fs.writeFileSync(
+        path.join(bridgeUnitHome, "codex-jobs", `${sessionId}.json`),
+        JSON.stringify({
+          session_id: sessionId,
+          prompt_id: `prompt_${sessionId}`,
+          state: "running",
+          complete,
+          mode: "execute",
+          focus: "engineering",
+          workspace: prepared.workspace
+        })
+      );
+    };
+    const fixtureOwnerStatus = async (sessionId) => {
+      if (sessionId === "session_missing_fixture") {
+        throw new Error(`Kimi API error 40401: session ${sessionId} does not exist`);
+      }
+      if (sessionId === "session_uncertain_fixture") throw new Error("HTTP 503: service unavailable");
+      const busy = sessionId === "session_live_fixture";
+      return {
+        state: busy ? "running" : sessionId.includes("idle") ? "idle" : "completed",
+        busy,
+        pending_interaction: "none"
+      };
+    };
+
+    const first = await prepareExecutionWorkspace(nonGit, [nonGit]);
     let secondRejected = false;
     try {
-      prepareExecutionWorkspace(nonGit, [nonGit]);
+      await prepareExecutionWorkspace(nonGit, [nonGit]);
     } catch (error) {
       secondRejected = String(error).includes("already owns the non-Git directory");
     }
@@ -330,12 +415,159 @@ try {
       mode: "execute",
       workspace: first.workspace
     });
-    const reacquired = prepareExecutionWorkspace(nonGit, [nonGit]);
+    const reacquired = await prepareExecutionWorkspace(nonGit, [nonGit]);
     finalizeExecutionWorkspace({
       session_id: "session_single_writer_reacquired",
       prompt_id: "prompt_single_writer_reacquired",
       mode: "execute",
       workspace: reacquired.workspace
+    });
+
+    const live = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    bindFixtureOwner(live, "session_live_fixture", { complete: true });
+    let liveRejected = false;
+    try {
+      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    } catch (error) {
+      liveRejected = String(error).includes("already owns the non-Git directory");
+    }
+    if (!liveRejected) throw new Error("A live single-writer owner was reclaimed.");
+    finalizeExecutionWorkspace({
+      session_id: "session_live_fixture",
+      prompt_id: "prompt_session_live_fixture",
+      mode: "execute",
+      workspace: live.workspace
+    });
+
+    const youngCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    bindFixtureOwner(youngCompleteTerminal, "session_terminal_complete_young_fixture", { complete: true });
+    let youngCompleteTerminalRejected = false;
+    try {
+      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    } catch (error) {
+      youngCompleteTerminalRejected = String(error).includes("already owns the non-Git directory");
+    }
+    if (!youngCompleteTerminalRejected) {
+      throw new Error("A young complete terminal single-writer owner was reclaimed.");
+    }
+    finalizeExecutionWorkspace({
+      session_id: "session_terminal_complete_young_fixture",
+      prompt_id: "prompt_session_terminal_complete_young_fixture",
+      mode: "execute",
+      workspace: youngCompleteTerminal.workspace
+    });
+
+    const expiredCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    bindFixtureOwner(expiredCompleteTerminal, "session_terminal_complete_expired_fixture", {
+      complete: true,
+      createdAt: new Date(Date.now() - 121000).toISOString()
+    });
+    const recoveredCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    finalizeExecutionWorkspace({
+      session_id: "session_terminal_complete_expired_recovered",
+      prompt_id: "prompt_session_terminal_complete_expired_recovered",
+      mode: "execute",
+      workspace: recoveredCompleteTerminal.workspace
+    });
+
+    const youngIdle = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    bindFixtureOwner(youngIdle, "session_idle_young_fixture", { persistRecord: false });
+    let youngIdleRejected = false;
+    try {
+      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    } catch (error) {
+      youngIdleRejected = String(error).includes("already owns the non-Git directory");
+    }
+    if (!youngIdleRejected) throw new Error("A young bound owner without a job record was reclaimed.");
+    finalizeExecutionWorkspace({
+      session_id: "session_idle_young_fixture",
+      prompt_id: "prompt_session_idle_young_fixture",
+      mode: "execute",
+      workspace: youngIdle.workspace
+    });
+
+    const expiredIdle = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    bindFixtureOwner(expiredIdle, "session_idle_expired_fixture", {
+      createdAt: new Date(Date.now() - 121000).toISOString(),
+      persistRecord: false
+    });
+    const recoveredIdle = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    finalizeExecutionWorkspace({
+      session_id: "session_idle_expired_recovered",
+      prompt_id: "prompt_session_idle_expired_recovered",
+      mode: "execute",
+      workspace: recoveredIdle.workspace
+    });
+
+    const terminal = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    bindFixtureOwner(terminal, "session_terminal_fixture");
+    const recoveredTerminal = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    const terminalRecord = JSON.parse(fs.readFileSync(
+      path.join(bridgeUnitHome, "codex-jobs", "session_terminal_fixture.json"),
+      "utf8"
+    ));
+    if (!terminalRecord.complete || terminalRecord.integration?.state !== "direct_changes") {
+      throw new Error("A terminal single-writer owner was not finalized before lock recovery.");
+    }
+    finalizeExecutionWorkspace({
+      session_id: "session_terminal_recovered",
+      prompt_id: "prompt_session_terminal_recovered",
+      mode: "execute",
+      workspace: recoveredTerminal.workspace
+    });
+
+    const missing = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    bindFixtureOwner(missing, "session_missing_fixture");
+    const recoveredMissing = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    const missingRecord = JSON.parse(fs.readFileSync(
+      path.join(bridgeUnitHome, "codex-jobs", "session_missing_fixture.json"),
+      "utf8"
+    ));
+    if (!missingRecord.complete || missingRecord.state !== "stopped") {
+      throw new Error("A missing single-writer owner was not recovered.");
+    }
+    finalizeExecutionWorkspace({
+      session_id: "session_missing_recovered",
+      prompt_id: "prompt_session_missing_recovered",
+      mode: "execute",
+      workspace: recoveredMissing.workspace
+    });
+
+    const uncertain = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    bindFixtureOwner(uncertain, "session_uncertain_fixture");
+    let uncertainRejected = false;
+    try {
+      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    } catch (error) {
+      uncertainRejected = String(error).includes("could not be verified");
+    }
+    if (!uncertainRejected) throw new Error("An unverifiable single-writer owner was reclaimed.");
+    finalizeExecutionWorkspace({
+      session_id: "session_uncertain_fixture",
+      prompt_id: "prompt_session_uncertain_fixture",
+      mode: "execute",
+      workspace: uncertain.workspace
+    });
+
+    const race = await Promise.allSettled([
+      prepareExecutionWorkspace(nonGit, [nonGit]),
+      prepareExecutionWorkspace(nonGit, [nonGit])
+    ]);
+    const raceWinner = race.find((result) => result.status === "fulfilled");
+    const raceLoser = race.find((result) => result.status === "rejected");
+    if (
+      !raceWinner ||
+      !raceLoser ||
+      !String(raceLoser.reason).includes("already owns the non-Git directory") ||
+      raceLoser.reason?.code === "EEXIST"
+    ) {
+      throw new Error("Concurrent single-writer acquisition did not fail with the friendly contention error.");
+    }
+    finalizeExecutionWorkspace({
+      session_id: "session_race_winner",
+      prompt_id: "prompt_session_race_winner",
+      mode: "execute",
+      workspace: raceWinner.value.workspace
     });
   } finally {
     fs.rmSync(nonGit, { recursive: true, force: true });
@@ -436,6 +668,8 @@ if (action === "start") {
   process.stdout.write(value("--format") === "json"
     ? JSON.stringify(requestedSession === "session_running"
       ? { session_id: requestedSession, state: "running", complete: false, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
+      : requestedSession === "session_failed"
+        ? { session_id: requestedSession, state: "failed", complete: true, error: "[provider.rate_limit] 429 overloaded", error_code: "provider.rate_limit", result: "# Stale report", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
       : { session_id: requestedSession, state: "max_tokens", complete: true, result: "# Stub K3 report\\n\\nOriginal Markdown.", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true })
     : \`# Stub K3 report\\n\\nOriginal Markdown.\\n\\n\${footer("completed")}\`);
 } else if (action === "reject-approval") {
@@ -531,6 +765,10 @@ try {
     name: "await_k3_result",
     arguments: { session_id: "session_running", wait_seconds: 1 }
   });
+  const failedAwaited = await request(nextRequestId++, "tools/call", {
+    name: "await_k3_result",
+    arguments: { session_id: "session_failed", wait_seconds: 1 }
+  });
   const messaged = await request(nextRequestId++, "tools/call", {
     name: "send_k3_message",
     arguments: { session_id: "session_portable_mcp", prompt: "Challenge the retry policy." }
@@ -605,6 +843,12 @@ try {
     !runningAwaited.result?.content?.[0]?.text?.includes("do not narrate the same waiting state") ||
     !runningAwaited.result?.content?.[0]?.text?.includes("inspect Git/status as filler") ||
     !runningAwaited.result?.content?.[0]?.text?.includes("for polling") ||
+    failedAwaited.result?.structuredContent?.status !== "failed" ||
+    failedAwaited.result?.structuredContent?.complete !== true ||
+    failedAwaited.result?.structuredContent?.error_code !== "provider.rate_limit" ||
+    failedAwaited.result?.structuredContent?.result_markdown !== null ||
+    !failedAwaited.result?.content?.[0]?.text?.includes("[provider.rate_limit] 429 overloaded") ||
+    failedAwaited.result?.content?.[0]?.text?.includes("# Stale report") ||
     JSON.stringify(browserOpened.result?.structuredContent).includes(fixtureToken) ||
     modelVisible.includes(fixtureToken) ||
     JSON.stringify(opened.result?.structuredContent).includes(fixtureToken) ||
@@ -624,7 +868,7 @@ try {
     !fs.existsSync(path.join(mcpFixtureHome, "approval-rejected")) ||
     maxRelayedBatchBytes > 520000 ||
     relayCursor < relayedFrames.length ||
-    [started, opened, browserOpened, awaited, runningAwaited, messaged, status, result, cancelled].some((message) =>
+    [started, opened, browserOpened, awaited, runningAwaited, failedAwaited, messaged, status, result, cancelled].some((message) =>
       message.result?.content?.[0]?.text?.trimStart().startsWith("{")
     )
   ) {
@@ -704,6 +948,19 @@ try {
     hook_event_name: "Stop",
     session_id: cancelSession,
     turn_id: "codex_cancel_turn_2"
+  });
+  const providerFailureSession = "codex_provider_failure_fixture";
+  const providerFailureTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: providerFailureSession,
+    turn_id: "codex_provider_failure_turn",
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_failed", status: "running" } }
+  });
+  const providerFailureHandoff = runHook({
+    hook_event_name: "Stop",
+    session_id: providerFailureSession,
+    turn_id: "codex_provider_failure_turn"
   });
   const transcriptSession = "codex_transcript_fixture";
   const transcript = path.join(mcpFixtureHome, "codex-transcript.jsonl");
@@ -792,6 +1049,8 @@ try {
     cancelTracked.status !== 0 ||
     cancelHandled.status !== 0 ||
     cancelStop.status !== 0 ||
+    providerFailureTracked.status !== 0 ||
+    providerFailureHandoff.status !== 0 ||
     transcriptHandoff.status !== 0 ||
     retryTracked.status !== 0 ||
     failedOnce.status !== 0 ||
@@ -806,6 +1065,9 @@ try {
     JSON.parse(released.stdout).continue !== true ||
     JSON.parse(guarded.stdout).continue !== true ||
     JSON.parse(cancelStop.stdout).continue !== true ||
+    JSON.parse(providerFailureHandoff.stdout).decision !== "block" ||
+    !JSON.parse(providerFailureHandoff.stdout).reason.includes("[provider.rate_limit] 429 overloaded") ||
+    JSON.parse(providerFailureHandoff.stdout).reason.includes("# Stale report") ||
     JSON.parse(transcriptHandoff.stdout).decision !== "block" ||
     !JSON.parse(transcriptHandoff.stdout).reason.includes("# Stub K3 report") ||
     transcriptState.k3SessionId !== "session_portable_mcp" ||
@@ -891,6 +1153,88 @@ applyK3Event(cursorRecord, {
 });
 if (!cursorRecord.complete || cursorRecord.state !== "completed") {
   throw new Error("The durable prompt terminal state was not advanced.");
+}
+const providerFailureRecord = { state: "running", complete: false, cursor: null };
+applyK3Event(providerFailureRecord, {
+  type: "turn.step.retrying",
+  seq: 44,
+  epoch: "epoch_portable",
+  payload: {
+    errorName: "APIProviderRateLimitError",
+    errorMessage: "429 overloaded",
+    statusCode: 429
+  }
+});
+if (providerFailureRecord.complete || providerFailureRecord.error) {
+  throw new Error("A transient Kimi Provider retry was treated as terminal.");
+}
+const transientProviderRecord = { session_id: "session_transient_provider", state: "running", complete: false };
+applyK3Event(transientProviderRecord, {
+  type: "error",
+  session_id: transientProviderRecord.session_id,
+  seq: 45,
+  epoch: "epoch_portable",
+  payload: {
+    code: "provider.overloaded",
+    message: "temporary overload",
+    fatal: false
+  }
+});
+if (transientProviderRecord.complete || transientProviderRecord.error) {
+  throw new Error("A non-terminal Kimi Provider error was treated as failed.");
+}
+applyK3Event(providerFailureRecord, {
+  type: "turn.ended",
+  seq: 46,
+  epoch: "epoch_portable",
+  payload: {
+    reason: "failed",
+    error: {
+      code: "provider.rate_limit",
+      message: "429 overloaded",
+      name: "APIProviderRateLimitError",
+      retryable: true
+    }
+  }
+});
+if (
+  !providerFailureRecord.complete ||
+  providerFailureRecord.state !== "failed" ||
+  providerFailureRecord.error_code !== "provider.rate_limit" ||
+  !providerFailureRecord.error?.includes("429 overloaded")
+) {
+  throw new Error("A terminal Kimi Provider error was not persisted as a failed handoff.");
+}
+const standaloneProviderFailure = {
+  session_id: "session_standalone_provider_failure",
+  state: "running",
+  complete: false
+};
+applyK3Event(standaloneProviderFailure, {
+  type: "error",
+  session_id: standaloneProviderFailure.session_id,
+  seq: 47,
+  payload: {
+    code: "provider.rate_limit",
+    message: "429 overloaded",
+    fatal: true
+  }
+});
+if (
+  !standaloneProviderFailure.complete ||
+  standaloneProviderFailure.state !== "failed" ||
+  standaloneProviderFailure.error_code !== "provider.rate_limit"
+) {
+  throw new Error("A standalone terminal Kimi Provider error was not persisted.");
+}
+const transportFailureRecord = { session_id: "session_transport_failure", state: "running", complete: false };
+applyK3Event(transportFailureRecord, {
+  type: "error",
+  seq: 48,
+  payload: { code: "provider.rate_limit", message: "transport-scoped", fatal: true }
+});
+if (transportFailureRecord.complete || transportFailureRecord.error) {
+  throw new Error("A transport-scoped WebSocket error was misclassified as a job failure.");
 }
 if (
   eventMatchesCurrentPrompt({ prompt_id: "prompt_new" }, { payload: { promptId: "prompt_old" } }) ||

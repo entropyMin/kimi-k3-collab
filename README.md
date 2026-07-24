@@ -81,7 +81,7 @@ Normal collaboration has no model-driven status loop or token-consuming retries:
 ## Requirements
 
 - Node.js 18.18 or newer on Windows, macOS, or Linux
-- Kimi Code CLI with local-server and Web UI support, installed and authenticated. `0.26.0` is tested; other versions are capability-checked but currently marked untested. See [compatibility](docs/compatibility.md).
+- Kimi Code CLI with local-server and Web UI support, installed and authenticated. The latest stable `0.29.0` is preferred and `0.26.0` remains a tested legacy baseline; other versions are capability-checked but marked untested. See [compatibility](docs/compatibility.md).
 - A Codex or ChatGPT host with personal plugins, MCP, and MCP Apps UI support
 - Codex lifecycle-hook support for the automatic stop-time handoff safety net
 - Git on `PATH` for isolated parallel `execute` mode; non-Git directories fall back to the single-writer protocol
@@ -180,6 +180,6 @@ npm run check
 npm test
 ```
 
-`npm test` uses a fake Kimi REST/WebSocket server and requires no Kimi login. Run `npm run test:real-kimi` for the optional check against the installed, authenticated Kimi Code service.
+`npm test` uses a fake Kimi REST/WebSocket server and requires no Kimi login. Run `npm run test:real-kimi` for the optional real session/prompt/WebSocket/result handoff against the installed, authenticated Kimi Code service; it consumes one model request.
 
 Register that directory as `kimi-k3-collab` in the personal Codex marketplace, install `kimi-k3-collab@personal`, and start a new Codex task so the updated skill, tools, and MCP resource are loaded.

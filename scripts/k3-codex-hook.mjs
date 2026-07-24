@@ -158,10 +158,16 @@ function runBridge(sessionId, waitSeconds) {
         if (!record.verified_k3 || model !== K3_MODEL) {
           throw new Error(`Kimi handoff did not verify ${K3_MODEL}.`);
         }
-        const status = record.complete === true || record.state === "end_turn"
-          ? "completed"
-          : String(record.state || record.status || "unknown");
-        resolve({ status, report: typeof record.result === "string" ? record.result.trim() : "" });
+        const rawStatus = String(record.state || record.status || "unknown");
+        const status = HANDOFF_STATUSES.has(rawStatus)
+          ? rawStatus
+          : record.complete === true || rawStatus === "end_turn"
+            ? "completed"
+            : rawStatus;
+        const report = record.error
+          ? `Kimi K3 collaboration failed: ${record.error}`
+          : typeof record.result === "string" ? record.result.trim() : "";
+        resolve({ status, report });
       } catch {
         reject(new Error("Kimi bridge returned invalid JSON to the handoff hook."));
       }
