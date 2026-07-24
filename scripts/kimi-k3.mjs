@@ -8,7 +8,15 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
-import { READ_ONLY_TOOLS, isReadOnlyTool, terminalProviderFailure } from "./lib/k3-policy.mjs";
+import {
+  READ_ONLY_TOOLS,
+  appendSecurityAudit,
+  findSensitivePaths,
+  inspectToolSecurity,
+  isReadOnlyTool,
+  isSensitivePath,
+  terminalProviderFailure
+} from "./lib/k3-policy.mjs";
 
 const K3_MODEL = "kimi-code/k3";
 const TESTED_KIMI_CODE_VERSIONS = new Set(["0.26.0", "0.29.0"]);
@@ -19,6 +27,7 @@ const WRITE_LOCK_ROOT = path.join(JOB_ROOT, "write-locks");
 const LOCK_FILE = path.join(KIMI_HOME, "server", "lock");
 const INSTANCE_ROOT = path.join(KIMI_HOME, "server", "instances");
 const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
+const SANDBOX_MARKER = path.join(JOB_ROOT, "sandbox-service.json");
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMPLETE_STATES = new Set(["completed", "cancelled", "failed", "error", "stopped", "end_turn"]);
 const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped"]);
@@ -54,6 +63,8 @@ function parseArgs(argv) {
     waitSeconds: 0,
     maxWaitSeconds: 105,
     deleteResources: false,
+    allowNonGitExecute: false,
+    sensitivePathsAcknowledged: false,
     allowedPaths: []
   };
   const names = new Map([
@@ -74,6 +85,16 @@ function parseArgs(argv) {
     const flag = tokens[index];
     if (flag === "--delete") {
       options.deleteResources = true;
+      index += 1;
+      continue;
+    }
+    if (flag === "--allow-non-git-execute") {
+      options.allowNonGitExecute = true;
+      index += 1;
+      continue;
+    }
+    if (flag === "--ack-sensitive-paths") {
+      options.sensitivePathsAcknowledged = true;
       index += 1;
       continue;
     }
@@ -152,6 +173,7 @@ function formatIntegration(value) {
     preserved && integration.worktree_root && `Preserved worktree: ${integration.worktree_root}`,
     integration.changed_paths?.length && `Changed paths: ${integration.changed_paths.join(", ")}`,
     integration.ignored_paths?.length && `Ignored paths requiring review: ${integration.ignored_paths.join(", ")}`,
+    integration.sensitive_paths?.length && `Sensitive paths blocked: ${integration.sensitive_paths.join(", ")}`,
     integration.symlink_paths?.length && `Symbolic links or junctions: ${integration.symlink_paths.join(", ")}`,
     integration.overlapping_source_paths?.length && `Overlapping source changes: ${integration.overlapping_source_paths.join(", ")}`,
     integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`,
@@ -627,11 +649,22 @@ export function kimiServerLaunchSpec(serverHelp) {
   };
 }
 
+export function wrappedServerCommand(command, args) {
+  const wrapper = String(process.env.KIMI_K3_SERVER_WRAPPER || "").trim();
+  if (wrapper && !path.isAbsolute(wrapper)) {
+    throw new Error("KIMI_K3_SERVER_WRAPPER must be an absolute executable path.");
+  }
+  return wrapper
+    ? { command: wrapper, args: [command, ...args], shell: false }
+    : { command, args, shell: process.platform === "win32" && command === "kimi" };
+}
+
 async function launchKimiService(command) {
   const help = runCommand(command, ["server", "--help"], { timeout: 10000 });
   const launch = kimiServerLaunchSpec(`${help.stdout || ""}\n${help.stderr || ""}`);
+  const wrapped = wrappedServerCommand(command, launch.args);
   if (!launch.detached) {
-    const started = runCommand(command, launch.args, { timeout: 60000 });
+    const started = runCommand(wrapped.command, wrapped.args, { timeout: 60000 });
     if (started.error) throw started.error;
     if (started.status !== 0) {
       throw new Error((started.stderr || started.stdout || `Kimi server exited with ${started.status}`).trim());
@@ -639,11 +672,11 @@ async function launchKimiService(command) {
     return;
   }
 
-  const child = spawn(command, launch.args, {
+  const child = spawn(wrapped.command, wrapped.args, {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
-    shell: process.platform === "win32" && command === "kimi"
+    shell: wrapped.shell
   });
   await new Promise((resolve, reject) => {
     child.once("spawn", resolve);
@@ -655,10 +688,18 @@ async function launchKimiService(command) {
 async function ensureService() {
   let service = await readService();
   if (service) {
-    return service;
+    const sandboxed = sandboxMarkerMatches(service);
+    if (String(process.env.KIMI_K3_SERVER_WRAPPER || "").trim() && !sandboxed) {
+      throw new Error(
+        "KIMI_K3_SERVER_WRAPPER is configured, but the active Kimi service was not launched through it. " +
+        "Stop the existing service or use a dedicated KIMI_CODE_HOME before retrying."
+      );
+    }
+    return { ...service, sandboxed };
   }
 
   const command = resolveKimiCommand();
+  const wrapped = Boolean(String(process.env.KIMI_K3_SERVER_WRAPPER || "").trim());
   await launchKimiService(command);
 
   const deadline = Math.min(Date.now() + 15000, PROCESS_DEADLINE - 1000);
@@ -666,7 +707,10 @@ async function ensureService() {
     await sleep(250);
     service = await readService();
     if (service) {
-      return service;
+      if (wrapped) {
+        writeJsonFile(SANDBOX_MARKER, { pid: service.pid, port: service.port, created_at: new Date().toISOString() });
+      }
+      return { ...service, sandboxed: wrapped };
     }
   }
   throw new Error("Kimi local server did not become healthy within 15 seconds.");
@@ -721,7 +765,7 @@ function writeJobRecord(record) {
 }
 
 function createJobRecord(job, options) {
-  return {
+  const record = {
     kind: "kimi-k3-native-delegation",
     session_id: job.session_id,
     prompt_id: job.prompt_id,
@@ -732,6 +776,9 @@ function createJobRecord(job, options) {
     cwd: job.workspace?.cwd || path.resolve(options.cwd),
     source_cwd: path.resolve(options.cwd),
     allowed_paths: job.workspace?.allowed_paths || [],
+    allow_non_git_execute: Boolean(options.allowNonGitExecute),
+    sensitive_paths_acknowledged: Boolean(options.sensitivePathsAcknowledged),
+    sandboxed: Boolean(job.sandboxed),
     workspace: job.workspace || null,
     explicit_model: job.explicit_model,
     server_reported_model: job.server_reported_model,
@@ -743,6 +790,27 @@ function createJobRecord(job, options) {
     result: null,
     cursor: { seq: 0 }
   };
+  appendSecurityAudit(JOB_ROOT, record.session_id, {
+    event: "session_security_policy",
+    decision: "configured",
+    cwd: record.source_cwd,
+    allowed_paths: record.allowed_paths,
+    sensitive_paths_acknowledged: record.sensitive_paths_acknowledged,
+    allow_non_git_execute: record.allow_non_git_execute,
+    sandboxed: record.sandboxed
+  });
+  return record;
+}
+
+function sandboxMarkerMatches(service) {
+  try {
+    const marker = JSON.parse(fs.readFileSync(SANDBOX_MARKER, "utf8"));
+    return Number.isInteger(service.pid) && service.pid > 0 &&
+      Number(marker.pid) === service.pid &&
+      Number(marker.port) === Number(service.port);
+  } catch {
+    return false;
+  }
 }
 
 function readJobRecord(sessionId) {
@@ -934,11 +1002,22 @@ function verifyWithinRoot(root, candidate) {
   throw new Error(`Allowed path is outside the working directory: ${candidate}`);
 }
 
-export async function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths, getOwnerStatus = getJobStatus) {
+export async function prepareExecutionWorkspace(
+  sourceCwd,
+  allowedAbsolutePaths,
+  getOwnerStatus = getJobStatus,
+  allowNonGitExecute = false
+) {
   const sourceRoot = canonicalPath(sourceCwd);
   const allowedSourcePaths = allowedAbsolutePaths.map((item) => verifyWithinRoot(sourceRoot, item));
   const repo = findGitRepo(sourceRoot);
   if (!repo) {
+    if (!allowNonGitExecute) {
+      throw new Error(
+        "Non-Git execute mode is disabled by default because it writes the source directory directly. " +
+        "Retry only after explicit user confirmation with allow_non_git_execute=true."
+      );
+    }
     const lock = await acquireSingleWriter(sourceRoot, getOwnerStatus);
     return {
       cwd: sourceRoot,
@@ -1096,7 +1175,13 @@ export function finalizeExecutionWorkspace(record) {
   const changedPaths = gitChangedPaths(workspace.worktree_root, baseCommit);
   const ignoredPaths = gitIgnoredPaths(workspace.worktree_root);
   const observedPaths = [...new Set([...changedPaths, ...ignoredPaths])];
-  const violations = scopeViolations(observedPaths, workspace.allowed_repo_paths);
+  const sensitivePaths = record.sensitive_paths_acknowledged
+    ? []
+    : observedPaths.filter(isSensitivePath);
+  const violations = [...new Set([
+    ...scopeViolations(observedPaths, workspace.allowed_repo_paths),
+    ...sensitivePaths
+  ])];
   if (violations.length > 0) {
     workspace.turn_finalized_for = record.prompt_id;
     record.integration = {
@@ -1107,11 +1192,19 @@ export function finalizeExecutionWorkspace(record) {
       worktree_root: workspace.worktree_root,
       changed_paths: observedPaths,
       ignored_paths: ignoredPaths,
+      sensitive_paths: sensitivePaths,
       scope_violations: violations
     };
     record.state = "error";
     record.complete = true;
-    record.error = `K3 changed files outside allowed_paths: ${violations.join(", ")}. The isolated worktree was preserved for review.`;
+    record.error = `K3 changed protected paths: ${violations.join(", ")}. The isolated worktree was preserved for review.`;
+    if (sensitivePaths.length > 0) {
+      appendSecurityAudit(JOB_ROOT, record.session_id, {
+        event: "sensitive_output_blocked",
+        decision: "block",
+        paths: sensitivePaths
+      });
+    }
     return record.integration;
   }
 
@@ -1311,16 +1404,29 @@ async function startJob(options) {
   let workspace = null;
   let scopeText = "";
   if (!readOnly) {
-    const prepared = await prepareExecutionWorkspace(sourceRoot, allowedOriginal);
+    const prepared = await prepareExecutionWorkspace(
+      sourceRoot,
+      allowedOriginal,
+      getJobStatus,
+      options.allowNonGitExecute
+    );
     root = prepared.cwd;
     workspace = prepared.workspace;
     const allowed = prepared.allowed;
     scopeText = `\nYou may edit only these paths:\n- ${allowed.join("\n- ")}`;
   }
+  const sensitivePaths = findSensitivePaths(root);
+  if (sensitivePaths.length > 0 && !options.sensitivePathsAcknowledged) {
+    if (workspace) cleanupPreparedWorkspace(workspace);
+    throw new Error(
+      `Sensitive paths are accessible to K3: ${sensitivePaths.join(", ")}. ` +
+      "Ask the user for explicit confirmation, then retry with sensitive_paths_ack=true."
+    );
+  }
 
   const systemPrompt = readOnly
-    ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Do not call Bash, Shell, another command-execution tool, WebSearch, or FetchURL; use the configured local read-only inspection tools instead. You may use TodoList to organize the review. Inspect relevant project files and assets as needed.\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
-    : `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe user has authorized the scoped implementation described in the task. Inspect before editing, preserve unrelated user changes, and do not touch files outside the allowed paths.${scopeText}\n${workspace?.isolation === "git-worktree" ? `You are inside an isolated Git worktree on branch ${workspace.branch}. Do not create commits, branches, merges, or additional worktrees; the collaboration bridge owns integration.` : "This is a non-Git single-writer session. Codex must pause local writes until your turn completes."}\nImplement the requested work, verify it with appropriate tests, static checks, or rendered evidence, and return the files changed, decisions made, and verification results.`;
+    ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Do not call Bash, Shell, another command-execution tool, WebSearch, or FetchURL; use the configured local read-only inspection tools instead. You may use TodoList to organize the review. ${options.sensitivePathsAcknowledged ? "The user explicitly authorized access to sensitive paths for this session." : "Do not access credentials, private keys, .env files, or other sensitive paths."} Inspect relevant project files and assets as needed.\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
+    : `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe user has authorized the scoped implementation described in the task. Inspect before editing, preserve unrelated user changes, and do not touch files outside the allowed paths.${scopeText}\n${options.sensitivePathsAcknowledged ? "The user explicitly authorized access to sensitive paths for this session." : "Do not access credentials, private keys, .env files, or other sensitive paths."}\n${workspace?.isolation === "git-worktree" ? `You are inside an isolated Git worktree on branch ${workspace.branch}. Do not create commits, branches, merges, or additional worktrees; the collaboration bridge owns integration.` : "This is an explicitly authorized non-Git single-writer session. Codex must pause local writes until your turn completes."}\nImplement the requested work, verify it with appropriate tests, static checks, or rendered evidence, and return the files changed, decisions made, and verification results.`;
 
   try {
     const session = await callApi("POST", "/api/v1/sessions", {
@@ -1389,6 +1495,7 @@ async function startJob(options) {
       compatibility_status: compatibility.status,
       verified_k3: configured.model === K3_MODEL,
       persistent_server: true,
+      sandboxed: Boolean(service.sandboxed),
       workspace
     };
   } catch (error) {
@@ -1835,6 +1942,42 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
           }
           writeJobRecord(record);
           continue;
+        }
+        if (frame.type === "tool.call.started") {
+          const finding = inspectToolSecurity(frame.payload, {
+            mode: record.mode,
+            cwd: record.cwd,
+            allowedPaths: record.allowed_paths,
+            sensitivePathsAcknowledged: record.sensitive_paths_acknowledged,
+            sandboxed: record.sandboxed
+          });
+          const findingId = `${frame.epoch || ""}:${frame.seq || ""}:${frame.payload?.toolCallId || ""}:${finding?.event || ""}`;
+          if (finding && !record.security_event_ids?.includes(findingId)) {
+            record.security_event_ids = [...(record.security_event_ids || []), findingId].slice(-100);
+            appendSecurityAudit(JOB_ROOT, sessionId, {
+              event_id: findingId,
+              event: finding.event,
+              decision: finding.action,
+              tool: String(frame.payload?.name || ""),
+              path: finding.path,
+              message: finding.message
+            });
+            onText(actionLine(renderState, `Security ${finding.action}: ${finding.message}`));
+            if (finding.action === "block") {
+              applyK3Event(record, frame);
+              const cancellation = await abortActivePrompt(sessionId);
+              Object.assign(record, {
+                state: "error",
+                complete: true,
+                error: finding.message,
+                error_code: finding.event,
+                cancellation
+              });
+              writeJobRecord(record);
+              websocket.close();
+              return { record, assistantStreamed: renderState.assistantStreamed };
+            }
+          }
         }
         if (record.mode === "analyze" && frame.type === "tool.call.started" && !isReadOnlyTool(frame.payload.name)) {
           applyK3Event(record, frame);

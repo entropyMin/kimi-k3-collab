@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -10,7 +12,12 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
-import { isReadOnlyTool, terminalProviderFailure } from "./lib/k3-policy.mjs";
+import {
+  appendSecurityAudit,
+  inspectToolSecurity,
+  isReadOnlyTool,
+  terminalProviderFailure
+} from "./lib/k3-policy.mjs";
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = path.dirname(path.dirname(THIS_FILE));
@@ -23,7 +30,6 @@ const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
 const PANEL_FILE = path.join(ROOT, "assets", "k3-panel.html");
 const PANEL_URI = "ui://kimi-k3/live-session-v3.html";
 const PANEL_MIME = "text/html;profile=mcp-app";
-const DEFAULT_KIMI_ORIGIN = "http://127.0.0.1:58627";
 const K3_MODEL = "kimi-code/k3";
 const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, ".codex-plugin", "plugin.json"), "utf8")).version;
 const PROTOCOL_VERSION = "2025-11-25";
@@ -33,6 +39,7 @@ const activeRequests = new Set();
 const cancelledRequests = new Set();
 const relayReceivers = new Map();
 const relays = new Map();
+let browserGateway = null;
 const MAX_RELAY_EVENTS = 2000;
 const MAX_EVENT_BATCH = 100;
 const MAX_RELAY_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -54,6 +61,8 @@ function closeTransport() {
   for (const child of activeChildren.values()) child.kill();
   for (const cancel of relayReceivers.values()) cancel();
   for (const relay of relays.values()) relay.stop();
+  browserGateway?.close();
+  browserGateway = null;
 }
 
 function send(message) {
@@ -104,12 +113,20 @@ function parseJobArguments(value) {
   }
   const cwd = requireString(input.cwd, "cwd");
   if (!path.isAbsolute(cwd)) throw new Error("cwd must be an absolute path.");
+  if (input.allow_non_git_execute != null && typeof input.allow_non_git_execute !== "boolean") {
+    throw new Error("allow_non_git_execute must be a boolean.");
+  }
+  if (input.sensitive_paths_ack != null && typeof input.sensitive_paths_ack !== "boolean") {
+    throw new Error("sensitive_paths_ack must be a boolean.");
+  }
   return {
     mode,
     focus,
     cwd: path.resolve(cwd),
     prompt: requireString(input.prompt, "prompt"),
-    allowedPaths
+    allowedPaths,
+    allowNonGitExecute: input.allow_non_git_execute === true,
+    sensitivePathsAcknowledged: input.sensitive_paths_ack === true
   };
 }
 
@@ -183,6 +200,8 @@ async function startJob(requestId, input) {
     requestId,
     [
       "start", "--format", "json", "--mode", input.mode, "--focus", input.focus, "--cwd", input.cwd,
+      ...(input.allowNonGitExecute ? ["--allow-non-git-execute"] : []),
+      ...(input.sensitivePathsAcknowledged ? ["--ack-sensitive-paths"] : []),
       ...(input.mode === "execute" ? input.allowedPaths.flatMap((item) => ["--allowed-path", item]) : [])
     ],
     input.prompt
@@ -204,6 +223,7 @@ function structuredJob(job) {
     compatibility_status: job.compatibility_status || "untested",
     server_reported_model: job.server_reported_model || job.explicit_model || null,
     verified_k3: Boolean(job.verified_k3),
+    sandboxed: Boolean(job.sandboxed),
     isolation: job.workspace?.isolation || integration?.isolation || null,
     integration_state: integration?.state || null,
     branch: integration?.branch || job.workspace?.branch || null,
@@ -233,6 +253,7 @@ export function integrationHandoff(record) {
     integration.commit && `Commit: ${integration.commit}`,
     integration.changed_paths?.length && `Changed paths: ${integration.changed_paths.join(", ")}`,
     integration.ignored_paths?.length && `Ignored paths requiring review: ${integration.ignored_paths.join(", ")}`,
+    integration.sensitive_paths?.length && `Sensitive paths blocked: ${integration.sensitive_paths.join(", ")}`,
     integration.symlink_paths?.length && `Symbolic links or junctions: ${integration.symlink_paths.join(", ")}`,
     integration.overlapping_source_paths?.length && `Overlapping source changes: ${integration.overlapping_source_paths.join(", ")}`,
     integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`,
@@ -252,6 +273,7 @@ export function integrationHandoff(record) {
       commits: integration.commits || [],
       changed_paths: integration.changed_paths || [],
       ignored_paths: integration.ignored_paths || [],
+      sensitive_paths: integration.sensitive_paths || [],
       symlink_paths: integration.symlink_paths || [],
       overlapping_source_paths: integration.overlapping_source_paths || [],
       scope_violations: integration.scope_violations || []
@@ -266,6 +288,21 @@ function latestSessionId() {
     return requireSessionId(JSON.parse(fs.readFileSync(file, "utf8")).session_id);
   } catch {
     return null;
+  }
+}
+
+function readSessionPolicy(sessionId) {
+  try {
+    const record = JSON.parse(fs.readFileSync(path.join(JOB_ROOT, `${requireSessionId(sessionId)}.json`), "utf8"));
+    return {
+      mode: record.mode,
+      cwd: record.cwd || record.source_cwd,
+      allowedPaths: record.allowed_paths || [],
+      sensitivePathsAcknowledged: Boolean(record.sensitive_paths_acknowledged),
+      sandboxed: Boolean(record.sandboxed)
+    };
+  } catch {
+    return { mode: null, cwd: process.cwd(), allowedPaths: [] };
   }
 }
 
@@ -542,6 +579,42 @@ class SessionRelay {
           this.updateServerCursor(frame);
           this.enqueue(frame);
           if (frame.type === "turn.started") this.providerFailureNotified = false;
+          if (frame.type === "tool.call.started") {
+            const policy = readSessionPolicy(this.sessionId);
+            const finding = inspectToolSecurity(frame.payload, {
+              ...policy,
+              mode: this.mode || policy.mode
+            });
+            if (finding) {
+              const eventId = `${frame.epoch || ""}:${frame.seq || ""}:${frame.payload?.toolCallId || ""}:${finding.event}`;
+              appendSecurityAudit(JOB_ROOT, this.sessionId, {
+                event_id: eventId,
+                event: finding.event,
+                decision: finding.action,
+                tool: String(frame.payload?.name || ""),
+                path: finding.path,
+                message: finding.message
+              });
+              if (finding.action === "block") {
+                try {
+                  await runBridgeJson(
+                    `relay-security:${this.sessionId}:${frame.payload?.toolCallId || randomUUID()}`,
+                    ["cancel", "--format", "json", "--session-id", this.sessionId]
+                  );
+                } catch {}
+              }
+              this.enqueue({
+                type: "relay.policy",
+                session_id: this.sessionId,
+                volatile: true,
+                payload: {
+                  status: finding.action === "block" ? "failed" : "warning",
+                  message: finding.message,
+                  security_event: finding.event
+                }
+              });
+            }
+          }
           if (this.mode === "analyze" && frame.type === "event.approval.requested") {
             const approvalId = String(frame.payload?.approval_id || "").trim();
             if (!approvalId) {
@@ -675,11 +748,6 @@ function relayFor(sessionId, mode = null) {
   return relay;
 }
 
-function panelUrl(service, sessionId) {
-  const route = sessionId ? `/sessions/${encodeURIComponent(sessionId)}` : "/";
-  return `${service.origin}${route}#token=${encodeURIComponent(service.token)}`;
-}
-
 export function browserCommand(url, platform = process.platform) {
   if (platform === "win32") return { command: "rundll32.exe", args: ["url.dll,FileProtocolHandler", url] };
   if (platform === "darwin") return { command: "open", args: [url] };
@@ -700,31 +768,188 @@ function launchBrowser(url) {
   });
 }
 
-function panelOrigins() {
-  const origins = new Set([DEFAULT_KIMI_ORIGIN, "http://localhost:58627"]);
-  try {
-    origins.add(readPanelService().origin);
-  } catch {
-    // The render tool starts Kimi before the panel is mounted.
+function cookieValue(request, name) {
+  for (const item of String(request.headers.cookie || "").split(";")) {
+    const [key, ...value] = item.trim().split("=");
+    if (key === name) return value.join("=");
   }
-  return [...origins];
+  return null;
 }
 
-function panelToolResult(sessionId, service, details, text) {
-  const url = panelUrl(service, sessionId);
+export function createBrowserGateway(
+  serviceProvider = readPanelService,
+  { ticketTtlMs = 60000, sessionTtlMs = 10 * 60 * 1000 } = {}
+) {
+  const tickets = new Map();
+  const sessions = new Map();
+  const sockets = new Set();
+  let origin = null;
+
+  function cleanup() {
+    const now = Date.now();
+    for (const [key, value] of tickets) if (value.expires_at <= now) tickets.delete(key);
+    for (const [key, value] of sessions) if (value.expires_at <= now) sessions.delete(key);
+  }
+
+  function authenticate(request) {
+    cleanup();
+    const token = cookieValue(request, "kimi_k3_browser");
+    const session = token && sessions.get(token);
+    return session?.expires_at > Date.now() ? session : null;
+  }
+
+  function upstreamHeaders(request, service) {
+    const headers = { ...request.headers, host: `${service.host}:${service.port}`, authorization: `Bearer ${service.token}` };
+    delete headers.cookie;
+    delete headers["proxy-connection"];
+    if (headers.origin) headers.origin = service.origin;
+    if (headers.referer) headers.referer = `${service.origin}/`;
+    return headers;
+  }
+
+  function proxyHttp(request, response) {
+    const session = authenticate(request);
+    if (!session) {
+      response.writeHead(401, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+      response.end("Browser fallback session expired. Reopen it from the Kimi K3 panel.");
+      return;
+    }
+    let service;
+    try {
+      service = serviceProvider();
+    } catch (error) {
+      response.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    const upstream = http.request({
+      host: service.host,
+      port: service.port,
+      method: request.method,
+      path: request.url,
+      headers: upstreamHeaders(request, service)
+    }, (upstreamResponse) => {
+      const headers = { ...upstreamResponse.headers };
+      delete headers["set-cookie"];
+      if (headers.location?.startsWith(service.origin)) {
+        headers.location = `${origin}${headers.location.slice(service.origin.length)}`;
+      }
+      response.writeHead(upstreamResponse.statusCode || 502, headers);
+      upstreamResponse.pipe(response);
+    });
+    upstream.on("error", (error) => {
+      if (!response.headersSent) response.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end(error instanceof Error ? error.message : String(error));
+    });
+    request.pipe(upstream);
+  }
+
+  const server = http.createServer((request, response) => {
+    const ticketPrefix = "/__kimi_k3_ticket/";
+    if (request.method === "GET" && request.url?.startsWith(ticketPrefix)) {
+      cleanup();
+      const ticket = request.url.slice(ticketPrefix.length).split(/[?#]/, 1)[0];
+      const pending = tickets.get(ticket);
+      tickets.delete(ticket);
+      if (!pending || pending.expires_at <= Date.now()) {
+        response.writeHead(410, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+        response.end("Browser fallback ticket expired or was already used.");
+        return;
+      }
+      sessions.set(pending.session_token, {
+        session_id: pending.session_id,
+        expires_at: Date.now() + sessionTtlMs
+      });
+      response.writeHead(302, {
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        "Set-Cookie": `kimi_k3_browser=${pending.session_token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.ceil(sessionTtlMs / 1000)}`,
+        Location: `/sessions/${encodeURIComponent(pending.session_id)}#token=${encodeURIComponent(pending.session_token)}`
+      });
+      response.end();
+      return;
+    }
+    proxyHttp(request, response);
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+
+  server.on("upgrade", (request, socket) => {
+    if (!authenticate(request)) {
+      socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    let service;
+    try {
+      service = serviceProvider();
+    } catch {
+      socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    const upstream = net.connect(service.port, service.host);
+    upstream.once("connect", () => {
+      const headers = upstreamHeaders(request, service);
+      const lines = [`${request.method} ${request.url} HTTP/${request.httpVersion}`];
+      for (const [name, value] of Object.entries(headers)) {
+        if (Array.isArray(value)) {
+          for (const item of value) lines.push(`${name}: ${item}`);
+        } else if (value != null) {
+          lines.push(`${name}: ${value}`);
+        }
+      }
+      upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
+      socket.pipe(upstream);
+      upstream.pipe(socket);
+    });
+    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
+  });
+
+  async function start() {
+    if (origin) return origin;
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    server.unref();
+    origin = `http://127.0.0.1:${server.address().port}`;
+    return origin;
+  }
+
+  return {
+    async issue(sessionId) {
+      const gatewayOrigin = await start();
+      cleanup();
+      const ticket = randomBytes(32).toString("base64url");
+      tickets.set(ticket, {
+        session_id: requireSessionId(sessionId),
+        session_token: randomBytes(32).toString("base64url"),
+        expires_at: Date.now() + ticketTtlMs
+      });
+      return `${gatewayOrigin}/__kimi_k3_ticket/${ticket}`;
+    },
+    close() {
+      tickets.clear();
+      sessions.clear();
+      for (const socket of sockets) socket.destroy();
+      server.close();
+    }
+  };
+}
+
+function panelToolResult(sessionId, details, text) {
   return {
     content: [{ type: "text", text }],
     structuredContent: { ...details, session_id: sessionId, view: "kimi-event-stream" },
-    _meta: {
-      "kimi-k3/panelUrl": url,
-      "kimi-k3/sessionId": sessionId
-    }
+    _meta: { "kimi-k3/sessionId": sessionId }
   };
 }
 
 async function startCollaboration(requestId, rawArguments) {
   const input = parseJobArguments(rawArguments);
-  const service = await ensurePanelService(requestId);
+  await ensurePanelService(requestId);
   const job = await startJob(requestId, input);
   relayFor(job.session_id, job.mode);
   const details = structuredJob(job);
@@ -736,13 +961,13 @@ async function startCollaboration(requestId, rawArguments) {
     `Model: ${details.server_reported_model} (${details.verified_k3 ? "verified" : "NOT VERIFIED"})`,
     "The live panel renders Kimi's raw pushed frames through the server relay."
   ].join("\n");
-  return panelToolResult(job.session_id, service, details, text);
+  return panelToolResult(job.session_id, details, text);
 }
 
 async function openPanel(requestId, rawArguments) {
   const input = requireObject(rawArguments);
   const sessionId = input.session_id ? requireSessionId(input.session_id) : latestSessionId();
-  const service = await ensurePanelService(requestId);
+  await ensurePanelService(requestId);
   const details = sessionId
     ? await runBridgeJson(requestId, ["status", "--format", "json", "--session-id", sessionId])
     : { status: "idle", mode: null, focus: null, server_reported_model: null, verified_k3: false };
@@ -750,13 +975,15 @@ async function openPanel(requestId, rawArguments) {
     ? `Opened the direct Kimi K3 event stream.\nSession: ${sessionId}`
     : "Opened Kimi K3. Start or select a session in the live panel.";
   if (sessionId) relayFor(sessionId, details.mode);
-  return panelToolResult(sessionId, service, structuredJob({ ...details, session_id: sessionId }), text);
+  return panelToolResult(sessionId, structuredJob({ ...details, session_id: sessionId }), text);
 }
 
 async function openK3InBrowser(requestId, rawArguments) {
   const { sessionId } = parseSessionArguments(rawArguments);
-  const service = await ensurePanelService(requestId);
-  await launchBrowser(panelUrl(service, sessionId));
+  await ensurePanelService(requestId);
+  browserGateway ||= createBrowserGateway();
+  const ticketUrl = await browserGateway.issue(sessionId);
+  await launchBrowser(ticketUrl);
   return {
     content: [{ type: "text", text: `Opened Kimi Code in the default browser.\nSession: ${sessionId}` }],
     structuredContent: { session_id: sessionId, opened: true }
@@ -939,7 +1166,17 @@ const jobInputProperties = {
   allowed_paths: {
     type: "array",
     items: { type: "string", minLength: 1 },
-    description: "Execute-mode paths allowed under cwd. Git projects use an isolated worktree; non-Git projects use a single-writer lock."
+    description: "Execute-mode paths allowed under cwd. Git projects use an isolated worktree."
+  },
+  allow_non_git_execute: {
+    type: "boolean",
+    default: false,
+    description: "Permit direct non-Git writes only after explicit user confirmation. Disabled by default."
+  },
+  sensitive_paths_ack: {
+    type: "boolean",
+    default: false,
+    description: "Permit access to default-sensitive paths only after explicit user confirmation. The decision is audited."
   }
 };
 
@@ -953,14 +1190,14 @@ const panelMeta = {
 export const startToolDefinition = {
   name: "start_k3_collaboration",
   title: "Start Kimi K3 Collaboration",
-  description: "Start one persistent K3 session and render the direct Kimi Code interface. Execute mode isolates Git writes in a temporary branch/worktree; non-Git execution is single-writer. Returns immediately without status polling.",
+  description: "Start one persistent K3 session and render the direct Kimi Code interface. Execute mode isolates Git writes in a temporary branch/worktree; non-Git execution is disabled unless explicitly confirmed. Returns immediately without status polling.",
   inputSchema: {
     type: "object",
     properties: jobInputProperties,
     required: ["prompt", "cwd"],
     additionalProperties: false
   },
-  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   _meta: panelMeta
 };
 
@@ -1116,7 +1353,6 @@ export const panelResource = {
 };
 
 function readPanelResource() {
-  const origins = panelOrigins();
   return {
     contents: [{
       uri: PANEL_URI,
@@ -1130,8 +1366,7 @@ function readPanelResource() {
         "openai/widgetPrefersBorder": false,
         "openai/widgetCSP": {
           connect_domains: [],
-          resource_domains: [],
-          redirect_domains: origins
+          resource_domains: []
         }
       }
     }]

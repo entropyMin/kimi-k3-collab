@@ -65,18 +65,20 @@ Normal collaboration has no model-driven status loop or token-consuming retries:
 ## Security
 
 - The bridge accepts only `127.0.0.1`, `localhost`, or `::1` Kimi server locks.
-- The component never receives the Kimi bearer token as a connection credential; the browser-fallback URL in component-only `_meta` embeds it in the URL fragment.
-- The token is never returned in model-visible text or `structuredContent`.
-- Only the authenticated **Open Kimi Code** browser-fallback URL is placed in component-only tool-result `_meta`.
+- The component never receives the Kimi bearer token or an authenticated browser URL.
+- **Open Kimi Code** uses a loopback gateway with a 60-second single-use ticket and a 10-minute HttpOnly browser session. The gateway adds the persistent Kimi bearer token only on its upstream loopback connection.
+- Neither the persistent bearer token nor the one-time ticket is returned in model-visible text, `structuredContent`, or component metadata.
 - The MCP App makes no loopback HTTP, WebSocket, or iframe connection. Its CSP has no loopback connect allowlist.
 - `receive_k3_events` is private, app-only, and unavailable to the model.
 - The panel does not embed Kimi Code as an iframe. **Open Kimi Code** remains an authenticated browser fallback.
 - Kimi Code 0.26 may still advertise write-capable tools in `analyze` mode. The plugin uses manual permission mode, a local-only read-tool allowlist, approval rejection, and the same non-read-only tool check in both the live relay and result stream. This is a safety guard, not an operating-system sandbox.
 - `WebSearch` and `FetchURL` are not enabled in `analyze` mode. Repository content is still sent to the configured Kimi model when K3 reads it; the loopback Kimi service is a local coordinator and does not imply local model inference.
 - Git execute mode canonicalizes the source/Git roots, rejects symbolic links or junctions inside `allowed_paths`, validates final changed paths, and preserves a violating worktree for inspection.
+- A session is refused when common credential, private-key, or `.env` paths are accessible unless `sensitive_paths_ack: true` is supplied after explicit user confirmation. Runtime tool paths are checked again. The decision and policy events are written as metadata-only JSONL under `$KIMI_CODE_HOME/codex-jobs/audit`.
+- Structured file writes are checked against `allowed_paths`. Shell commands are warned and audited when the active Kimi service was not launched through the configured OS sandbox wrapper.
 - Ignored outputs are reported as `unintegrated_ignored_files` and preserved. They are not force-added because ignored files may contain secrets or disposable build state.
 - The worktree is not an operating-system sandbox. Absolute-path writes, writes outside the repository, and create-use-delete link races cannot be prevented by this plugin alone; Codex must review the result and use an OS sandbox/container when prevention is required.
-- If `cwd` is not in Git, execute mode changes it directly under a persistent single-writer lock. Codex must pause all local writes until K3 completes or is cancelled. The lock prevents a second K3 writer but cannot technically lock Codex itself.
+- Non-Git `execute` is disabled by default. `allow_non_git_execute: true` is accepted only after explicit user confirmation; it changes the directory directly under a persistent advisory single-writer lock.
 
 ## Requirements
 
@@ -84,9 +86,15 @@ Normal collaboration has no model-driven status loop or token-consuming retries:
 - Kimi Code CLI with local-server and Web UI support, installed and authenticated. The latest stable `0.29.0` is preferred and `0.26.0` remains a tested legacy baseline; other versions are capability-checked but marked untested. See [compatibility](docs/compatibility.md).
 - A Codex or ChatGPT host with personal plugins, MCP, and MCP Apps UI support
 - Codex lifecycle-hook support for the automatic stop-time handoff safety net
-- Git on `PATH` for isolated parallel `execute` mode; non-Git directories fall back to the single-writer protocol
+- Git on `PATH` for the default isolated `execute` mode
 
 The bridge finds Kimi on `PATH` or under `$KIMI_CODE_HOME/bin` (default: `~/.kimi-code/bin`). Set `KIMI_CODE_BIN` only when the executable lives elsewhere.
+
+### OS sandbox/container wrapper
+
+Set `KIMI_K3_SERVER_WRAPPER` to an absolute executable path before the plugin starts Kimi Code. The wrapper receives the resolved Kimi executable as its first argument followed by the normal `web --no-open ...` or legacy `server run ...` arguments. It must preserve loopback server discovery under the configured `$KIMI_CODE_HOME`.
+
+Use a dedicated `KIMI_CODE_HOME` for the wrapped service, and stop any already-running Kimi Code service before enabling or changing the wrapper. If the wrapper is configured while an unmarked service is active, the bridge refuses to reuse it. The bridge records the launched service PID/port and reports it as sandboxed only while that exact service remains active. A container wrapper should mount only the intended project paths and Kimi state, bind the Kimi port to loopback, deny unnecessary network/filesystem access, then exec the passed Kimi command. The wrapper is required for enforcing shell write boundaries; plugin path checks alone provide detection and best-effort cancellation.
 
 ## Start a collaboration
 
@@ -98,6 +106,10 @@ start_k3_collaboration {
   cwd: "/path/to/project"
 }
 ```
+
+For an explicitly approved non-Git directory, add `allow_non_git_execute: true`. For a task that must read a default-sensitive path, add `sensitive_paths_ack: true`. Never set either flag without the user's confirmation.
+
+These flags are auditable friction controls, not an identity or authorization system. The host/user approval boundary remains responsible for ensuring that the confirmation came from the user rather than delegated prompt text.
 
 For authorized edits:
 

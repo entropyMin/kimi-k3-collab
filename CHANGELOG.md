@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Disable non-Git execute by default and require explicit confirmation for direct writes.
+- Replace browser bearer URLs with short-lived one-time tickets and a loopback authenticated gateway.
+- Add default-sensitive path checks, structured external-write blocking, unsandboxed shell warnings, and metadata-only security audit records.
+- Add the `KIMI_K3_SERVER_WRAPPER` contract for OS sandbox/container launchers.
+
 ## 0.5.0 - 2026-07-24
 
 ### Security
