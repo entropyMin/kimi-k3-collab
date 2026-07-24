@@ -12,6 +12,12 @@ The bridge preflights the effective workspace and refuses sessions that expose d
 
 The plugin cannot reliably parse or confine arbitrary shell commands. It may also lose a race against a process that creates, uses, and deletes a link before inspection. Use an operating-system sandbox or container when prevention is required. Configure `KIMI_K3_SERVER_WRAPPER` with a dedicated `KIMI_CODE_HOME` before Kimi starts; the executable receives the resolved Kimi command and its server arguments. The bridge refuses to reuse an active service that was not marked as launched by the configured wrapper.
 
+## Operational recommendations
+
+Run `execute` sessions in a dedicated development environment with no production access — a separate OS account, VM, or container. The launched Kimi service inherits its parent process environment, so keep production environment variables, cloud credentials, and unrelated file mounts out of that environment. Plugin path checks and worktree isolation limit what a session writes through the plugin; they do not hide credentials or files the environment already exposes.
+
+Install the plugin pinned to a Git tag or commit instead of tracking a moving branch. Validate each upgrade in a test repository first — `npm run check`, `npm test`, and `npm run test:real-kimi` when the change touches live Kimi interaction — then update the pinned ref in the production development environment only after those checks pass.
+
 ## Data flow
 
 1. The MCP server reads the authenticated Kimi lock/token from the local Kimi home.

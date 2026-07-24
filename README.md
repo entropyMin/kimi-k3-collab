@@ -78,6 +78,7 @@ Normal collaboration has no model-driven status loop or token-consuming retries:
 - Structured file writes are checked against `allowed_paths`. Shell commands are warned and audited when the active Kimi service was not launched through the configured OS sandbox wrapper.
 - Ignored outputs are reported as `unintegrated_ignored_files` and preserved. They are not force-added because ignored files may contain secrets or disposable build state.
 - The worktree is not an operating-system sandbox. Absolute-path writes, writes outside the repository, and create-use-delete link races cannot be prevented by this plugin alone; Codex must review the result and use an OS sandbox/container when prevention is required.
+- Run `execute` in a dedicated development environment with no production access — a separate OS account, VM, or container. The launched Kimi service inherits its parent process environment, so keep production environment variables, cloud credentials, and unrelated file mounts out of that environment. Plugin path checks and worktree isolation limit what a session writes; they do not hide credentials or files the environment already exposes.
 - Non-Git `execute` is disabled by default. `allow_non_git_execute: true` is accepted only after explicit user confirmation; it changes the directory directly under a persistent advisory single-writer lock.
 
 ## Requirements
@@ -196,9 +197,12 @@ CLI clients without MCP Apps UI still expose the control tools and readable fall
 ```sh
 git clone https://github.com/entropyMin/kimi-k3-collab.git kimi-k3-collab
 cd kimi-k3-collab
+git checkout <tag-or-commit>
 npm run check
 npm test
 ```
+
+Pin the installation to a specific Git tag or commit rather than a moving branch. To upgrade, check out the new ref in a separate test clone first and run `npm run check` and `npm test` there — plus `npm run test:real-kimi` when the update touches live Kimi interaction. Only after those pass, update the pinned ref in the registered directory of your regular development environment; starting a new Codex task then loads the updated plugin.
 
 `npm test` uses a fake Kimi REST/WebSocket server and requires no Kimi login. It exercises the real MCP server and bridge through analyze and isolated execute handoffs. CI runs the portable and fake-Kimi suites on Windows, macOS, and Ubuntu across the minimum Node.js 18.18 runtime and supported Node.js LTS releases. Run `npm run test:real-kimi` for the optional real session/prompt/WebSocket/result handoff against the installed, authenticated Kimi Code service; it consumes one model request.
 
