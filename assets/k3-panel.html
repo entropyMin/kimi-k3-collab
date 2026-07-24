@@ -321,7 +321,6 @@
 
       const state = {
         sessionId: "",
-        panelUrl: "",
         cursor: 0,
         relayGeneration: "",
         generation: 0,
@@ -347,16 +346,13 @@
           value?.call_tool_result?.result?._meta,
           value?.metadata?._meta
         ];
-        return candidates.find((item) => item && (
-          item["kimi-k3/sessionId"] || item["kimi-k3/panelUrl"]
-        )) || null;
+        return candidates.find((item) => item?.["kimi-k3/sessionId"]) || null;
       }
 
       function privateConnection(meta) {
-        const panelUrl = meta?.["kimi-k3/panelUrl"] || "";
         const sessionId = meta?.["kimi-k3/sessionId"] || "";
         if (!sessionId) return null;
-        return { sessionId, panelUrl };
+        return { sessionId };
       }
 
       function setConnection(label, kind = "") {
@@ -817,12 +813,8 @@
             const result = callResult(response);
             const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
             if (result?.isError) throw new Error(errorText || "Kimi Code could not be opened.");
-          } else if (window.openai?.openExternal && state.panelUrl) {
-            await window.openai.openExternal({ href: state.panelUrl, redirectUrl: false });
-          } else if (state.panelUrl) {
-            window.open(state.panelUrl, "_blank", "noopener,noreferrer");
           } else {
-            throw new Error("The authenticated Kimi Code URL is unavailable.");
+            throw new Error("This host cannot request a protected browser fallback.");
           }
         } catch (error) {
           addNotice(`Open Kimi Code failed: ${error instanceof Error ? error.message : String(error)}`, true);

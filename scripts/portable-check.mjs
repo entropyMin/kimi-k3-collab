@@ -40,23 +40,34 @@ const {
   pruneExecutionResources,
   renderK3Event,
   restoreExecutionWorkspace,
-  scopeViolations
+  scopeViolations,
+  wrappedServerCommand
 } = await import(pathToFileURL(bridge));
 if (originalKimiHome == null) delete process.env.KIMI_CODE_HOME;
 else process.env.KIMI_CODE_HOME = originalKimiHome;
 const legacyServerLaunch = kimiServerLaunchSpec("Commands:\n  run [options]   Start the Kimi server");
 const currentServerLaunch = kimiServerLaunchSpec("Commands:\n  kill   Stop a legacy Kimi server");
+const originalServerWrapper = process.env.KIMI_K3_SERVER_WRAPPER;
+const wrapperFixture = path.join(root, "sandbox-wrapper-fixture");
+process.env.KIMI_K3_SERVER_WRAPPER = wrapperFixture;
+const wrappedLaunch = wrappedServerCommand("kimi", ["web", "--no-open"]);
+if (originalServerWrapper == null) delete process.env.KIMI_K3_SERVER_WRAPPER;
+else process.env.KIMI_K3_SERVER_WRAPPER = originalServerWrapper;
 if (
   legacyServerLaunch.detached ||
   legacyServerLaunch.args.join(" ") !== "server run --keep-alive --log-level warn" ||
   !currentServerLaunch.detached ||
-  currentServerLaunch.args.join(" ") !== "web --no-open --log-level warn"
+  currentServerLaunch.args.join(" ") !== "web --no-open --log-level warn" ||
+  wrappedLaunch.command !== path.resolve(wrapperFixture) ||
+  wrappedLaunch.args.join(" ") !== "kimi web --no-open" ||
+  wrappedLaunch.shell
 ) {
   throw new Error("Kimi server startup capability negotiation is invalid.");
 }
 const {
   browserCommand,
   browserToolDefinition,
+  createBrowserGateway,
   awaitToolDefinition,
   integrationHandoff,
   panelResource,
@@ -66,12 +77,21 @@ const {
   toolDefinitions
 } = await import(pathToFileURL(mcpServer));
 const { connectLocalWebSocket } = await import(pathToFileURL(websocketModule));
+const {
+  appendSecurityAudit,
+  findSensitivePaths,
+  inspectToolSecurity,
+  isSensitivePath
+} = await import(pathToFileURL(policyModule));
 const footer = parseBridgeFooter("---\nKimi K3 session: session_mcp\nMode: analyze\nFocus: engineering\nStatus: completed\nModel: kimi-code/k3 (verified)\n");
 if (footer.sessionId !== "session_mcp" || footer.status !== "completed" || footer.model !== "kimi-code/k3" || !footer.verifiedK3) {
   throw new Error("The MCP server did not preserve the K3 verification footer.");
 }
 if (
   startToolDefinition.name !== "start_k3_collaboration" ||
+  startToolDefinition.annotations?.destructiveHint !== true ||
+  startToolDefinition.inputSchema?.properties?.allow_non_git_execute?.default !== false ||
+  startToolDefinition.inputSchema?.properties?.sensitive_paths_ack?.default !== false ||
   startToolDefinition._meta?.ui?.resourceUri !== panelResource.uri ||
   startToolDefinition._meta?.["openai/outputTemplate"] !== panelResource.uri ||
   panelResource.mimeType !== "text/html;profile=mcp-app" ||
@@ -96,6 +116,90 @@ if (
 ) {
   throw new Error("The private cross-platform Kimi browser launcher contract is invalid.");
 }
+const gatewayToken = "gateway-persistent-secret";
+let gatewayAuthenticated = false;
+let gatewayWebsocketAuthenticated = false;
+const gatewayUpgradeSockets = new Set();
+const gatewayUpstream = http.createServer((request, response) => {
+  gatewayAuthenticated ||= request.headers.authorization === `Bearer ${gatewayToken}`;
+  response.writeHead(200, { "Content-Type": "text/plain" });
+  response.end("proxied");
+});
+gatewayUpstream.on("upgrade", (request, socket) => {
+  gatewayUpgradeSockets.add(socket);
+  socket.once("close", () => gatewayUpgradeSockets.delete(socket));
+  gatewayWebsocketAuthenticated ||= request.headers.authorization === `Bearer ${gatewayToken}`;
+  const accept = createHash("sha1")
+    .update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+    .digest("base64");
+  socket.write([
+    "HTTP/1.1 101 Switching Protocols",
+    "Upgrade: websocket",
+    "Connection: Upgrade",
+    `Sec-WebSocket-Accept: ${accept}`,
+    "",
+    ""
+  ].join("\r\n"));
+  socket.write(websocketFrame({ type: "server_hello", payload: { protocol_version: 1 } }));
+});
+await new Promise((resolve) => gatewayUpstream.listen(0, "127.0.0.1", resolve));
+const gatewayPort = gatewayUpstream.address().port;
+const gateway = createBrowserGateway(() => ({
+  origin: `http://127.0.0.1:${gatewayPort}`,
+  host: "127.0.0.1",
+  port: gatewayPort,
+  token: gatewayToken
+}));
+let expiredGateway;
+try {
+  const ticketUrl = await gateway.issue("session_browser_gateway");
+  const exchanged = await fetch(ticketUrl, { redirect: "manual" });
+  const cookie = exchanged.headers.get("set-cookie")?.split(";", 1)[0];
+  const reused = await fetch(ticketUrl, { redirect: "manual" });
+  const malformed = await fetch(new URL("/__kimi_k3_ticket/not-a-ticket", ticketUrl), { redirect: "manual" });
+  const proxied = await fetch(new URL(exchanged.headers.get("location"), ticketUrl), {
+    headers: { Cookie: cookie }
+  });
+  const gatewayAddress = new URL(ticketUrl);
+  const gatewayWebsocket = await connectLocalWebSocket({
+    host: gatewayAddress.hostname,
+    port: Number(gatewayAddress.port),
+    pathname: "/api/v1/ws",
+    headers: { Cookie: cookie }
+  });
+  const gatewayHello = JSON.parse(await gatewayWebsocket.nextMessage(1000));
+  gatewayWebsocket.close();
+  expiredGateway = createBrowserGateway(() => ({
+    origin: `http://127.0.0.1:${gatewayPort}`,
+    host: "127.0.0.1",
+    port: gatewayPort,
+    token: gatewayToken
+  }), { ticketTtlMs: 0 });
+  const expiredTicket = await expiredGateway.issue("session_expired_gateway");
+  const expired = await fetch(expiredTicket, { redirect: "manual" });
+  if (
+    ticketUrl.includes(gatewayToken) ||
+    exchanged.status !== 302 ||
+    !exchanged.headers.get("location")?.startsWith("/sessions/session_browser_gateway#token=") ||
+    exchanged.headers.get("location")?.includes(gatewayToken) ||
+    !cookie?.startsWith("kimi_k3_browser=") ||
+    reused.status !== 410 ||
+    malformed.status !== 410 ||
+    expired.status !== 410 ||
+    proxied.status !== 200 ||
+    await proxied.text() !== "proxied" ||
+    !gatewayAuthenticated ||
+    !gatewayWebsocketAuthenticated ||
+    gatewayHello.type !== "server_hello"
+  ) {
+    throw new Error("The one-time browser ticket or authenticated fallback proxy failed.");
+  }
+} finally {
+  gateway.close();
+  expiredGateway?.close();
+  for (const socket of gatewayUpgradeSockets) socket.destroy();
+  await new Promise((resolve) => gatewayUpstream.close(resolve));
+}
 const sendDefinition = toolDefinitions.find((tool) => tool.name === "send_k3_message");
 if (
   sendDefinition?._meta?.ui?.visibility?.join(",") !== "model,app" ||
@@ -109,6 +213,75 @@ if (
   receiveToolDefinition._meta?.["openai/widgetAccessible"] !== true
 ) {
   throw new Error("The pushed K3 event receiver is not private and app-only.");
+}
+
+const policyCwd = path.join(bridgeUnitHome, "policy-workspace");
+const policyAllowed = path.join(policyCwd, "src");
+fs.mkdirSync(policyAllowed, { recursive: true });
+fs.writeFileSync(path.join(policyCwd, ".env.local"), "fixture-secret");
+fs.writeFileSync(path.join(policyCwd, ".env.example"), "safe-example");
+const sensitiveBlocked = inspectToolSecurity(
+  { name: "Read", args: { path: ".env.production" } },
+  { mode: "analyze", cwd: policyCwd }
+);
+const externalBlocked = inspectToolSecurity(
+  { name: "Write", args: { path: path.resolve(policyCwd, "..", "outside.txt") } },
+  { mode: "execute", cwd: policyCwd, allowedPaths: [policyAllowed] }
+);
+const shellWarned = inspectToolSecurity(
+  { name: "Bash", args: { command: "build" } },
+  { mode: "execute", cwd: policyCwd, allowedPaths: [policyAllowed] }
+);
+if (
+  !isSensitivePath("config/.env.local") ||
+  !isSensitivePath(".ENV") ||
+  !isSensitivePath(".env:stream") ||
+  !isSensitivePath(".git/config") ||
+  isSensitivePath(".env.example") ||
+  findSensitivePaths(policyCwd).join(",") !== ".env.local" ||
+  sensitiveBlocked?.event !== "sensitive_path_blocked" ||
+  externalBlocked?.event !== "external_write_blocked" ||
+  shellWarned?.event !== "unsandboxed_shell_warning" ||
+  inspectToolSecurity(
+    { name: "Read", args: { path: ".env.production" } },
+    { mode: "analyze", cwd: policyCwd, sensitivePathsAcknowledged: true }
+  ) !== null ||
+  inspectToolSecurity(
+    { name: "Bash", args: { command: "build" } },
+    { mode: "execute", cwd: policyCwd, allowedPaths: [policyAllowed], sandboxed: true }
+  ) !== null
+) {
+  throw new Error("The sensitive-path, external-write, or unsandboxed-shell policy failed.");
+}
+if (process.platform === "win32") {
+  for (const candidate of ["\\\\server\\share\\outside.txt", "D:outside.txt"]) {
+    const finding = inspectToolSecurity(
+      { name: "Write", args: { path: candidate } },
+      { mode: "execute", cwd: policyCwd, allowedPaths: [policyAllowed] }
+    );
+    if (finding?.event !== "external_write_blocked") {
+      throw new Error(`Windows external write target was not blocked: ${candidate}`);
+    }
+  }
+}
+appendSecurityAudit(bridgeUnitHome, "session_policy_fixture", {
+  event_id: "policy-1",
+  event: "sensitive_path_blocked",
+  decision: "block",
+  path: ".env"
+});
+appendSecurityAudit(bridgeUnitHome, "session_policy_fixture", {
+  event_id: "policy-1",
+  event: "sensitive_path_blocked",
+  decision: "block",
+  path: ".env"
+});
+const auditLines = fs.readFileSync(
+  path.join(bridgeUnitHome, "audit", "session_policy_fixture.jsonl"),
+  "utf8"
+).trim().split(/\r?\n/);
+if (auditLines.length !== 1 || JSON.parse(auditLines[0]).event !== "sensitive_path_blocked") {
+  throw new Error("Security audit records were not durable and idempotent.");
 }
 
 for (const preservedState of ["scope_violation", "integration_error", "unintegrated_ignored_files"]) {
@@ -475,6 +648,25 @@ try {
   checkedGit(isolationFixture, ["worktree", "remove", "--force", ignoredOutsideScope.workspace.worktree_root]);
   checkedGit(isolationFixture, ["branch", "-D", ignoredOutsideScope.workspace.branch]);
 
+  const sensitiveOutput = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  fs.writeFileSync(path.join(sensitiveOutput.cwd, "src", ".env"), "generated-secret\n");
+  const sensitiveHandoff = finalizeExecutionWorkspace({
+    session_id: "session_sensitive_output_fixture",
+    prompt_id: "prompt_sensitive_output_fixture",
+    mode: "execute",
+    sensitive_paths_acknowledged: false,
+    workspace: sensitiveOutput.workspace
+  });
+  if (
+    sensitiveHandoff.state !== "scope_violation" ||
+    sensitiveHandoff.sensitive_paths.join(",") !== "src/.env" ||
+    !fs.existsSync(sensitiveOutput.workspace.worktree_root)
+  ) {
+    throw new Error("A generated sensitive file was not blocked and preserved for review.");
+  }
+  checkedGit(isolationFixture, ["worktree", "remove", "--force", sensitiveOutput.workspace.worktree_root]);
+  checkedGit(isolationFixture, ["branch", "-D", sensitiveOutput.workspace.branch]);
+
   const externalTarget = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-external-"));
   const symlinkEscape = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
   const escapingLink = path.join(symlinkEscape.cwd, "src", "linked");
@@ -655,10 +847,17 @@ try {
       };
     };
 
-    const first = await prepareExecutionWorkspace(nonGit, [nonGit]);
-    let secondRejected = false;
+    let nonGitDefaultRejected = false;
     try {
       await prepareExecutionWorkspace(nonGit, [nonGit]);
+    } catch (error) {
+      nonGitDefaultRejected = String(error).includes("disabled by default");
+    }
+    if (!nonGitDefaultRejected) throw new Error("Non-Git execute mode was not disabled by default.");
+    const first = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
+    let secondRejected = false;
+    try {
+      await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     } catch (error) {
       secondRejected = String(error).includes("already owns the non-Git directory");
     }
@@ -671,7 +870,7 @@ try {
       mode: "execute",
       workspace: first.workspace
     });
-    const reacquired = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const reacquired = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     finalizeExecutionWorkspace({
       session_id: "session_single_writer_reacquired",
       prompt_id: "prompt_single_writer_reacquired",
@@ -679,11 +878,11 @@ try {
       workspace: reacquired.workspace
     });
 
-    const live = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const live = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     bindFixtureOwner(live, "session_live_fixture", { complete: true });
     let liveRejected = false;
     try {
-      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus, true);
     } catch (error) {
       liveRejected = String(error).includes("already owns the non-Git directory");
     }
@@ -695,11 +894,11 @@ try {
       workspace: live.workspace
     });
 
-    const youngCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const youngCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     bindFixtureOwner(youngCompleteTerminal, "session_terminal_complete_young_fixture", { complete: true });
     let youngCompleteTerminalRejected = false;
     try {
-      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus, true);
     } catch (error) {
       youngCompleteTerminalRejected = String(error).includes("already owns the non-Git directory");
     }
@@ -713,12 +912,12 @@ try {
       workspace: youngCompleteTerminal.workspace
     });
 
-    const expiredCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const expiredCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     bindFixtureOwner(expiredCompleteTerminal, "session_terminal_complete_expired_fixture", {
       complete: true,
       createdAt: new Date(Date.now() - 121000).toISOString()
     });
-    const recoveredCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    const recoveredCompleteTerminal = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus, true);
     finalizeExecutionWorkspace({
       session_id: "session_terminal_complete_expired_recovered",
       prompt_id: "prompt_session_terminal_complete_expired_recovered",
@@ -726,11 +925,11 @@ try {
       workspace: recoveredCompleteTerminal.workspace
     });
 
-    const youngIdle = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const youngIdle = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     bindFixtureOwner(youngIdle, "session_idle_young_fixture", { persistRecord: false });
     let youngIdleRejected = false;
     try {
-      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus, true);
     } catch (error) {
       youngIdleRejected = String(error).includes("already owns the non-Git directory");
     }
@@ -742,12 +941,12 @@ try {
       workspace: youngIdle.workspace
     });
 
-    const expiredIdle = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const expiredIdle = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     bindFixtureOwner(expiredIdle, "session_idle_expired_fixture", {
       createdAt: new Date(Date.now() - 121000).toISOString(),
       persistRecord: false
     });
-    const recoveredIdle = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    const recoveredIdle = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus, true);
     finalizeExecutionWorkspace({
       session_id: "session_idle_expired_recovered",
       prompt_id: "prompt_session_idle_expired_recovered",
@@ -755,9 +954,9 @@ try {
       workspace: recoveredIdle.workspace
     });
 
-    const terminal = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const terminal = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     bindFixtureOwner(terminal, "session_terminal_fixture");
-    const recoveredTerminal = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    const recoveredTerminal = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus, true);
     const terminalRecord = JSON.parse(fs.readFileSync(
       path.join(bridgeUnitHome, "codex-jobs", "session_terminal_fixture.json"),
       "utf8"
@@ -772,9 +971,9 @@ try {
       workspace: recoveredTerminal.workspace
     });
 
-    const missing = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const missing = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     bindFixtureOwner(missing, "session_missing_fixture");
-    const recoveredMissing = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+    const recoveredMissing = await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus, true);
     const missingRecord = JSON.parse(fs.readFileSync(
       path.join(bridgeUnitHome, "codex-jobs", "session_missing_fixture.json"),
       "utf8"
@@ -789,11 +988,11 @@ try {
       workspace: recoveredMissing.workspace
     });
 
-    const uncertain = await prepareExecutionWorkspace(nonGit, [nonGit]);
+    const uncertain = await prepareExecutionWorkspace(nonGit, [nonGit], undefined, true);
     bindFixtureOwner(uncertain, "session_uncertain_fixture");
     let uncertainRejected = false;
     try {
-      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus);
+      await prepareExecutionWorkspace(nonGit, [nonGit], fixtureOwnerStatus, true);
     } catch (error) {
       uncertainRejected = String(error).includes("could not be verified");
     }
@@ -806,8 +1005,8 @@ try {
     });
 
     const race = await Promise.allSettled([
-      prepareExecutionWorkspace(nonGit, [nonGit]),
-      prepareExecutionWorkspace(nonGit, [nonGit])
+      prepareExecutionWorkspace(nonGit, [nonGit], undefined, true),
+      prepareExecutionWorkspace(nonGit, [nonGit], undefined, true)
     ]);
     const raceWinner = race.find((result) => result.status === "fulfilled");
     const raceLoser = race.find((result) => result.status === "rejected");
@@ -928,6 +1127,7 @@ const footer = (status) => \`---\\nKimi K3 session: \${session}\\nMode: analyze\
 if (action === "start") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
   fs.appendFileSync(process.env.KIMI_CODE_HOME + "/start-calls", "1\\n");
+  fs.appendFileSync(process.env.KIMI_CODE_HOME + "/start-args", JSON.stringify(args) + "\\n");
   process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "send") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
@@ -1030,6 +1230,20 @@ try {
     name: "start_k3_collaboration",
     arguments: { prompt: "Stub review", mode: "analyze", focus: "engineering", cwd: root }
   });
+  await request(nextRequestId++, "tools/call", {
+    name: "start_k3_collaboration",
+    arguments: {
+      prompt: "Stub authorized execute",
+      mode: "execute",
+      focus: "engineering",
+      cwd: root,
+      allowed_paths: ["src"],
+      allow_non_git_execute: true,
+      sensitive_paths_ack: true
+    }
+  });
+  const propagatedStartArgs = fs.readFileSync(path.join(mcpFixtureHome, "start-args"), "utf8")
+    .trim().split(/\r?\n/).map(JSON.parse);
   const opened = await request(nextRequestId++, "tools/call", {
     name: "open_k3_panel",
     arguments: { session_id: "session_portable_mcp" }
@@ -1107,8 +1321,8 @@ try {
     panel.result?.contents?.[0]?._meta?.ui?.csp?.frameDomains !== undefined ||
     panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.connect_domains?.length !== 0 ||
     panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.frame_domains !== undefined ||
-    !panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.redirect_domains?.includes("http://127.0.0.1:58627") ||
-    !panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.redirect_domains?.includes(`http://127.0.0.1:${relayPort}`)
+    panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.redirect_domains !== undefined ||
+    panel.result?.contents?.[0]?.text?.includes("kimi-k3/panelUrl")
   ) {
     throw new Error("The MCP server did not advertise the K3 tools and app resource.");
   }
@@ -1117,8 +1331,6 @@ try {
   if (!panelScript) throw new Error("The K3 event panel script is missing.");
   Function(panelScript);
 
-  const privatePanelUrl = started.result?._meta?.["kimi-k3/panelUrl"];
-  const openedPanelUrl = opened.result?._meta?.["kimi-k3/panelUrl"];
   const privateToken = started.result?._meta?.["kimi-k3/token"];
   const privateOrigin = started.result?._meta?.["kimi-k3/origin"];
   const modelVisible = JSON.stringify({
@@ -1129,10 +1341,16 @@ try {
     started.result?.structuredContent?.status !== "running" ||
     started.result?.structuredContent?.server_reported_model !== "kimi-code/k3" ||
     !started.result?.structuredContent?.verified_k3 ||
-    !privatePanelUrl?.endsWith(`#token=${fixtureToken}`) ||
+    !propagatedStartArgs.some((args) =>
+      args.includes("--allow-non-git-execute") &&
+      args.includes("--ack-sensitive-paths") &&
+      args.includes("--allowed-path")
+    ) ||
+    started.result?._meta?.["kimi-k3/sessionId"] !== "session_portable_mcp" ||
+    started.result?._meta?.["kimi-k3/panelUrl"] !== undefined ||
     privateToken !== undefined ||
     privateOrigin !== undefined ||
-    openedPanelUrl !== privatePanelUrl ||
+    opened.result?._meta?.["kimi-k3/sessionId"] !== "session_portable_mcp" ||
     browserOpened.result?.structuredContent?.opened !== true ||
     awaited.result?.structuredContent?.complete !== true ||
     !awaited.result?.structuredContent?.result_markdown?.includes("# Stub K3 report") ||
@@ -1676,6 +1894,7 @@ if (/powershell|\.ps1|%USERPROFILE%|[A-Z]:\\/i.test(publishedText)) {
   throw new Error("A Windows-specific invocation remains in a published contract.");
 }
 const skillContract = fs.readFileSync(path.join(root, "skills", "kimi-k3-collab", "SKILL.md"), "utf8");
+const securityContract = fs.readFileSync(path.join(root, "SECURITY.md"), "utf8");
 if (
   /kimi-k3\.mjs|--wait-seconds|17 event-stream windows/i.test(skillContract) ||
   !skillContract.includes("Do not spawn a Codex subagent") ||
@@ -1685,6 +1904,14 @@ if (
   !skillContract.includes("isolation=single-writer")
 ) {
   throw new Error("The direct MCP skill lacks parallel work or the K3-to-Codex handoff contract.");
+}
+if (
+  !securityContract.includes("KIMI_K3_SERVER_WRAPPER") ||
+  !securityContract.includes("dedicated `KIMI_CODE_HOME`") ||
+  !securityContract.includes("single-use loopback ticket") ||
+  securityContract.includes("component-private URL metadata")
+) {
+  throw new Error("The published security contract does not describe the sandbox or browser-token boundary.");
 }
 
 const hooksManifest = JSON.parse(fs.readFileSync(path.join(root, "hooks", "hooks.json"), "utf8"));
@@ -1735,9 +1962,10 @@ if (
   mcpServerText.includes("start_k3_job") ||
   mcpServerText.includes("setInterval(") ||
   !mcpServerText.includes('const PANEL_MIME = "text/html;profile=mcp-app"') ||
-  !mcpServerText.includes('"kimi-k3/panelUrl"') ||
+  mcpServerText.includes('"kimi-k3/panelUrl"') ||
   mcpServerText.includes('"kimi-k3/token"') ||
   mcpServerText.includes('"kimi-k3/origin"') ||
+  !mcpServerText.includes("createBrowserGateway") ||
   !mcpServerText.includes('name: "receive_k3_events"') ||
   !mcpServerText.includes('name: "await_k3_result"') ||
   !mcpServerText.includes('name: "open_k3_in_browser"') ||
