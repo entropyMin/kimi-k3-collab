@@ -10,7 +10,7 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
-import { isReadOnlyTool } from "./lib/k3-policy.mjs";
+import { isReadOnlyTool, terminalProviderFailure } from "./lib/k3-policy.mjs";
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = path.dirname(path.dirname(THIS_FILE));
@@ -38,10 +38,13 @@ const MAX_EVENT_BATCH = 100;
 const MAX_RELAY_BUFFER_BYTES = 16 * 1024 * 1024;
 const MAX_EVENT_BATCH_BYTES = 512 * 1024;
 const MAX_RELAY_FAILURES = 30;
-const RELAY_IDLE_MS = 3 * 60 * 1000;
+const DEFAULT_RELAY_IDLE_MS = 3 * 60 * 1000;
+const MIN_RELAY_IDLE_MS = 1000;
+const RELAY_IDLE_MS = Math.max(Number(process.env.KIMI_K3_RELAY_IDLE_MS) || DEFAULT_RELAY_IDLE_MS, MIN_RELAY_IDLE_MS);
 const DEFAULT_RECEIVE_WAIT_MS = 45000;
 const DEFAULT_MODEL_WAIT_SECONDS = 100;
 const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed", "error", "stopped"]);
+const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files"]);
 let transportClosed = false;
 
 function closeTransport() {
@@ -208,7 +211,7 @@ function structuredJob(job) {
   };
 }
 
-function integrationHandoff(record) {
+export function integrationHandoff(record) {
   const integration = record?.integration;
   if (!integration) return { text: "", structured: {} };
   if (integration.isolation === "single-writer") {
@@ -233,6 +236,8 @@ function integrationHandoff(record) {
     integration.symlink_paths?.length && `Symbolic links or junctions: ${integration.symlink_paths.join(", ")}`,
     integration.overlapping_source_paths?.length && `Overlapping source changes: ${integration.overlapping_source_paths.join(", ")}`,
     integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`,
+    PRESERVED_WORKTREE_STATES.has(integration.state) && integration.worktree_root &&
+      `Preserved worktree: ${integration.worktree_root} (K3 changes were not integrated; review or cherry-pick them there, then remove the worktree).`,
     integration.commit && "Review the commit before cherry-picking it; the plugin never merges automatically."
   ].filter(Boolean);
   return {
@@ -243,6 +248,7 @@ function integrationHandoff(record) {
       source_repo: integration.source_repo || null,
       branch: integration.branch || null,
       commit: integration.commit || null,
+      worktree_root: integration.worktree_root || null,
       commits: integration.commits || [],
       changed_paths: integration.changed_paths || [],
       ignored_paths: integration.ignored_paths || [],
@@ -345,6 +351,7 @@ class SessionRelay {
     this.loop = null;
     this.stopped = false;
     this.outage = false;
+    this.providerFailureNotified = false;
     this.lastReceiveAt = Date.now();
   }
 
@@ -429,6 +436,15 @@ class SessionRelay {
     };
   }
 
+  noteResynced() {
+    this.enqueue({
+      type: "relay.status",
+      session_id: this.sessionId,
+      volatile: true,
+      payload: { status: "resynced", message: "K3 event relay resynchronized its event cursor; live events continue." }
+    });
+  }
+
   isDuplicateDurable(frame) {
     if (!Number.isInteger(frame?.seq) || frame.volatile === true) return false;
     const key = `${frame.epoch || this.serverCursor.epoch || ""}:${frame.seq}:${frame.type || ""}`;
@@ -468,8 +484,14 @@ class SessionRelay {
           }
         });
         while (!this.stopped && !transportClosed) {
-          const message = await websocket.nextMessage(30000);
-          if (message == null) continue;
+          const message = await websocket.nextMessage(Math.min(30000, RELAY_IDLE_MS));
+          if (message == null) {
+            if (Date.now() - this.lastReceiveAt >= RELAY_IDLE_MS) {
+              this.stop();
+              break;
+            }
+            continue;
+          }
           let frame;
           try {
             frame = JSON.parse(message);
@@ -505,6 +527,7 @@ class SessionRelay {
             if (frame.payload?.resync_required?.includes(this.sessionId)) {
               const cursor = frame.payload?.cursors?.[this.sessionId];
               if (Number.isInteger(cursor?.seq)) this.serverCursor = cursor;
+              this.noteResynced();
             }
           }
           if (frame.type === "resync_required" && frame.payload?.session_id === this.sessionId) {
@@ -512,6 +535,7 @@ class SessionRelay {
               seq: Number(frame.payload.current_seq || 0),
               ...(frame.payload.epoch ? { epoch: frame.payload.epoch } : {})
             };
+            this.noteResynced();
           }
           if (frame.session_id && frame.session_id !== this.sessionId) continue;
           if (this.isDuplicateDurable(frame)) continue;
@@ -576,7 +600,23 @@ class SessionRelay {
               });
             }
           }
-          if (frame.type === "error" && frame.payload?.fatal) {
+          const sessionProviderFailure = frame.session_id === this.sessionId && terminalProviderFailure(frame);
+          if (sessionProviderFailure && !this.providerFailureNotified) {
+            this.providerFailureNotified = true;
+            const code = String(frame.payload?.code || frame.payload?.type || "").trim();
+            const detail = String(frame.payload?.message || frame.payload?.msg || "").trim() || "Kimi provider failure.";
+            this.enqueue({
+              type: "relay.status",
+              session_id: this.sessionId,
+              volatile: true,
+              payload: {
+                status: "failed",
+                message: [code && `[${code}]`, detail].filter(Boolean).join(" "),
+                terminal: true
+              }
+            });
+          }
+          if (frame.type === "error" && frame.payload?.fatal && !sessionProviderFailure) {
             throw new Error(`Kimi WebSocket error: ${frame.payload.msg || frame.payload.code}`);
           }
         }

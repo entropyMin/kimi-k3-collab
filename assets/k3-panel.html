@@ -592,7 +592,10 @@
           return;
         }
         if (frame.type === "relay.status") {
-          if (frame.payload?.status === "connected") {
+          if (frame.payload?.status === "resynced") {
+            setConnection("Live", "live");
+            addNotice(frame.payload?.message || "K3 event relay resynchronized its event cursor.");
+          } else if (frame.payload?.status === "connected") {
             setConnection("Live", "live");
             addNotice("K3 event relay reconnected.");
           } else if (frame.payload?.terminal) {

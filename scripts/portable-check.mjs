@@ -57,6 +57,7 @@ const {
   browserCommand,
   browserToolDefinition,
   awaitToolDefinition,
+  integrationHandoff,
   panelResource,
   parseBridgeFooter,
   receiveToolDefinition,
@@ -107,6 +108,39 @@ if (
   receiveToolDefinition._meta?.["openai/widgetAccessible"] !== true
 ) {
   throw new Error("The pushed K3 event receiver is not private and app-only.");
+}
+
+for (const preservedState of ["scope_violation", "integration_error", "unintegrated_ignored_files"]) {
+  const preservedHandoff = integrationHandoff({
+    integration: {
+      isolation: "git-worktree",
+      state: preservedState,
+      branch: "k3/fixture",
+      worktree_root: "D:/fixture/k3-worktree"
+    }
+  });
+  if (
+    preservedHandoff.structured.worktree_root !== "D:/fixture/k3-worktree" ||
+    !preservedHandoff.text.includes("Preserved worktree: D:/fixture/k3-worktree") ||
+    !preservedHandoff.text.includes("cherry-pick")
+  ) {
+    throw new Error("The preserved-worktree handoff guidance is missing or incomplete.");
+  }
+}
+const integratedHandoff = integrationHandoff({
+  integration: {
+    isolation: "git-worktree",
+    state: "ready",
+    branch: "k3/fixture",
+    commit: "abc123",
+    worktree_root: "D:/fixture/k3-worktree"
+  }
+});
+if (
+  integratedHandoff.structured.worktree_root !== "D:/fixture/k3-worktree" ||
+  integratedHandoff.text.includes("Preserved worktree")
+) {
+  throw new Error("An integrated handoff must expose worktree_root without preserved-worktree guidance.");
 }
 
 if (
@@ -605,6 +639,7 @@ relayServer.on("upgrade", (request, socket) => {
   relayConnectionCount += 1;
   relayAuthenticated ||= request.headers.authorization === `Bearer ${fixtureToken}`;
   relaySockets.add(socket);
+  socket.on("error", () => {});
   socket.once("close", () => relaySockets.delete(socket));
   const accept = createHash("sha1")
     .update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
@@ -632,9 +667,11 @@ relayServer.on("upgrade", (request, socket) => {
         sharedToolStart,
         { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "x".repeat(300000) } } },
         { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "y".repeat(300000) } } },
+        { type: "resync_required", payload: { session_id: "session_portable_mcp", current_seq: 5, epoch: "epoch_portable_resync" } },
         { type: "tool.result", session_id: "session_portable_mcp", seq: 6, payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
-        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 7, payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
-        { type: "turn.ended", session_id: "session_portable_mcp", seq: 8, payload: { turnId: "turn_fixture", reason: "completed" } }
+        { type: "error", session_id: "session_portable_mcp", seq: 7, payload: { code: "provider.rate_limit", message: "429 overloaded", fatal: true } },
+        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 8, payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
+        { type: "turn.ended", session_id: "session_portable_mcp", seq: 9, payload: { turnId: "turn_fixture", reason: "completed" } }
       ];
   socket.write(Buffer.concat([headers, ...frames.map(websocketFrame)]));
   if (relayConnectionCount === 1) setTimeout(() => socket.destroy(), 20);
@@ -679,6 +716,8 @@ if (action === "start") {
       ? { session_id: requestedSession, state: "running", complete: false, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
       : requestedSession === "session_failed"
         ? { session_id: requestedSession, state: "failed", complete: true, error: "[provider.rate_limit] 429 overloaded", error_code: "provider.rate_limit", result: "# Stale report", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
+      : requestedSession === "session_scope_violation_fixture"
+        ? { session_id: requestedSession, state: "failed", complete: true, error: "K3 wrote outside its allowed paths; the isolated worktree was preserved for review.", error_code: "scope_violation", mode: "execute", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true, integration: { isolation: "git-worktree", state: "scope_violation", branch: "k3/session_scope_violation_fixture", commit: null, worktree_root: "D:/fixture/k3-worktree", changed_paths: ["README.md"], scope_violations: ["README.md"] } }
       : { session_id: requestedSession, state: "max_tokens", complete: true, result: "# Stub K3 report\\n\\nOriginal Markdown.", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true })
     : \`# Stub K3 report\\n\\nOriginal Markdown.\\n\\n\${footer("completed")}\`);
 } else if (action === "reject-approval") {
@@ -704,11 +743,11 @@ const mcpChild = spawn(process.execPath, [mcpServer], {
 });
 let mcpExited = false;
 try {
-  const request = (() => {
+  const createRequest = (child) => {
     const pending = new Map();
     let buffer = "";
-    mcpChild.stdout.setEncoding("utf8");
-    mcpChild.stdout.on("data", (chunk) => {
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
       buffer += chunk;
       let newline = buffer.indexOf("\n");
       while (newline !== -1) {
@@ -730,9 +769,18 @@ try {
         clearTimeout(timer);
         resolve(message);
       });
-      mcpChild.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
-  })();
+  };
+  const waitFor = async (predicate, description, timeoutMs = 10000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`Timed out waiting for ${description}.`);
+  };
+  const request = createRequest(mcpChild);
 
   const initialized = await request(1, "initialize", { protocolVersion: "2025-11-25" });
   const listed = await request(2, "tools/list", {});
@@ -777,6 +825,10 @@ try {
   const failedAwaited = await request(nextRequestId++, "tools/call", {
     name: "await_k3_result",
     arguments: { session_id: "session_failed", wait_seconds: 1 }
+  });
+  const scopeHandoff = await request(nextRequestId++, "tools/call", {
+    name: "await_k3_result",
+    arguments: { session_id: "session_scope_violation_fixture", wait_seconds: 1 }
   });
   const messaged = await request(nextRequestId++, "tools/call", {
     name: "send_k3_message",
@@ -824,6 +876,7 @@ try {
     !panel.result?.contents?.[0]?.text?.includes("open_k3_in_browser") ||
     !panel.result?.contents?.[0]?.text?.includes("send_k3_message") ||
     !panel.result?.contents?.[0]?.text?.includes("relay.policy") ||
+    !panel.result?.contents?.[0]?.text?.includes("resynced") ||
     !panel.result?.contents?.[0]?.text?.includes("stream gap: resumed at source offset") ||
     panel.result?.contents?.[0]?.text?.includes("<iframe") ||
     panel.result?.contents?.[0]?._meta?.ui?.csp?.connectDomains !== undefined ||
@@ -880,12 +933,17 @@ try {
     !cancelled.result?.structuredContent?.aborted ||
     !relayAuthenticated ||
     !relayGeneration ||
-    relayConnectionCount < 2 ||
+    relayConnectionCount !== 2 ||
     relayedFrames.filter((frame) => frame.type === "assistant.delta" && frame.seq === 2).length !== 2 ||
     relayedFrames.filter((frame) => frame.type === "tool.call.started" && frame.seq === 3).length !== 1 ||
     !relayedFrames.some((frame) => frame.type === "tool.result") ||
     !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.status === "rejected") ||
     !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.message?.includes("Stopped disallowed tool")) ||
+    relayedFrames.filter((frame) => frame.type === "relay.status" && frame.payload?.status === "failed" && frame.payload?.terminal === true).length !== 1 ||
+    !relayedFrames.some((frame) => frame.type === "relay.status" && frame.payload?.status === "resynced") ||
+    relayedFrames.findIndex((frame) => frame.type === "error" && frame.payload?.code === "provider.rate_limit") < 0 ||
+    relayedFrames.findIndex((frame) => frame.type === "error" && frame.payload?.code === "provider.rate_limit") >
+      relayedFrames.findIndex((frame) => frame.type === "turn.ended") ||
     !fs.existsSync(path.join(mcpFixtureHome, "approval-rejected")) ||
     maxRelayedBatchBytes > 520000 ||
     relayCursor < relayedFrames.length ||
@@ -894,6 +952,14 @@ try {
     )
   ) {
     throw new Error("The direct K3 panel, messaging, fallback, or token-isolation contract failed.");
+  }
+  if (
+    scopeHandoff.result?.structuredContent?.integration_state !== "scope_violation" ||
+    scopeHandoff.result?.structuredContent?.worktree_root !== "D:/fixture/k3-worktree" ||
+    !scopeHandoff.result?.content?.[0]?.text?.includes("Preserved worktree: D:/fixture/k3-worktree") ||
+    !scopeHandoff.result?.content?.[0]?.text?.includes("cherry-pick")
+  ) {
+    throw new Error("The scope-violation handoff did not expose the preserved worktree.");
   }
   if (!invalid.result?.isError || invalid.error) {
     throw new Error("MCP tool execution errors are not returned with the MCP isError result shape.");
@@ -1140,6 +1206,60 @@ try {
   ]);
   mcpExited = true;
   if (exitCode !== 0) throw new Error(`The MCP server exited with code ${exitCode} after stdin closed.`);
+
+  const idleBaselineConnections = relayConnectionCount;
+  fs.writeFileSync(
+    instanceFile,
+    JSON.stringify({
+      host: "127.0.0.1",
+      port: relayPort,
+      pid: process.pid,
+      host_version: "0.29.0",
+      heartbeat_at: Date.now()
+    }),
+    "utf8"
+  );
+  const idleChild = spawn(process.execPath, [mcpServer], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    env: {
+      ...process.env,
+      KIMI_K3_BRIDGE: stubBridge,
+      KIMI_CODE_HOME: mcpFixtureHome,
+      KIMI_K3_BROWSER_TEST: "1",
+      KIMI_K3_RELAY_IDLE_MS: "1000"
+    }
+  });
+  let idleExited = false;
+  try {
+    const idleRequest = createRequest(idleChild);
+    const firstIdle = await idleRequest(1, "tools/call", {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_idle_fixture", after_cursor: 0, wait_ms: 0 }
+    });
+    const firstGeneration = firstIdle.result?.structuredContent?.relay_generation;
+    await waitFor(() => relayConnectionCount === idleBaselineConnections + 1, "the idle-fixture relay connection");
+    // Polling receive_k3_events would refresh lastReceiveAt, so wait out the 1s idle window instead.
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    const secondIdle = await idleRequest(2, "tools/call", {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_idle_fixture", after_cursor: 0, wait_ms: 0 }
+    });
+    const secondGeneration = secondIdle.result?.structuredContent?.relay_generation;
+    await waitFor(() => relayConnectionCount === idleBaselineConnections + 2, "the recreated relay connection");
+    if (!firstGeneration || !secondGeneration || firstGeneration === secondGeneration) {
+      throw new Error("The idle K3 event relay was not torn down and recreated.");
+    }
+    idleChild.stdin.end();
+    const idleExitCode = await Promise.race([
+      new Promise((resolve) => idleChild.once("exit", (code) => resolve(code))),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("The idle-fixture MCP server did not exit after stdin closed.")), 2000))
+    ]);
+    idleExited = true;
+    if (idleExitCode !== 0) throw new Error(`The idle-fixture MCP server exited with code ${idleExitCode}.`);
+  } finally {
+    if (!idleExited) idleChild.kill();
+  }
 } finally {
   if (!mcpExited) mcpChild.kill();
   for (const socket of relaySockets) socket.destroy();
@@ -1400,6 +1520,9 @@ if (
   !mcpServerText.includes("MAX_EVENT_BATCH_BYTES") ||
   !mcpServerText.includes("relay_generation") ||
   !mcpServerText.includes("isReadOnlyTool") ||
+  !mcpServerText.includes("terminalProviderFailure") ||
+  !mcpServerText.includes("KIMI_K3_RELAY_IDLE_MS") ||
+  !mcpServerText.includes("resynced") ||
   mcpServerText.includes("frameDomains") ||
   mcpServerText.includes("frame_domains")
 ) {
@@ -1407,6 +1530,7 @@ if (
 }
 if (
   !policyText.includes('"TodoList"') ||
+  !policyText.includes("terminalProviderFailure") ||
   policyText.includes('"WebSearch"') ||
   policyText.includes('"FetchURL"') ||
   !bridgeText.includes("Do not call Bash") ||
