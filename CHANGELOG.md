@@ -17,6 +17,8 @@
 - Recover stale non-Git writer locks only after the previous Kimi session is confirmed inactive or missing.
 - Persist terminal Provider errors and return them immediately through await and Stop handoffs.
 - Discover Kimi Code 0.29 foreground Web instances, read `host_version`, and launch the supported `kimi web --no-open` server when the legacy `server run` command is absent.
+- Discover Kimi Code 0.29 instances in the MCP panel path and preflight the panel service before creating a K3 job.
+- Restore the persisted session mode before recreating an event relay after an MCP restart, and fail closed when the mode is unavailable.
 
 ### Testing
 

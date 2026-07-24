@@ -641,10 +641,18 @@ relayServer.on("upgrade", (request, socket) => {
 });
 await new Promise((resolve) => relayServer.listen(0, "127.0.0.1", resolve));
 const relayPort = relayServer.address().port;
-fs.mkdirSync(path.join(mcpFixtureHome, "server"), { recursive: true });
+const instanceRoot = path.join(mcpFixtureHome, "server", "instances");
+const instanceFile = path.join(instanceRoot, "current.json");
+fs.mkdirSync(instanceRoot, { recursive: true });
 fs.writeFileSync(
-  path.join(mcpFixtureHome, "server", "lock"),
-  JSON.stringify({ host: "127.0.0.1", port: relayPort }),
+  instanceFile,
+  JSON.stringify({
+    host: "127.0.0.1",
+    port: relayPort,
+    pid: process.pid,
+    host_version: "0.29.0",
+    heartbeat_at: Date.now()
+  }),
   "utf8"
 );
 fs.writeFileSync(path.join(mcpFixtureHome, "server.token"), fixtureToken, "utf8");
@@ -658,12 +666,13 @@ const requestedSession = value("--session-id") || session;
 const footer = (status) => \`---\\nKimi K3 session: \${session}\\nMode: analyze\\nFocus: engineering\\nStatus: \${status}\\nModel: kimi-code/k3 (verified)\\n\`;
 if (action === "start") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
+  fs.appendFileSync(process.env.KIMI_CODE_HOME + "/start-calls", "1\\n");
   process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "send") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
   process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "status") {
-  process.stdout.write(JSON.stringify({ session_id: session, state: "completed", busy: false, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
+  process.stdout.write(JSON.stringify({ session_id: requestedSession, state: "completed", busy: false, mode: requestedSession === "session_mode_missing" ? null : "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "result") {
   process.stdout.write(value("--format") === "json"
     ? JSON.stringify(requestedSession === "session_running"
@@ -730,10 +739,6 @@ try {
   const resources = await request(3, "resources/list", {});
   const panel = await request(4, "resources/read", { uri: panelResource.uri });
   let nextRequestId = 5;
-  const started = await request(nextRequestId++, "tools/call", {
-    name: "start_k3_collaboration",
-    arguments: { prompt: "Stub review", mode: "analyze", focus: "engineering", cwd: root }
-  });
   let relayCursor = 0;
   let relayGeneration = "";
   const relayedFrames = [];
@@ -749,6 +754,10 @@ try {
     relayedFrames.push(...(batch?.events || []));
     relayCursor = batch?.cursor ?? relayCursor;
   }
+  const started = await request(nextRequestId++, "tools/call", {
+    name: "start_k3_collaboration",
+    arguments: { prompt: "Stub review", mode: "analyze", focus: "engineering", cwd: root }
+  });
   const opened = await request(nextRequestId++, "tools/call", {
     name: "open_k3_panel",
     arguments: { session_id: "session_portable_mcp" }
@@ -789,6 +798,17 @@ try {
     name: "start_k3_collaboration",
     arguments: { prompt: "Invalid cwd", cwd: "." }
   });
+  const missingMode = await request(nextRequestId++, "tools/call", {
+    name: "receive_k3_events",
+    arguments: { session_id: "session_mode_missing", after_cursor: 0, wait_ms: 0 }
+  });
+  const startCallsBeforeUnavailable = fs.readFileSync(path.join(mcpFixtureHome, "start-calls"), "utf8");
+  fs.unlinkSync(instanceFile);
+  const unavailable = await request(nextRequestId++, "tools/call", {
+    name: "start_k3_collaboration",
+    arguments: { prompt: "No panel service", mode: "analyze", focus: "engineering", cwd: root }
+  });
+  const startCallsAfterUnavailable = fs.readFileSync(path.join(mcpFixtureHome, "start-calls"), "utf8");
 
   if (
     initialized.result?.serverInfo?.name !== "Kimi K3 Collab" ||
@@ -810,7 +830,8 @@ try {
     panel.result?.contents?.[0]?._meta?.ui?.csp?.frameDomains !== undefined ||
     panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.connect_domains?.length !== 0 ||
     panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.frame_domains !== undefined ||
-    !panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.redirect_domains?.includes("http://127.0.0.1:58627")
+    !panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.redirect_domains?.includes("http://127.0.0.1:58627") ||
+    !panel.result?.contents?.[0]?._meta?.["openai/widgetCSP"]?.redirect_domains?.includes(`http://127.0.0.1:${relayPort}`)
   ) {
     throw new Error("The MCP server did not advertise the K3 tools and app resource.");
   }
@@ -876,6 +897,13 @@ try {
   }
   if (!invalid.result?.isError || invalid.error) {
     throw new Error("MCP tool execution errors are not returned with the MCP isError result shape.");
+  }
+  if (
+    !missingMode.result?.isError ||
+    !unavailable.result?.isError ||
+    startCallsAfterUnavailable !== startCallsBeforeUnavailable
+  ) {
+    throw new Error("The MCP restart policy or preflight orphan guard failed.");
   }
 
   const hookData = path.join(mcpFixtureHome, "hook-data");
