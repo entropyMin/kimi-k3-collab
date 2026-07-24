@@ -65,13 +65,16 @@ if (
   throw new Error("Kimi server startup capability negotiation is invalid.");
 }
 const {
+  bridgeEnvironment,
   browserCommand,
   browserToolDefinition,
   createBrowserGateway,
   awaitToolDefinition,
+  inspectSessionToolSecurity,
   integrationHandoff,
   panelResource,
   parseBridgeFooter,
+  readSessionPolicy,
   receiveToolDefinition,
   startToolDefinition,
   toolDefinitions
@@ -99,6 +102,24 @@ if (
     "start_k3_collaboration,open_k3_panel,send_k3_message,await_k3_result,receive_k3_events,open_k3_in_browser,get_k3_status,get_k3_result,cancel_k3_job"
 ) {
   throw new Error("The direct MCP Apps tool contract is invalid.");
+}
+const filteredBridgeEnvironment = bridgeEnvironment({
+  Path: "fixture-path",
+  KIMI_CODE_HOME: "fixture-home",
+  KIMI_K3_SERVER_WRAPPER: "fixture-wrapper",
+  GH_TOKEN: "must-not-pass",
+  AWS_SECRET_ACCESS_KEY: "must-not-pass",
+  NODE_OPTIONS: "--require must-not-pass"
+});
+if (
+  filteredBridgeEnvironment.Path !== "fixture-path" ||
+  filteredBridgeEnvironment.KIMI_CODE_HOME !== "fixture-home" ||
+  filteredBridgeEnvironment.KIMI_K3_SERVER_WRAPPER !== "fixture-wrapper" ||
+  Object.keys(filteredBridgeEnvironment).some((key) =>
+    ["GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "NODE_OPTIONS"].includes(key)
+  )
+) {
+  throw new Error("The Kimi bridge environment allowlist leaked an unapproved variable.");
 }
 if (
   awaitToolDefinition.inputSchema?.properties?.wait_seconds?.default !== 100 ||
@@ -220,6 +241,43 @@ const policyAllowed = path.join(policyCwd, "src");
 fs.mkdirSync(policyAllowed, { recursive: true });
 fs.writeFileSync(path.join(policyCwd, ".env.local"), "fixture-secret");
 fs.writeFileSync(path.join(policyCwd, ".env.example"), "safe-example");
+const persistedPolicyRoot = path.join(bridgeUnitHome, "policy-records");
+fs.mkdirSync(persistedPolicyRoot, { recursive: true });
+fs.writeFileSync(path.join(persistedPolicyRoot, "session_valid.json"), JSON.stringify({
+  mode: "execute",
+  cwd: policyAllowed,
+  allowed_paths: [policyAllowed],
+  sensitive_paths_acknowledged: false,
+  sandboxed: false
+}));
+fs.writeFileSync(path.join(persistedPolicyRoot, "session_invalid.json"), "{");
+fs.writeFileSync(path.join(persistedPolicyRoot, "session_outside.json"), JSON.stringify({
+  mode: "execute",
+  cwd: policyAllowed,
+  allowed_paths: [path.resolve(policyAllowed, "..")],
+  sensitive_paths_acknowledged: false,
+  sandboxed: false
+}));
+if (
+  !readSessionPolicy("session_valid", persistedPolicyRoot).valid ||
+  readSessionPolicy("session_missing", persistedPolicyRoot).valid ||
+  readSessionPolicy("session_invalid", persistedPolicyRoot).valid ||
+  readSessionPolicy("session_outside", persistedPolicyRoot).valid ||
+  inspectSessionToolSecurity(
+    "session_valid",
+    { name: "Read", args: { path: "README.md" } },
+    "analyze",
+    persistedPolicyRoot
+  )?.event !== "session_policy_unavailable" ||
+  inspectSessionToolSecurity(
+    "session_missing",
+    { name: "Read", args: { path: "README.md" } },
+    "analyze",
+    persistedPolicyRoot
+  )?.event !== "session_policy_unavailable"
+) {
+  throw new Error("Missing or invalid persisted session policy did not fail closed.");
+}
 const sensitiveBlocked = inspectToolSecurity(
   { name: "Read", args: { path: ".env.production" } },
   { mode: "analyze", cwd: policyCwd }
@@ -1052,6 +1110,15 @@ function websocketFrame(value) {
 const mcpFixtureHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-mcp-"));
 const stubBridge = path.join(mcpFixtureHome, "stub-bridge.mjs");
 const fixtureToken = "fixture-secret-token";
+const mcpJobRoot = path.join(mcpFixtureHome, "codex-jobs");
+fs.mkdirSync(mcpJobRoot, { recursive: true });
+fs.writeFileSync(path.join(mcpJobRoot, "session_portable_mcp.json"), JSON.stringify({
+  mode: "analyze",
+  cwd: root,
+  allowed_paths: [],
+  sensitive_paths_acknowledged: false,
+  sandboxed: false
+}));
 const relayServer = http.createServer();
 const relaySockets = new Set();
 let relayAuthenticated = false;
@@ -1118,6 +1185,7 @@ fs.writeFileSync(
 fs.writeFileSync(path.join(mcpFixtureHome, "server.token"), fixtureToken, "utf8");
 fs.writeFileSync(stubBridge, `
 import fs from "node:fs";
+if (process.env.KIMI_K3_UNSAFE_ENV_FIXTURE) process.exit(5);
 if (process.env.KIMI_K3_HOOK_FAIL === "1") process.exit(4);
 const [action, ...args] = process.argv.slice(2);
 const value = (flag) => args[args.indexOf(flag) + 1];
@@ -1162,7 +1230,8 @@ const mcpChild = spawn(process.execPath, [mcpServer], {
     ...process.env,
     KIMI_K3_BRIDGE: stubBridge,
     KIMI_CODE_HOME: mcpFixtureHome,
-    KIMI_K3_BROWSER_TEST: "1"
+    KIMI_K3_BROWSER_TEST: "1",
+    KIMI_K3_UNSAFE_ENV_FIXTURE: "must-not-pass"
   }
 });
 let mcpExited = false;
@@ -1288,6 +1357,17 @@ try {
     name: "start_k3_collaboration",
     arguments: { prompt: "Invalid cwd", cwd: "." }
   });
+  const startCallsBeforeOutsidePath = fs.readFileSync(path.join(mcpFixtureHome, "start-calls"), "utf8");
+  const outsideAllowedPath = await request(nextRequestId++, "tools/call", {
+    name: "start_k3_collaboration",
+    arguments: {
+      prompt: "Invalid allowed path",
+      mode: "execute",
+      cwd: root,
+      allowed_paths: [".."]
+    }
+  });
+  const startCallsAfterOutsidePath = fs.readFileSync(path.join(mcpFixtureHome, "start-calls"), "utf8");
   const missingMode = await request(nextRequestId++, "tools/call", {
     name: "receive_k3_events",
     arguments: { session_id: "session_mode_missing", after_cursor: 0, wait_ms: 0 }
@@ -1410,6 +1490,12 @@ try {
   }
   if (!invalid.result?.isError || invalid.error) {
     throw new Error("MCP tool execution errors are not returned with the MCP isError result shape.");
+  }
+  if (
+    !outsideAllowedPath.result?.isError ||
+    startCallsAfterOutsidePath !== startCallsBeforeOutsidePath
+  ) {
+    throw new Error("The MCP boundary accepted an allowed_paths entry outside cwd.");
   }
   if (
     !missingMode.result?.isError ||
