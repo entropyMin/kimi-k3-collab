@@ -362,7 +362,21 @@ try {
       candidate.reason === "empty-terminal-directory"
     )
   ) {
-    throw new Error("Prune preview did not distinguish preserved, explicit, and unknown worktrees.");
+    throw new Error(`Prune preview did not distinguish preserved, explicit, and unknown worktrees: ${JSON.stringify({
+      expected: {
+        scoped: scoped.workspace.worktree_root,
+        orphan: orphanRoot,
+        unknown: unknownRoot,
+        empty: emptyRoot
+      },
+      candidates: prunePreview.candidates.map((candidate) => ({
+        type: candidate.type,
+        worktree_root: candidate.worktree_root,
+        session_id: candidate.session_id,
+        deletable: candidate.deletable,
+        reason: candidate.reason
+      }))
+    })}`);
   }
   const prunedResources = pruneExecutionResources(true, orphanSessionId);
   if (
