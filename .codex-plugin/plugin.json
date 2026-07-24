@@ -1,6 +1,6 @@
 {
   "name": "kimi-k3-collab",
-  "version": "0.5.0+codex.20260724014438",
+  "version": "0.5.0+codex.20260724060350",
   "description": "Run complementary Codex and Kimi K3 tasks concurrently with direct results and isolated Git execution.",
   "author": {
     "name": "entropyMin",

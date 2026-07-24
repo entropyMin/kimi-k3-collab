@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-07-24
 
 ### Security
 
@@ -19,10 +19,20 @@
 - Discover Kimi Code 0.29 foreground Web instances, read `host_version`, and launch the supported `kimi web --no-open` server when the legacy `server run` command is absent.
 - Discover Kimi Code 0.29 instances in the MCP panel path and preflight the panel service before creating a K3 job.
 - Restore the persisted session mode before recreating an event relay after an MCP restart, and fail closed when the mode is unavailable.
+- Reuse durable Provider terminal-error classification in the live relay without reconnect churn.
+- Close idle relays while their WebSocket remains healthy.
+- Remove no-change worktree branches and recreate follow-up worktrees from the persisted base commit.
+- Finalize an unread execute handoff before follow-up and restore the prior handoff when prompt submission fails.
+- Return preserved worktree paths with manual review guidance.
+- Add conservative orphan inspection and session-targeted worktree or branch cleanup.
+- Remove known terminal worktree directories only when they are already empty.
 
 ### Testing
 
 - Run all CI matrix jobs with fail-fast disabled.
+- Test the minimum Node.js runtime and supported Node.js LTS releases on every CI operating system.
 - Add fake Kimi REST/WebSocket integration coverage that requires no Kimi login.
+- Exercise the real MCP server and bridge through fake-Kimi analyze and isolated execute handoffs.
+- Cover submodule execute isolation and paths containing spaces, Unicode, and semicolons.
 - Test Kimi Code 0.26.0 as the legacy baseline and prioritize the latest stable 0.29.0.
 - Make `npm run test:real-kimi` verify a real session, prompt, WebSocket stream, result handoff, and durable record.

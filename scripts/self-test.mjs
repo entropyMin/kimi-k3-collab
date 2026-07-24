@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const bridge = path.join(scriptsDir, "kimi-k3.mjs");
+const mcpServer = path.join(scriptsDir, "mcp-server.mjs");
 const temporaryHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-e2e-"));
 const fixtureCwd = path.join(temporaryHome, "project");
 const token = "fake-kimi-token";
@@ -25,6 +26,10 @@ let activePromptId = successPromptId;
 let approvalRejected = false;
 let authenticated = true;
 let profile = null;
+let sessionMetadata = { mode: "analyze", focus: "engineering", cwd: fixtureCwd };
+let executeTarget = null;
+let executeWritesChange = true;
+let rejectNextPrompt = false;
 const upgradedSockets = new Set();
 
 function websocketFrame(value) {
@@ -69,7 +74,7 @@ const server = http.createServer(async (request, response) => {
     });
   }
   if (pathname === "/api/v1/sessions" && request.method === "POST") {
-    await readBody(request);
+    sessionMetadata = (await readBody(request))?.metadata || sessionMetadata;
     return reply(response, { id: sessionId });
   }
   if (pathname === `/api/v1/sessions/${sessionId}/profile` && request.method === "POST") {
@@ -78,7 +83,7 @@ const server = http.createServer(async (request, response) => {
   }
   if (pathname === `/api/v1/sessions/${sessionId}`) {
     return reply(response, {
-      metadata: { mode: "analyze", focus: "engineering" },
+      metadata: sessionMetadata,
       pending_interaction: "none",
       last_turn_reason: complete && scenario !== "failure" ? "completed" : "",
       agent_config: { model: "kimi-code/k3" },
@@ -89,15 +94,30 @@ const server = http.createServer(async (request, response) => {
     return reply(response, {
       model: "kimi-code/k3",
       thinking_level: "max",
-      permission: "manual",
+      permission: profile?.agent_config?.permission_mode || "manual",
       plan_mode: false,
       busy: !complete
     });
   }
   if (pathname === `/api/v1/sessions/${sessionId}/prompts` && request.method === "POST") {
-    await readBody(request);
+    const prompt = await readBody(request);
+    if (rejectNextPrompt) {
+      rejectNextPrompt = false;
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ code: 503, msg: "fake prompt submission failure" }));
+      return;
+    }
     promptCount += 1;
-    scenario = promptCount === 1 ? "success" : promptCount === 2 ? "failure" : "recovered";
+    scenario = sessionMetadata.mode === "execute"
+      ? "execute"
+      : promptCount === 1 ? "success" : promptCount === 2 ? "failure" : "recovered";
+    if (scenario === "execute") {
+      const text = String(prompt?.content?.[0]?.text || "");
+      executeTarget = text.split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line.startsWith("- ") && line.includes("semi;colon.txt"))
+        ?.slice(2) || null;
+    }
     complete = false;
     activePromptId = scenario === "success"
       ? successPromptId
@@ -123,7 +143,9 @@ const server = http.createServer(async (request, response) => {
               type: "text",
               text: scenario === "recovered"
                 ? "# Recovered K3 report\n\nTransient Provider overload recovered."
-                : "# Fake K3 report\n\nProtocol handoff completed."
+                : scenario === "execute"
+                  ? "# Execute K3 report\n\nIsolated change completed."
+                  : "# Fake K3 report\n\nProtocol handoff completed."
             }]
           }]
         : []
@@ -138,6 +160,7 @@ server.on("upgrade", (request, socket) => {
   const websocketPromptId = activePromptId;
   upgradedSockets.add(socket);
   socket.once("close", () => upgradedSockets.delete(socket));
+  socket.on("error", () => {});
   authenticated &&= request.headers.authorization === `Bearer ${token}`;
   const accept = createHash("sha1")
     .update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
@@ -152,6 +175,14 @@ server.on("upgrade", (request, socket) => {
   ].join("\r\n"));
   setTimeout(() => {
     complete = true;
+    if (
+      websocketScenario === "execute" &&
+      executeWritesChange &&
+      executeTarget &&
+      fs.existsSync(path.dirname(executeTarget))
+    ) {
+      fs.writeFileSync(executeTarget, "K3 full-chain change\n");
+    }
     const frames = websocketScenario === "failure"
       ? [
           { type: "server_hello", payload: { protocol_version: 1 } },
@@ -216,7 +247,23 @@ server.on("upgrade", (request, socket) => {
               payload: { promptId: websocketPromptId, reason: "completed" }
             }
           ]
-        : [
+        : websocketScenario === "execute"
+          ? [
+              { type: "server_hello", payload: { protocol_version: 1 } },
+              {
+                type: "assistant.delta",
+                session_id: sessionId,
+                seq: 13,
+                payload: { delta: "# Execute K3 report\n\nIsolated change completed." }
+              },
+              {
+                type: "prompt.completed",
+                session_id: sessionId,
+                seq: 14,
+                payload: { promptId: websocketPromptId, reason: "completed" }
+              }
+            ]
+          : [
           { type: "server_hello", payload: { protocol_version: 1 } },
           {
             type: "event.approval.requested",
@@ -274,9 +321,144 @@ function runBridge(args) {
   });
 }
 
+function checkedGit(args) {
+  const result = spawnSync("git", ["-C", fixtureCwd, ...args], { encoding: "utf8", windowsHide: true });
+  if (result.status !== 0) throw new Error(result.stderr || result.stdout || `git ${args.join(" ")} failed`);
+  return result.stdout.trim();
+}
+
+async function runMcpFullChain(
+  mode = "analyze",
+  { writeExecuteChange = true, failFollowupBeforeAwait = false } = {}
+) {
+  executeWritesChange = writeExecuteChange;
+  const child = spawn(process.execPath, [mcpServer], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    env: { ...process.env, KIMI_CODE_HOME: temporaryHome }
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const pending = new Map();
+  let buffer = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    let newline = buffer.indexOf("\n");
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+      if (!line.trim()) continue;
+      const message = JSON.parse(line);
+      pending.get(message.id)?.(message);
+      pending.delete(message.id);
+    }
+  });
+  let nextId = 1;
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`MCP full-chain request timed out: ${method}`));
+    }, 10000);
+    pending.set(id, (message) => {
+      clearTimeout(timer);
+      resolve(message);
+    });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+  });
+  try {
+    await request("initialize", { protocolVersion: "2025-11-25" });
+    const started = await request("tools/call", {
+      name: "start_k3_collaboration",
+      arguments: {
+        prompt: "Review the full fake MCP chain.",
+        mode,
+        focus: "engineering",
+        cwd: fixtureCwd,
+        ...(mode === "execute" ? {
+          allowed_paths: [
+            path.join(fixtureCwd, "feature.txt"),
+            path.join(fixtureCwd, "semi;colon.txt")
+          ]
+        } : {})
+      }
+    });
+    if (
+      started.result?.structuredContent?.status !== "running" ||
+      started.result?.structuredContent?.session_id !== sessionId ||
+      (mode === "execute" && started.result?.structuredContent?.isolation !== "git-worktree")
+    ) {
+      throw new Error("The real MCP did not start a job through the real bridge.");
+    }
+
+    let cursor = 0;
+    const events = [];
+    for (let attempt = 0; attempt < 10 && !events.some((event) => event.type === "prompt.completed"); attempt += 1) {
+      const received = await request("tools/call", {
+        name: "receive_k3_events",
+        arguments: { session_id: sessionId, after_cursor: cursor, wait_ms: 1000 }
+      });
+      const batch = received.result?.structuredContent;
+      cursor = batch?.cursor ?? cursor;
+      events.push(...(batch?.events || []));
+    }
+    let failedFollowup = null;
+    if (failFollowupBeforeAwait) {
+      rejectNextPrompt = true;
+      failedFollowup = await request("tools/call", {
+        name: "send_k3_message",
+        arguments: { session_id: sessionId, prompt: "This fake follow-up must fail." }
+      });
+    }
+    const awaited = await request("tools/call", {
+      name: "await_k3_result",
+      arguments: { session_id: sessionId, wait_seconds: 5 }
+    });
+    if (
+      !events.some((event) => event.type === "prompt.completed") ||
+      (failFollowupBeforeAwait && !failedFollowup?.result?.isError) ||
+      awaited.result?.structuredContent?.complete !== true ||
+      !awaited.result?.structuredContent?.result_markdown?.includes(mode === "execute" ? "# Execute K3 report" : "# Fake K3 report") ||
+      (mode === "analyze" && !approvalRejected) ||
+      (mode === "execute" && writeExecuteChange && (
+        awaited.result?.structuredContent?.integration_state !== "ready" ||
+        !awaited.result?.structuredContent?.commit ||
+        !awaited.result?.structuredContent?.changed_paths?.includes("semi;colon.txt")
+      )) ||
+      (mode === "execute" && !writeExecuteChange && (
+        awaited.result?.structuredContent?.integration_state !== "no_changes" ||
+        awaited.result?.structuredContent?.commit
+      ))
+    ) {
+      throw new Error(`The real MCP/bridge/fake-Kimi Relay and await chain failed: ${JSON.stringify({
+        mode,
+        event_types: events.map((event) => event.type),
+        result: awaited.result?.structuredContent,
+        approvalRejected
+      })}`);
+    }
+  } finally {
+    child.stdin.end();
+    await new Promise((resolve) => child.once("close", resolve));
+    if (child.exitCode && child.exitCode !== 0) {
+      throw new Error(stderr || `MCP full-chain child exited with ${child.exitCode}.`);
+    }
+  }
+}
+
 try {
   fs.mkdirSync(path.join(temporaryHome, "server"), { recursive: true });
   fs.mkdirSync(fixtureCwd);
+  checkedGit(["init"]);
+  checkedGit(["config", "user.name", "Fake Kimi"]);
+  checkedGit(["config", "user.email", "fake-kimi@local"]);
+  fs.writeFileSync(path.join(fixtureCwd, "feature.txt"), "base\n");
+  fs.writeFileSync(path.join(fixtureCwd, "semi;colon.txt"), "base semicolon\n");
+  checkedGit(["add", "--all"]);
+  checkedGit(["commit", "-m", "fixture"]);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   fs.writeFileSync(
@@ -312,6 +494,26 @@ try {
     currentService.compatibility_status !== "tested"
   ) {
     throw new Error("The current Kimi instance discovery/version contract failed.");
+  }
+  const unbornRepo = path.join(temporaryHome, "unborn");
+  fs.mkdirSync(unbornRepo);
+  const unbornInit = spawnSync("git", ["-C", unbornRepo, "init"], { encoding: "utf8", windowsHide: true });
+  if (unbornInit.status !== 0) throw new Error(unbornInit.stderr || "Unable to create the unborn Git fixture.");
+  fs.writeFileSync(path.join(unbornRepo, "feature.txt"), "uncommitted\n");
+  let unbornError = null;
+  try {
+    await runBridge([
+      "start",
+      "--mode", "execute",
+      "--cwd", unbornRepo,
+      "--allowed-path", path.join(unbornRepo, "feature.txt"),
+      "--prompt", "This must fail before creating a Kimi session."
+    ]);
+  } catch (error) {
+    unbornError = error;
+  }
+  if (!unbornError?.message.includes("requires at least one commit")) {
+    throw new Error(`An unborn Git repository did not fail with an actionable execute-mode error: ${unbornError?.message || "no error"}`);
   }
   const started = await runBridge([
     "start",
@@ -393,6 +595,73 @@ try {
     !recoveredResult.result?.includes("# Recovered K3 report")
   ) {
     throw new Error("A transient Kimi Provider error was treated as terminal.");
+  }
+  complete = false;
+  scenario = "success";
+  promptCount = 0;
+  activePromptId = successPromptId;
+  approvalRejected = false;
+  profile = null;
+  await runMcpFullChain();
+  complete = false;
+  promptCount = 0;
+  activePromptId = successPromptId;
+  profile = null;
+  await runMcpFullChain("execute", { failFollowupBeforeAwait: true });
+  if (
+    fs.readFileSync(path.join(fixtureCwd, "feature.txt"), "utf8") !== "base\n" ||
+    fs.readFileSync(path.join(fixtureCwd, "semi;colon.txt"), "utf8") !== "base semicolon\n" ||
+    checkedGit(["status", "--short"])
+  ) {
+    throw new Error("The full-chain execute handoff changed the source checkout.");
+  }
+  const prunePreview = await runBridge(["prune"]);
+  if (!prunePreview.candidates.some((candidate) => candidate.type === "branch" && candidate.deletable)) {
+    throw new Error("The explicit prune preview did not report the completed handoff branch.");
+  }
+  let untargetedPruneError = null;
+  try {
+    await runBridge(["prune", "--delete"]);
+  } catch (error) {
+    untargetedPruneError = error;
+  }
+  if (!untargetedPruneError?.message.includes("explicit --session-id")) {
+    throw new Error("Untargeted prune deletion was not rejected.");
+  }
+  const pruned = await runBridge(["prune", "--delete", "--session-id", sessionId]);
+  if (!pruned.deleted.some((candidate) => candidate.type === "branch") || checkedGit(["branch", "--list", "codex-k3/*"])) {
+    throw new Error("The explicit prune action did not remove the completed handoff branch.");
+  }
+  complete = false;
+  promptCount = 0;
+  activePromptId = successPromptId;
+  profile = null;
+  await runMcpFullChain("execute", { writeExecuteChange: false });
+  rejectNextPrompt = true;
+  let failedNoChangeFollowup = null;
+  try {
+    await runBridge(["send", "--session-id", sessionId, "--prompt", "This fake follow-up must fail."]);
+  } catch (error) {
+    failedNoChangeFollowup = error;
+  }
+  const noChangeRecord = JSON.parse(fs.readFileSync(
+    path.join(temporaryHome, "codex-jobs", `${sessionId}.json`),
+    "utf8"
+  ));
+  const rereadNoChange = await runBridge([
+    "result",
+    "--session-id", sessionId,
+    "--wait-seconds", "0"
+  ]);
+  if (
+    !failedNoChangeFollowup?.message.includes("fake prompt submission failure") ||
+    noChangeRecord.integration?.state !== "no_changes" ||
+    rereadNoChange.integration?.state !== "no_changes" ||
+    rereadNoChange.error ||
+    fs.existsSync(noChangeRecord.workspace?.worktree_root) ||
+    checkedGit(["branch", "--list", "codex-k3/*"])
+  ) {
+    throw new Error("A failed no-change follow-up leaked its temporary worktree or branch.");
   }
   process.stdout.write(`Fake Kimi REST/WebSocket test passed on ${process.platform}.\n`);
 } finally {

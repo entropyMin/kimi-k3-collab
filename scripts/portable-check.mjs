@@ -26,7 +26,7 @@ for (const script of [bridge, mcpServer, handoffHook, websocketModule, policyMod
   }
 }
 
-const bridgeUnitHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-bridge-unit-"));
+const bridgeUnitHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-bridge-unit-ü;-"));
 const originalKimiHome = process.env.KIMI_CODE_HOME;
 process.env.KIMI_CODE_HOME = bridgeUnitHome;
 const {
@@ -37,6 +37,7 @@ const {
   kimiServerLaunchSpec,
   pathsOverlap,
   prepareExecutionWorkspace,
+  pruneExecutionResources,
   renderK3Event,
   restoreExecutionWorkspace,
   scopeViolations
@@ -57,6 +58,7 @@ const {
   browserCommand,
   browserToolDefinition,
   awaitToolDefinition,
+  integrationHandoff,
   panelResource,
   parseBridgeFooter,
   receiveToolDefinition,
@@ -109,6 +111,39 @@ if (
   throw new Error("The pushed K3 event receiver is not private and app-only.");
 }
 
+for (const preservedState of ["scope_violation", "integration_error", "unintegrated_ignored_files"]) {
+  const preservedHandoff = integrationHandoff({
+    integration: {
+      isolation: "git-worktree",
+      state: preservedState,
+      branch: "k3/fixture",
+      worktree_root: "D:/fixture/k3-worktree"
+    }
+  });
+  if (
+    preservedHandoff.structured.worktree_root !== "D:/fixture/k3-worktree" ||
+    !preservedHandoff.text.includes("Preserved worktree: D:/fixture/k3-worktree") ||
+    !preservedHandoff.text.includes("cherry-pick")
+  ) {
+    throw new Error("The preserved-worktree handoff guidance is missing or incomplete.");
+  }
+}
+const integratedHandoff = integrationHandoff({
+  integration: {
+    isolation: "git-worktree",
+    state: "ready",
+    branch: "k3/fixture",
+    commit: "abc123",
+    worktree_root: "D:/fixture/k3-worktree"
+  }
+});
+if (
+  integratedHandoff.structured.worktree_root !== "D:/fixture/k3-worktree" ||
+  integratedHandoff.text.includes("Preserved worktree")
+) {
+  throw new Error("An integrated handoff must expose worktree_root without preserved-worktree guidance.");
+}
+
 if (
   !pathsOverlap("src", "src/app.js") ||
   pathsOverlap("src", "scripts/app.js") ||
@@ -121,6 +156,18 @@ function checkedGit(cwd, args) {
   const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true });
   if (result.status !== 0) throw new Error(result.stderr || result.stdout || `git ${args.join(" ")} failed`);
   return result.stdout.trim();
+}
+
+function samePath(left, right) {
+  const identity = (value) => {
+    let resolved = path.resolve(value);
+    try {
+      resolved = fs.realpathSync.native(resolved);
+    } catch {}
+    if (process.platform === "darwin") resolved = resolved.normalize("NFC");
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  return identity(left) === identity(right);
 }
 
 const isolationFixture = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-isolation-"));
@@ -153,8 +200,34 @@ try {
       mode: "execute",
       workspace: linked.workspace
     });
-    if (linkedHandoff.state !== "no_changes" || fs.existsSync(linked.workspace.worktree_root)) {
+    if (
+      linkedHandoff.state !== "no_changes" ||
+      fs.existsSync(linked.workspace.worktree_root) ||
+      checkedGit(isolationFixture, ["branch", "--list", linked.workspace.branch])
+    ) {
       throw new Error("A canonicalized working directory did not finalize cleanly.");
+    }
+    const linkedFollowup = {
+      session_id: "session_linked_cwd_followup",
+      prompt_id: "prompt_linked_cwd_followup",
+      mode: "execute",
+      workspace: linked.workspace
+    };
+    await restoreExecutionWorkspace(linkedFollowup);
+    if (
+      !fs.existsSync(linked.workspace.worktree_root) ||
+      checkedGit(linked.workspace.worktree_root, ["rev-parse", "HEAD"]) !== linked.workspace.base_commit
+    ) {
+      throw new Error("A no-change follow-up did not recreate its worktree from the persisted base commit.");
+    }
+    linked.workspace.turn_finalized_for = null;
+    const linkedFollowupHandoff = finalizeExecutionWorkspace(linkedFollowup);
+    if (
+      linkedFollowupHandoff.state !== "no_changes" ||
+      fs.existsSync(linked.workspace.worktree_root) ||
+      checkedGit(isolationFixture, ["branch", "--list", linked.workspace.branch])
+    ) {
+      throw new Error("A recreated no-change worktree did not clean up its branch.");
     }
   } finally {
     fs.unlinkSync(linkedFixture);
@@ -218,6 +291,149 @@ try {
   if (scopedHandoff.state !== "scope_violation" || !fs.existsSync(scoped.workspace.worktree_root)) {
     throw new Error("A scope violation was not blocked and preserved for review.");
   }
+  const pruneJobs = path.join(bridgeUnitHome, "codex-jobs");
+  fs.mkdirSync(pruneJobs, { recursive: true });
+  fs.writeFileSync(path.join(pruneJobs, `${scopedRecord.session_id}.json`), JSON.stringify({
+    ...scopedRecord,
+    complete: true,
+    integration: scopedHandoff
+  }));
+  const orphanSessionId = "session_portable_orphan";
+  const orphanRoot = path.join(bridgeUnitHome, "codex-worktrees", "portable-orphan");
+  const orphanBranch = "codex-k3/portable-orphan";
+  checkedGit(isolationFixture, ["worktree", "add", "-b", orphanBranch, orphanRoot, "HEAD"]);
+  fs.writeFileSync(path.join(pruneJobs, `${orphanSessionId}.json`), JSON.stringify({
+    session_id: orphanSessionId,
+    complete: true,
+    workspace: {
+      isolation: "git-worktree",
+      source_repo: isolationFixture,
+      worktree_root: orphanRoot,
+      branch: orphanBranch
+    },
+    integration: { state: "ready" }
+  }));
+  const unknownRoot = path.join(bridgeUnitHome, "codex-worktrees", "portable-unknown");
+  const unknownBranch = "codex-k3/portable-unknown";
+  checkedGit(isolationFixture, ["worktree", "add", "-b", unknownBranch, unknownRoot, "HEAD"]);
+  const emptySessionId = "session_portable_empty_directory";
+  const emptyRoot = path.join(bridgeUnitHome, "codex-worktrees", "portable-empty");
+  fs.mkdirSync(emptyRoot);
+  fs.writeFileSync(path.join(pruneJobs, `${emptySessionId}.json`), JSON.stringify({
+    session_id: emptySessionId,
+    complete: true,
+    workspace: {
+      isolation: "git-worktree",
+      source_repo: isolationFixture,
+      worktree_root: emptyRoot,
+      branch: "codex-k3/portable-empty"
+    },
+    integration: { state: "ready" }
+  }));
+  const prunePreview = pruneExecutionResources(false);
+  let untargetedPruneError = null;
+  try {
+    pruneExecutionResources(true);
+  } catch (error) {
+    untargetedPruneError = error;
+  }
+  if (
+    !untargetedPruneError?.message.includes("explicit session id") ||
+    !prunePreview.candidates.some((candidate) =>
+      candidate.type === "worktree" &&
+      samePath(candidate.worktree_root, scoped.workspace.worktree_root) &&
+      !candidate.deletable
+    ) ||
+    !prunePreview.candidates.some((candidate) =>
+      candidate.type === "worktree" &&
+      samePath(candidate.worktree_root, orphanRoot) &&
+      candidate.deletable
+    ) ||
+    !prunePreview.candidates.some((candidate) =>
+      candidate.type === "worktree" &&
+      samePath(candidate.worktree_root, unknownRoot) &&
+      !candidate.deletable &&
+      candidate.reason === "missing-record"
+    ) ||
+    !prunePreview.candidates.some((candidate) =>
+      candidate.type === "unowned_directory" &&
+      samePath(candidate.worktree_root, emptyRoot) &&
+      candidate.deletable &&
+      candidate.reason === "empty-terminal-directory"
+    )
+  ) {
+    throw new Error(`Prune preview did not distinguish preserved, explicit, and unknown worktrees: ${JSON.stringify({
+      expected: {
+        scoped: scoped.workspace.worktree_root,
+        orphan: orphanRoot,
+        unknown: unknownRoot,
+        empty: emptyRoot
+      },
+      candidates: prunePreview.candidates.map((candidate) => ({
+        type: candidate.type,
+        worktree_root: candidate.worktree_root,
+        session_id: candidate.session_id,
+        deletable: candidate.deletable,
+        reason: candidate.reason
+      }))
+    })}`);
+  }
+  const prunedResources = pruneExecutionResources(true, orphanSessionId);
+  if (
+    !fs.existsSync(scoped.workspace.worktree_root) ||
+    fs.existsSync(orphanRoot) ||
+    !fs.existsSync(unknownRoot) ||
+    checkedGit(isolationFixture, ["branch", "--list", orphanBranch]) ||
+    !prunedResources.deleted.some((candidate) =>
+      candidate.type === "worktree" && candidate.session_id === orphanSessionId
+    )
+  ) {
+    throw new Error(`Session-targeted prune did not remove only the selected worktree: ${JSON.stringify({
+      scoped_exists: fs.existsSync(scoped.workspace.worktree_root),
+      orphan_exists: fs.existsSync(orphanRoot),
+      unknown_exists: fs.existsSync(unknownRoot),
+      orphan_branch: checkedGit(isolationFixture, ["branch", "--list", orphanBranch]),
+      deleted: prunedResources.deleted,
+      errors: prunedResources.errors
+    })}`);
+  }
+  const originalRmdirSync = fs.rmdirSync;
+  fs.rmdirSync = (target) => {
+    if (target === emptyRoot) {
+      const error = new Error("fixture directory is busy");
+      error.code = "EBUSY";
+      throw error;
+    }
+    return originalRmdirSync(target);
+  };
+  let busyEmptyDirectory;
+  try {
+    busyEmptyDirectory = pruneExecutionResources(true, emptySessionId);
+  } finally {
+    fs.rmdirSync = originalRmdirSync;
+  }
+  if (
+    !fs.existsSync(emptyRoot) ||
+    busyEmptyDirectory.deleted.length !== 0 ||
+    !busyEmptyDirectory.errors.some((candidate) =>
+      samePath(candidate.worktree_root, emptyRoot) &&
+      candidate.delete_error.includes("fixture directory is busy")
+    )
+  ) {
+    throw new Error("A locked empty terminal directory was not reported without forced deletion.");
+  }
+  const prunedEmptyDirectory = pruneExecutionResources(true, emptySessionId);
+  if (
+    fs.existsSync(emptyRoot) ||
+    !prunedEmptyDirectory.deleted.some((candidate) =>
+      candidate.type === "unowned_directory" && candidate.session_id === emptySessionId
+    ) ||
+    prunedEmptyDirectory.errors.length !== 0
+  ) {
+    throw new Error("Session-targeted prune did not remove a known empty terminal directory.");
+  }
+  checkedGit(isolationFixture, ["worktree", "remove", "--force", unknownRoot]);
+  checkedGit(isolationFixture, ["branch", "-D", unknownBranch]);
   checkedGit(isolationFixture, ["worktree", "remove", "--force", scoped.workspace.worktree_root]);
   checkedGit(isolationFixture, ["branch", "-D", scoped.workspace.branch]);
 
@@ -354,6 +570,46 @@ try {
     providerRecord.workspace.turn_finalized_for !== providerRecord.prompt_id
   ) {
     throw new Error("A Provider failure did not finalize its partial execute handoff exactly once.");
+  }
+
+  const submoduleSource = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-submodule-source-"));
+  try {
+    checkedGit(submoduleSource, ["init"]);
+    checkedGit(submoduleSource, ["config", "user.name", "Portable Check"]);
+    checkedGit(submoduleSource, ["config", "user.email", "portable-check@local"]);
+    fs.writeFileSync(path.join(submoduleSource, "feature.txt"), "submodule base\n");
+    checkedGit(submoduleSource, ["add", "--all"]);
+    checkedGit(submoduleSource, ["commit", "-m", "submodule fixture"]);
+    const submoduleRelative = "module ü; space";
+    checkedGit(isolationFixture, [
+      "-c", "protocol.file.allow=always",
+      "submodule", "add", submoduleSource, submoduleRelative
+    ]);
+    checkedGit(isolationFixture, ["commit", "-am", "add submodule fixture"]);
+    const submoduleRoot = path.join(isolationFixture, submoduleRelative);
+    const submoduleSourceText = fs.readFileSync(path.join(submoduleRoot, "feature.txt"), "utf8");
+    const submoduleWorkspace = await prepareExecutionWorkspace(
+      submoduleRoot,
+      [path.join(submoduleRoot, "feature.txt")]
+    );
+    fs.writeFileSync(path.join(submoduleWorkspace.cwd, "feature.txt"), "submodule K3 change\n");
+    const submoduleHandoff = finalizeExecutionWorkspace({
+      session_id: "session_submodule_fixture",
+      prompt_id: "prompt_submodule_fixture",
+      mode: "execute",
+      workspace: submoduleWorkspace.workspace
+    });
+    if (
+      submoduleWorkspace.workspace.source_repo !== fs.realpathSync.native(submoduleRoot) ||
+      submoduleHandoff.state !== "ready" ||
+      submoduleHandoff.changed_paths.join(",") !== "feature.txt" ||
+      fs.existsSync(submoduleWorkspace.workspace.worktree_root) ||
+      fs.readFileSync(path.join(submoduleRoot, "feature.txt"), "utf8") !== submoduleSourceText
+    ) {
+      throw new Error("Submodule execute isolation or special-path handoff failed.");
+    }
+  } finally {
+    fs.rmSync(submoduleSource, { recursive: true, force: true });
   }
 
   const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-single-writer-"));
@@ -605,6 +861,7 @@ relayServer.on("upgrade", (request, socket) => {
   relayConnectionCount += 1;
   relayAuthenticated ||= request.headers.authorization === `Bearer ${fixtureToken}`;
   relaySockets.add(socket);
+  socket.on("error", () => {});
   socket.once("close", () => relaySockets.delete(socket));
   const accept = createHash("sha1")
     .update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
@@ -632,9 +889,13 @@ relayServer.on("upgrade", (request, socket) => {
         sharedToolStart,
         { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "x".repeat(300000) } } },
         { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "y".repeat(300000) } } },
+        { type: "resync_required", payload: { session_id: "session_portable_mcp", current_seq: 5, epoch: "epoch_portable_resync" } },
         { type: "tool.result", session_id: "session_portable_mcp", seq: 6, payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
-        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 7, payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
-        { type: "turn.ended", session_id: "session_portable_mcp", seq: 8, payload: { turnId: "turn_fixture", reason: "completed" } }
+        { type: "error", session_id: "session_portable_mcp", seq: 7, payload: { code: "provider.rate_limit", message: "429 overloaded", fatal: true } },
+        { type: "turn.started", session_id: "session_portable_mcp", seq: 8, payload: { turnId: "turn_followup" } },
+        { type: "error", session_id: "session_portable_mcp", seq: 9, payload: { code: "provider.rate_limit", message: "429 overloaded again", fatal: true } },
+        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 10, payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
+        { type: "turn.ended", session_id: "session_portable_mcp", seq: 11, payload: { turnId: "turn_followup", reason: "completed" } }
       ];
   socket.write(Buffer.concat([headers, ...frames.map(websocketFrame)]));
   if (relayConnectionCount === 1) setTimeout(() => socket.destroy(), 20);
@@ -679,6 +940,8 @@ if (action === "start") {
       ? { session_id: requestedSession, state: "running", complete: false, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
       : requestedSession === "session_failed"
         ? { session_id: requestedSession, state: "failed", complete: true, error: "[provider.rate_limit] 429 overloaded", error_code: "provider.rate_limit", result: "# Stale report", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
+      : requestedSession === "session_scope_violation_fixture"
+        ? { session_id: requestedSession, state: "failed", complete: true, error: "K3 wrote outside its allowed paths; the isolated worktree was preserved for review.", error_code: "scope_violation", mode: "execute", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true, integration: { isolation: "git-worktree", state: "scope_violation", branch: "k3/session_scope_violation_fixture", commit: null, worktree_root: "D:/fixture/k3-worktree", changed_paths: ["README.md"], scope_violations: ["README.md"] } }
       : { session_id: requestedSession, state: "max_tokens", complete: true, result: "# Stub K3 report\\n\\nOriginal Markdown.", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true })
     : \`# Stub K3 report\\n\\nOriginal Markdown.\\n\\n\${footer("completed")}\`);
 } else if (action === "reject-approval") {
@@ -704,11 +967,11 @@ const mcpChild = spawn(process.execPath, [mcpServer], {
 });
 let mcpExited = false;
 try {
-  const request = (() => {
+  const createRequest = (child) => {
     const pending = new Map();
     let buffer = "";
-    mcpChild.stdout.setEncoding("utf8");
-    mcpChild.stdout.on("data", (chunk) => {
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
       buffer += chunk;
       let newline = buffer.indexOf("\n");
       while (newline !== -1) {
@@ -730,9 +993,18 @@ try {
         clearTimeout(timer);
         resolve(message);
       });
-      mcpChild.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
-  })();
+  };
+  const waitFor = async (predicate, description, timeoutMs = 10000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`Timed out waiting for ${description}.`);
+  };
+  const request = createRequest(mcpChild);
 
   const initialized = await request(1, "initialize", { protocolVersion: "2025-11-25" });
   const listed = await request(2, "tools/list", {});
@@ -777,6 +1049,10 @@ try {
   const failedAwaited = await request(nextRequestId++, "tools/call", {
     name: "await_k3_result",
     arguments: { session_id: "session_failed", wait_seconds: 1 }
+  });
+  const scopeHandoff = await request(nextRequestId++, "tools/call", {
+    name: "await_k3_result",
+    arguments: { session_id: "session_scope_violation_fixture", wait_seconds: 1 }
   });
   const messaged = await request(nextRequestId++, "tools/call", {
     name: "send_k3_message",
@@ -824,6 +1100,7 @@ try {
     !panel.result?.contents?.[0]?.text?.includes("open_k3_in_browser") ||
     !panel.result?.contents?.[0]?.text?.includes("send_k3_message") ||
     !panel.result?.contents?.[0]?.text?.includes("relay.policy") ||
+    !panel.result?.contents?.[0]?.text?.includes("resynced") ||
     !panel.result?.contents?.[0]?.text?.includes("stream gap: resumed at source offset") ||
     panel.result?.contents?.[0]?.text?.includes("<iframe") ||
     panel.result?.contents?.[0]?._meta?.ui?.csp?.connectDomains !== undefined ||
@@ -880,12 +1157,22 @@ try {
     !cancelled.result?.structuredContent?.aborted ||
     !relayAuthenticated ||
     !relayGeneration ||
-    relayConnectionCount < 2 ||
+    relayConnectionCount !== 2 ||
     relayedFrames.filter((frame) => frame.type === "assistant.delta" && frame.seq === 2).length !== 2 ||
     relayedFrames.filter((frame) => frame.type === "tool.call.started" && frame.seq === 3).length !== 1 ||
     !relayedFrames.some((frame) => frame.type === "tool.result") ||
     !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.status === "rejected") ||
     !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.message?.includes("Stopped disallowed tool")) ||
+    relayedFrames.filter((frame) =>
+      frame.type === "relay.status" &&
+      frame.payload?.status === "failed" &&
+      frame.payload?.terminal === true &&
+      frame.payload?.turn_terminal === true
+    ).length !== 2 ||
+    !relayedFrames.some((frame) => frame.type === "relay.status" && frame.payload?.status === "resynced") ||
+    relayedFrames.findIndex((frame) => frame.type === "error" && frame.payload?.code === "provider.rate_limit") < 0 ||
+    relayedFrames.findIndex((frame) => frame.type === "error" && frame.payload?.code === "provider.rate_limit") >
+      relayedFrames.findIndex((frame) => frame.type === "turn.ended") ||
     !fs.existsSync(path.join(mcpFixtureHome, "approval-rejected")) ||
     maxRelayedBatchBytes > 520000 ||
     relayCursor < relayedFrames.length ||
@@ -894,6 +1181,14 @@ try {
     )
   ) {
     throw new Error("The direct K3 panel, messaging, fallback, or token-isolation contract failed.");
+  }
+  if (
+    scopeHandoff.result?.structuredContent?.integration_state !== "scope_violation" ||
+    scopeHandoff.result?.structuredContent?.worktree_root !== "D:/fixture/k3-worktree" ||
+    !scopeHandoff.result?.content?.[0]?.text?.includes("Preserved worktree: D:/fixture/k3-worktree") ||
+    !scopeHandoff.result?.content?.[0]?.text?.includes("cherry-pick")
+  ) {
+    throw new Error("The scope-violation handoff did not expose the preserved worktree.");
   }
   if (!invalid.result?.isError || invalid.error) {
     throw new Error("MCP tool execution errors are not returned with the MCP isError result shape.");
@@ -1140,6 +1435,60 @@ try {
   ]);
   mcpExited = true;
   if (exitCode !== 0) throw new Error(`The MCP server exited with code ${exitCode} after stdin closed.`);
+
+  const idleBaselineConnections = relayConnectionCount;
+  fs.writeFileSync(
+    instanceFile,
+    JSON.stringify({
+      host: "127.0.0.1",
+      port: relayPort,
+      pid: process.pid,
+      host_version: "0.29.0",
+      heartbeat_at: Date.now()
+    }),
+    "utf8"
+  );
+  const idleChild = spawn(process.execPath, [mcpServer], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    env: {
+      ...process.env,
+      KIMI_K3_BRIDGE: stubBridge,
+      KIMI_CODE_HOME: mcpFixtureHome,
+      KIMI_K3_BROWSER_TEST: "1",
+      KIMI_K3_RELAY_IDLE_MS: "1000"
+    }
+  });
+  let idleExited = false;
+  try {
+    const idleRequest = createRequest(idleChild);
+    const firstIdle = await idleRequest(1, "tools/call", {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_idle_fixture", after_cursor: 0, wait_ms: 0 }
+    });
+    const firstGeneration = firstIdle.result?.structuredContent?.relay_generation;
+    await waitFor(() => relayConnectionCount === idleBaselineConnections + 1, "the idle-fixture relay connection");
+    // Polling receive_k3_events would refresh lastReceiveAt, so wait out the 1s idle window instead.
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    const secondIdle = await idleRequest(2, "tools/call", {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_idle_fixture", after_cursor: 0, wait_ms: 0 }
+    });
+    const secondGeneration = secondIdle.result?.structuredContent?.relay_generation;
+    await waitFor(() => relayConnectionCount === idleBaselineConnections + 2, "the recreated relay connection");
+    if (!firstGeneration || !secondGeneration || firstGeneration === secondGeneration) {
+      throw new Error("The idle K3 event relay was not torn down and recreated.");
+    }
+    idleChild.stdin.end();
+    const idleExitCode = await Promise.race([
+      new Promise((resolve) => idleChild.once("exit", (code) => resolve(code))),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("The idle-fixture MCP server did not exit after stdin closed.")), 2000))
+    ]);
+    idleExited = true;
+    if (idleExitCode !== 0) throw new Error(`The idle-fixture MCP server exited with code ${idleExitCode}.`);
+  } finally {
+    if (!idleExited) idleChild.kill();
+  }
 } finally {
   if (!mcpExited) mcpChild.kill();
   for (const socket of relaySockets) socket.destroy();
@@ -1400,6 +1749,9 @@ if (
   !mcpServerText.includes("MAX_EVENT_BATCH_BYTES") ||
   !mcpServerText.includes("relay_generation") ||
   !mcpServerText.includes("isReadOnlyTool") ||
+  !mcpServerText.includes("terminalProviderFailure") ||
+  !mcpServerText.includes("KIMI_K3_RELAY_IDLE_MS") ||
+  !mcpServerText.includes("resynced") ||
   mcpServerText.includes("frameDomains") ||
   mcpServerText.includes("frame_domains")
 ) {
@@ -1407,6 +1759,7 @@ if (
 }
 if (
   !policyText.includes('"TodoList"') ||
+  !policyText.includes("terminalProviderFailure") ||
   policyText.includes('"WebSearch"') ||
   policyText.includes('"FetchURL"') ||
   !bridgeText.includes("Do not call Bash") ||

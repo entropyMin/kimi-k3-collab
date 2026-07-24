@@ -8,7 +8,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
-import { READ_ONLY_TOOLS, isReadOnlyTool } from "./lib/k3-policy.mjs";
+import { READ_ONLY_TOOLS, isReadOnlyTool, terminalProviderFailure } from "./lib/k3-policy.mjs";
 
 const K3_MODEL = "kimi-code/k3";
 const TESTED_KIMI_CODE_VERSIONS = new Set(["0.26.0", "0.29.0"]);
@@ -24,7 +24,7 @@ const COMPLETE_STATES = new Set(["completed", "cancelled", "failed", "error", "s
 const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped"]);
 const PROMPT_TERMINAL_EVENTS = new Set(["prompt.completed", "prompt.aborted"]);
 const CHECKPOINT_EVENTS = new Set(["turn.ended", "error", ...PROMPT_TERMINAL_EVENTS]);
-const TERMINAL_PROVIDER_ERROR_CODES = new Set(["provider.api_error", "provider.rate_limit"]);
+const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files"]);
 const PROCESS_DEADLINE = Date.now() + 115000;
 const STREAM_EXIT_RESERVE_MS = 10000;
 
@@ -53,6 +53,7 @@ function parseArgs(argv) {
     outputFormat: "json",
     waitSeconds: 0,
     maxWaitSeconds: 105,
+    deleteResources: false,
     allowedPaths: []
   };
   const names = new Map([
@@ -69,8 +70,13 @@ function parseArgs(argv) {
     ["--max-wait-seconds", "maxWaitSeconds"]
   ]);
 
-  for (let index = 0; index < tokens.length; index += 2) {
+  for (let index = 0; index < tokens.length;) {
     const flag = tokens[index];
+    if (flag === "--delete") {
+      options.deleteResources = true;
+      index += 1;
+      continue;
+    }
     const key = names.get(flag);
     const value = tokens[index + 1];
     if (!key || value == null) {
@@ -83,10 +89,17 @@ function parseArgs(argv) {
     } else {
       options[key] = value;
     }
+    index += 2;
   }
 
-  if (!["ensure", "delegate", "latest", "start", "send", "status", "watch", "result", "cancel", "reject-approval"].includes(options.action)) {
+  if (!["ensure", "delegate", "latest", "start", "send", "status", "watch", "result", "cancel", "reject-approval", "prune"].includes(options.action)) {
     throw new Error(`Unknown action: ${options.action}`);
+  }
+  if (options.deleteResources && options.action !== "prune") {
+    throw new Error("--delete is supported only with prune.");
+  }
+  if (options.deleteResources && !options.sessionId?.trim()) {
+    throw new Error("prune --delete requires an explicit --session-id.");
   }
   if (!["analyze", "execute"].includes(options.mode)) {
     throw new Error(`Unsupported mode: ${options.mode}`);
@@ -129,17 +142,23 @@ function formatIntegration(value) {
   if (integration.isolation === "single-writer") {
     return `\n\n---\nExecution handoff: non-Git single-writer changes were made directly in ${integration.source_cwd}.`;
   }
+  const preserved = PRESERVED_WORKTREE_STATES.has(integration.state);
   return `\n\n${[
     "---",
     "K3 isolated Git handoff",
     `State: ${integration.state}`,
     integration.branch && `Branch: ${integration.branch}`,
     integration.commit && `Commit: ${integration.commit}`,
+    preserved && integration.worktree_root && `Preserved worktree: ${integration.worktree_root}`,
     integration.changed_paths?.length && `Changed paths: ${integration.changed_paths.join(", ")}`,
     integration.ignored_paths?.length && `Ignored paths requiring review: ${integration.ignored_paths.join(", ")}`,
     integration.symlink_paths?.length && `Symbolic links or junctions: ${integration.symlink_paths.join(", ")}`,
     integration.overlapping_source_paths?.length && `Overlapping source changes: ${integration.overlapping_source_paths.join(", ")}`,
-    integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`
+    integration.scope_violations?.length && `Scope violations: ${integration.scope_violations.join(", ")}`,
+    integration.state === "unintegrated_ignored_files"
+      && "Ignored outputs were not committed because they may contain secrets or disposable build state.",
+    preserved && integration.worktree_root
+      && "The worktree was preserved for manual review. Inspect it before removing the worktree and its branch."
   ].filter(Boolean).join("\n")}`;
 }
 
@@ -150,6 +169,13 @@ function formatText(value) {
 
   if (value.kind === "kimi-k3-job-cancel") {
     return `Kimi K3 prompt ${value.aborted ? "cancelled" : "was not active"}.\nSession: ${value.session_id}\n`;
+  }
+
+  if (value.kind === "kimi-k3-prune") {
+    if (value.delete_requested) {
+      return `Pruned ${value.deleted.length} of ${value.candidates.length} inspected K3 resource candidate(s); ${value.errors.length} failed.\n`;
+    }
+    return `Found ${value.candidates.length} K3 resource candidate(s).\n`;
   }
 
   const status = value.status || value;
@@ -274,6 +300,20 @@ function canonicalPath(value) {
   return path.join(fs.realpathSync.native(current), ...missing);
 }
 
+function pathIdentity(value) {
+  let resolved = path.resolve(value);
+  try {
+    resolved = fs.realpathSync.native(resolved);
+  } catch {}
+  if (process.platform === "darwin") resolved = resolved.normalize("NFC");
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isManagedWorktreePath(value) {
+  const relative = path.relative(pathIdentity(WORKTREE_ROOT), pathIdentity(value));
+  return Boolean(relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function kimiCompatibility(version) {
   const normalized = String(version || "").match(/\d+\.\d+\.\d+/)?.[0] || null;
   return {
@@ -331,12 +371,17 @@ function findGitRepo(cwd) {
   return canonicalPath(result.stdout.trim());
 }
 
+function deleteK3Branch(repo, branch) {
+  if (!String(branch || "").startsWith("codex-k3/")) {
+    throw new Error(`Refusing to remove unexpected K3 branch: ${branch || "unknown"}`);
+  }
+  runGit(repo, ["branch", "-D", branch]);
+}
+
 function removeGitWorktree(workspace, deleteBranch = false) {
   if (!workspace?.source_repo || !workspace?.worktree_root) return;
-  const expectedRoot = path.resolve(WORKTREE_ROOT);
   const target = path.resolve(workspace.worktree_root);
-  const relative = path.relative(expectedRoot, target);
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+  if (!isManagedWorktreePath(target)) {
     throw new Error(`Refusing to remove unexpected K3 worktree path: ${target}`);
   }
   if (fs.existsSync(target)) {
@@ -344,7 +389,7 @@ function removeGitWorktree(workspace, deleteBranch = false) {
   }
   runCommand("git", ["-C", workspace.source_repo, "worktree", "prune"]);
   if (deleteBranch && workspace.branch) {
-    runGit(workspace.source_repo, ["branch", "-D", workspace.branch]);
+    deleteK3Branch(workspace.source_repo, workspace.branch);
   }
   workspace.worktree_active = false;
 }
@@ -705,6 +750,172 @@ function readJobRecord(sessionId) {
   return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
 }
 
+function readJobRecords() {
+  if (!fs.existsSync(JOB_ROOT)) return [];
+  const records = [];
+  for (const entry of fs.readdirSync(JOB_ROOT, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json") || entry.name === "latest.json") continue;
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(JOB_ROOT, entry.name), "utf8"));
+      if (record?.session_id) records.push(record);
+    } catch {
+      // Ignore incomplete records; prune will still report registered orphan worktrees.
+    }
+  }
+  return records;
+}
+
+function registeredGitWorktrees(repo) {
+  const result = runCommand("git", ["-C", repo, "worktree", "list", "--porcelain", "-z"]);
+  if (result.error || result.status !== 0) return [];
+  const worktrees = [];
+  let current = null;
+  for (const field of result.stdout.split("\0")) {
+    if (field.startsWith("worktree ")) {
+      if (current) worktrees.push(current);
+      current = { worktree_root: field.slice(9), branch: null };
+    } else if (current && field.startsWith("branch refs/heads/")) {
+      current.branch = field.slice("branch refs/heads/".length);
+    } else if (!field && current) {
+      worktrees.push(current);
+      current = null;
+    }
+  }
+  if (current) worktrees.push(current);
+  return worktrees;
+}
+
+function k3Branches(repo) {
+  const result = runCommand("git", ["-C", repo, "branch", "--format=%(refname:short)", "--list", "codex-k3/*"]);
+  if (result.error || result.status !== 0) return [];
+  return result.stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+}
+
+export function pruneExecutionResources(deleteResources = false, targetSessionId = null) {
+  if (deleteResources && !String(targetSessionId || "").trim()) {
+    throw new Error("Deleting K3 resources requires an explicit session id.");
+  }
+  const records = readJobRecords();
+  const recordsByRoot = new Map();
+  const recordsByBranch = new Map();
+  const repositories = new Map();
+  for (const record of records) {
+    const workspace = record.workspace;
+    if (workspace?.worktree_root) recordsByRoot.set(pathIdentity(workspace.worktree_root), record);
+    if (workspace?.source_repo && workspace?.branch) {
+      recordsByBranch.set(`${pathIdentity(workspace.source_repo)}\0${workspace.branch}`, record);
+    }
+    if (workspace?.source_repo) repositories.set(pathIdentity(workspace.source_repo), workspace.source_repo);
+  }
+
+  const candidates = [];
+  const registeredRoots = new Set();
+  for (const repo of repositories.values()) {
+    const repoKey = pathIdentity(repo);
+    const worktrees = registeredGitWorktrees(repo);
+    for (const worktree of worktrees) {
+      const target = path.resolve(worktree.worktree_root);
+      if (!isManagedWorktreePath(target)) continue;
+      registeredRoots.add(pathIdentity(target));
+      const record = recordsByRoot.get(pathIdentity(target)) || null;
+      const state = record?.integration?.state || null;
+      const protectedResource = !record || !record.complete || PRESERVED_WORKTREE_STATES.has(state);
+      candidates.push({
+        type: "worktree",
+        source_repo: repo,
+        worktree_root: target,
+        branch: worktree.branch,
+        session_id: record?.session_id || null,
+        integration_state: state,
+        deletable: !protectedResource,
+        reason: !record ? "missing-record" : protectedResource ? "active-or-preserved" : "terminal-record"
+      });
+    }
+
+    const registeredBranches = new Set(worktrees.map((item) => item.branch).filter(Boolean));
+    for (const branch of k3Branches(repo)) {
+      if (registeredBranches.has(branch)) continue;
+      const record = recordsByBranch.get(`${repoKey}\0${branch}`) || null;
+      const state = record?.integration?.state || null;
+      const protectedResource = !record || !record.complete || PRESERVED_WORKTREE_STATES.has(state);
+      candidates.push({
+        type: "branch",
+        source_repo: repo,
+        worktree_root: record?.workspace?.worktree_root || null,
+        branch,
+        session_id: record?.session_id || null,
+        integration_state: state,
+        deletable: !protectedResource,
+        reason: !record ? "missing-record" : protectedResource ? "active-or-preserved" : "terminal-record"
+      });
+    }
+  }
+
+  if (fs.existsSync(WORKTREE_ROOT)) {
+    for (const entry of fs.readdirSync(WORKTREE_ROOT, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const target = path.join(WORKTREE_ROOT, entry.name);
+      if (registeredRoots.has(pathIdentity(target))) continue;
+      const record = recordsByRoot.get(pathIdentity(target)) || null;
+      const state = record?.integration?.state || null;
+      const empty = fs.readdirSync(target).length === 0;
+      const deletable = Boolean(
+        empty &&
+        record?.complete &&
+        !PRESERVED_WORKTREE_STATES.has(state)
+      );
+      candidates.push({
+        type: "unowned_directory",
+        source_repo: null,
+        worktree_root: target,
+        branch: null,
+        session_id: record?.session_id || null,
+        integration_state: state,
+        deletable,
+        reason: deletable
+          ? "empty-terminal-directory"
+          : record
+            ? "non-empty-or-preserved-directory"
+            : "not-registered-with-a-known-repository"
+      });
+    }
+  }
+
+  const deleted = [];
+  const errors = [];
+  if (deleteResources) {
+    for (const candidate of candidates) {
+      if (!candidate.deletable || candidate.session_id !== targetSessionId) continue;
+      try {
+        if (candidate.type === "worktree") {
+          removeGitWorktree({
+            source_repo: candidate.source_repo,
+            worktree_root: candidate.worktree_root,
+            branch: candidate.branch
+          }, true);
+        } else if (candidate.type === "branch") {
+          deleteK3Branch(candidate.source_repo, candidate.branch);
+        } else if (candidate.type === "unowned_directory") {
+          fs.rmdirSync(candidate.worktree_root);
+        }
+        candidate.deleted = true;
+        deleted.push(candidate);
+      } catch (error) {
+        candidate.delete_error = error instanceof Error ? error.message : String(error);
+        errors.push(candidate);
+      }
+    }
+  }
+
+  return {
+    kind: "kimi-k3-prune",
+    delete_requested: Boolean(deleteResources),
+    candidates,
+    deleted,
+    errors
+  };
+}
+
 function requireSessionId(options) {
   const sessionId = options.sessionId?.trim();
   if (!sessionId) {
@@ -747,6 +958,11 @@ export async function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths,
     throw new Error(`Working directory is outside its reported Git root: ${sourceRoot}`);
   }
   const allowedRepoPaths = allowedSourcePaths.map((item) => gitPath(path.relative(repo, item)));
+  const head = runCommand("git", ["-C", repo, "rev-parse", "--verify", "HEAD"]);
+  if (head.error || head.status !== 0) {
+    throw new Error("Git execute mode requires at least one commit to create an isolated worktree.");
+  }
+  const baseCommit = head.stdout.trim();
   const dirtyPaths = gitDirtyPaths(repo);
   const overlaps = dirtyPaths.filter((dirty) => allowedRepoPaths.some((allowed) => pathsOverlap(dirty, allowed)));
   if (overlaps.length > 0) {
@@ -756,7 +972,6 @@ export async function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths,
     );
   }
 
-  const baseCommit = runGit(repo, ["rev-parse", "HEAD"]).trim();
   const id = `${Date.now()}-${randomUUID().slice(0, 8)}`;
   const branch = `codex-k3/${id}`;
   const worktreeRoot = path.join(WORKTREE_ROOT, id);
@@ -817,7 +1032,19 @@ export async function restoreExecutionWorkspace(record, getOwnerStatus = getJobS
   if (workspace?.isolation !== "git-worktree") return;
   if (workspace.worktree_active && fs.existsSync(workspace.worktree_root)) return;
   workspace.worktree_active = false;
-  runGit(workspace.source_repo, ["worktree", "add", workspace.worktree_root, workspace.branch], { timeout: 60000 });
+  runCommand("git", ["-C", workspace.source_repo, "worktree", "prune"]);
+  const branchRef = `refs/heads/${workspace.branch}`;
+  const branch = runCommand("git", ["-C", workspace.source_repo, "show-ref", "--verify", "--quiet", branchRef]);
+  if (branch.error || ![0, 1].includes(branch.status)) {
+    throw new Error(branch.stderr || `Unable to inspect K3 branch ${workspace.branch}.`);
+  }
+  runGit(
+    workspace.source_repo,
+    branch.status === 0
+      ? ["worktree", "add", workspace.worktree_root, workspace.branch]
+      : ["worktree", "add", "-b", workspace.branch, workspace.worktree_root, workspace.base_commit],
+    { timeout: 60000 }
+  );
   workspace.worktree_active = true;
   workspace.cwd = path.join(
     workspace.worktree_root,
@@ -912,7 +1139,7 @@ export function finalizeExecutionWorkspace(record) {
       changed_paths: []
     };
     try {
-      removeGitWorktree(workspace);
+      removeGitWorktree(workspace, true);
     } catch (error) {
       record.integration.cleanup_error = error instanceof Error ? error.message : String(error);
     }
@@ -1066,7 +1293,7 @@ async function startJob(options) {
   const readOnly = options.mode === "analyze";
   let allowedOriginal = null;
   if (!readOnly) {
-    const items = options.allowedPaths.flatMap((value) => value.split(";")).map((value) => value.trim()).filter(Boolean);
+    const items = options.allowedPaths.map((value) => value.trim()).filter(Boolean);
     if (items.length === 0) {
       throw new Error("Execution mode requires at least one --allowed-path.");
     }
@@ -1177,7 +1404,7 @@ async function startJob(options) {
 async function sendMessage(options) {
   const sessionId = requireSessionId(options);
   const prompt = readPromptInput(options);
-  const record = readJobRecord(sessionId);
+  let record = readJobRecord(sessionId);
   if (!record) {
     throw new Error(`No persisted Kimi K3 job was found for ${sessionId}.`);
   }
@@ -1191,8 +1418,15 @@ async function sendMessage(options) {
 
   const readOnly = record.mode !== "execute";
   let previousIntegration = null;
+  let previousFinalizedFor = null;
   let preserveWorktreeOnSendFailure = false;
   if (!readOnly) {
+    if (!record.integration) {
+      ({ record } = await syncJobRecord(sessionId, record, true));
+      if (!record.integration) {
+        throw new Error(`The previous K3 execute turn is not ready for a follow-up in ${sessionId}.`);
+      }
+    }
     if (["scope_violation", "integration_error"].includes(record.integration?.state)) {
       throw new Error(`K3 execute workspace requires manual review after ${record.integration.state}; refusing a follow-up turn.`);
     }
@@ -1206,6 +1440,7 @@ async function sendMessage(options) {
     if (record.workspace?.isolation === "git-worktree") {
       record.workspace.base_commit = runGit(record.workspace.worktree_root, ["rev-parse", "HEAD"]).trim();
     }
+    previousFinalizedFor = record.workspace?.turn_finalized_for ?? null;
     record.workspace.turn_finalized_for = null;
     bindSingleWriter(record.workspace, sessionId);
     writeJobRecord(record);
@@ -1230,10 +1465,11 @@ async function sendMessage(options) {
         record.integration = previousIntegration;
         record.integration_history = (record.integration_history || []).slice(0, -1);
       }
+      record.workspace.turn_finalized_for = previousFinalizedFor;
       if (record.workspace?.isolation === "single-writer") releaseSingleWriter(record.workspace);
       if (record.workspace?.isolation === "git-worktree" && !preserveWorktreeOnSendFailure) {
         try {
-          removeGitWorktree(record.workspace);
+          removeGitWorktree(record.workspace, previousIntegration?.state === "no_changes");
         } catch {}
       }
       writeJobRecord(record);
@@ -1445,14 +1681,6 @@ export function eventMatchesCurrentPrompt(record, event) {
   const eventPromptId = String(event?.payload?.promptId || event?.payload?.prompt_id || "").trim();
   const recordPromptId = String(record?.prompt_id || "").trim();
   return !eventPromptId || !recordPromptId || eventPromptId === recordPromptId;
-}
-
-function terminalProviderFailure(event) {
-  if (event?.type !== "error" || !event.session_id) return null;
-  const payload = event.payload || {};
-  const code = String(payload.code || payload.type || "").trim();
-  if (!code.startsWith("provider.")) return null;
-  return payload.fatal === true || TERMINAL_PROVIDER_ERROR_CODES.has(code) ? payload : null;
 }
 
 export function applyK3Event(record, event) {
@@ -1713,6 +1941,11 @@ async function main() {
     }
     const record = JSON.parse(fs.readFileSync(latest, "utf8"));
     printOutput(record, options.outputFormat);
+    return;
+  }
+
+  if (options.action === "prune") {
+    printOutput(pruneExecutionResources(options.deleteResources, options.sessionId), options.outputFormat);
     return;
   }
 

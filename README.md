@@ -132,6 +132,14 @@ In a Git project, `allowed_paths` are translated into K3's isolated worktree. Ex
 
 Review the returned commit with Git, then cherry-pick it only when appropriate. The plugin intentionally performs no automatic integration. Follow-up K3 turns recreate the same isolated worktree from the handoff branch and produce another scoped commit.
 
+The handoff includes the preserved worktree path when manual review is required. To inspect leftover plugin-managed resources without deleting anything:
+
+```sh
+node scripts/kimi-k3.mjs prune
+```
+
+After reviewing the list, target one completed handoff explicitly with `prune --delete --session-id <session-id>`. Active sessions and `scope_violation`, `integration_error`, or `unintegrated_ignored_files` worktrees are always preserved. Missing-record and non-empty unregistered resources are reported but never deleted automatically; a known terminal worktree directory is removed only when it is already empty.
+
 ## Receive K3 in Codex
 
 After Codex finishes its own complementary subtask, it waits for K3 once:
@@ -180,6 +188,6 @@ npm run check
 npm test
 ```
 
-`npm test` uses a fake Kimi REST/WebSocket server and requires no Kimi login. Run `npm run test:real-kimi` for the optional real session/prompt/WebSocket/result handoff against the installed, authenticated Kimi Code service; it consumes one model request.
+`npm test` uses a fake Kimi REST/WebSocket server and requires no Kimi login. It exercises the real MCP server and bridge through analyze and isolated execute handoffs. CI runs the portable and fake-Kimi suites on Windows, macOS, and Ubuntu across the minimum Node.js 18.18 runtime and supported Node.js LTS releases. Run `npm run test:real-kimi` for the optional real session/prompt/WebSocket/result handoff against the installed, authenticated Kimi Code service; it consumes one model request.
 
 Register that directory as `kimi-k3-collab` in the personal Codex marketplace, install `kimi-k3-collab@personal`, and start a new Codex task so the updated skill, tools, and MCP resource are loaded.
