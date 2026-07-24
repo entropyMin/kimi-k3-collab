@@ -384,7 +384,9 @@ try {
     fs.existsSync(orphanRoot) ||
     !fs.existsSync(unknownRoot) ||
     checkedGit(isolationFixture, ["branch", "--list", orphanBranch]) ||
-    !prunedResources.deleted.some((candidate) => samePath(candidate.worktree_root, orphanRoot))
+    !prunedResources.deleted.some((candidate) =>
+      candidate.type === "worktree" && candidate.session_id === orphanSessionId
+    )
   ) {
     throw new Error(`Session-targeted prune did not remove only the selected worktree: ${JSON.stringify({
       scoped_exists: fs.existsSync(scoped.workspace.worktree_root),
@@ -423,7 +425,9 @@ try {
   const prunedEmptyDirectory = pruneExecutionResources(true, emptySessionId);
   if (
     fs.existsSync(emptyRoot) ||
-    !prunedEmptyDirectory.deleted.some((candidate) => samePath(candidate.worktree_root, emptyRoot)) ||
+    !prunedEmptyDirectory.deleted.some((candidate) =>
+      candidate.type === "unowned_directory" && candidate.session_id === emptySessionId
+    ) ||
     prunedEmptyDirectory.errors.length !== 0
   ) {
     throw new Error("Session-targeted prune did not remove a known empty terminal directory.");
