@@ -18,6 +18,7 @@ const BRIDGE = path.resolve(process.env.KIMI_K3_BRIDGE || path.join(ROOT, "scrip
 const KIMI_HOME = path.resolve(process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code"));
 const JOB_ROOT = path.join(KIMI_HOME, "codex-jobs");
 const LOCK_FILE = path.join(KIMI_HOME, "server", "lock");
+const INSTANCE_ROOT = path.join(KIMI_HOME, "server", "instances");
 const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
 const PANEL_FILE = path.join(ROOT, "assets", "k3-panel.html");
 const PANEL_URI = "ui://kimi-k3/live-session-v3.html";
@@ -263,21 +264,51 @@ function latestSessionId() {
 }
 
 function readPanelService() {
-  const lock = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
-  const host = String(lock.host ?? "");
-  const port = Number(lock.port);
-  if (!LOOPBACK_HOSTS.has(host)) throw new Error(`Refusing non-loopback Kimi server host: ${host}`);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Kimi server lock has an invalid port.");
+  const descriptors = [];
+  const readDescriptor = (filename) => {
+    try {
+      const value = JSON.parse(fs.readFileSync(filename, "utf8"));
+      descriptors.push({
+        ...value,
+        freshness: Number(value.heartbeat_at ?? value.started_at ?? 0)
+      });
+    } catch {
+      // Ignore incomplete discovery files and try the remaining candidates.
+    }
+  };
+  if (fs.existsSync(LOCK_FILE)) readDescriptor(LOCK_FILE);
+  if (fs.existsSync(INSTANCE_ROOT)) {
+    for (const entry of fs.readdirSync(INSTANCE_ROOT, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith(".json")) {
+        readDescriptor(path.join(INSTANCE_ROOT, entry.name));
+      }
+    }
+  }
+  descriptors.sort((left, right) => right.freshness - left.freshness);
+  if (!descriptors.length) throw new Error("Kimi server discovery record is missing.");
+
   const token = fs.readFileSync(TOKEN_FILE, "utf8").trim();
   if (!token) throw new Error("Kimi server token is empty.");
-  const urlHost = host === "::1" ? "[::1]" : host;
-  return {
-    origin: `http://${urlHost}:${port}`,
-    token,
-    host,
-    port,
-    headers: { Authorization: `Bearer ${token}` }
-  };
+  let refusedHost = null;
+  for (const descriptor of descriptors) {
+    const host = String(descriptor.host ?? "");
+    if (!LOOPBACK_HOSTS.has(host)) {
+      refusedHost ||= host;
+      continue;
+    }
+    const port = Number(descriptor.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
+    const urlHost = host === "::1" ? "[::1]" : host;
+    return {
+      origin: `http://${urlHost}:${port}`,
+      token,
+      host,
+      port,
+      headers: { Authorization: `Bearer ${token}` }
+    };
+  }
+  if (refusedHost) throw new Error(`Refusing non-loopback Kimi server host: ${refusedHost}`);
+  throw new Error("Kimi server discovery has no valid loopback instance.");
 }
 
 async function ensurePanelService(requestId) {
@@ -588,10 +619,16 @@ class SessionRelay {
 function relayFor(sessionId, mode = null) {
   let relay = relays.get(sessionId);
   if (!relay) {
+    if (!["analyze", "execute"].includes(mode)) {
+      throw new Error(`Cannot start the K3 event relay without a persisted session mode.`);
+    }
     relay = new SessionRelay(sessionId, mode);
     relays.set(sessionId, relay);
   }
-  if (mode) relay.mode = mode;
+  if (mode) {
+    if (!["analyze", "execute"].includes(mode)) throw new Error(`Invalid K3 relay mode: ${mode}.`);
+    relay.mode = mode;
+  }
   relay.start();
   return relay;
 }
@@ -645,8 +682,8 @@ function panelToolResult(sessionId, service, details, text) {
 
 async function startCollaboration(requestId, rawArguments) {
   const input = parseJobArguments(rawArguments);
-  const job = await startJob(requestId, input);
   const service = await ensurePanelService(requestId);
+  const job = await startJob(requestId, input);
   relayFor(job.session_id, job.mode);
   const details = structuredJob(job);
   const text = [
@@ -710,9 +747,17 @@ async function receiveK3Events(requestId, rawArguments) {
   if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 55000) {
     throw new Error("wait_ms must be an integer from 0 through 55000.");
   }
+  let relay = relays.get(sessionId);
+  if (!relay) {
+    const status = await runBridgeJson(
+      requestId,
+      ["status", "--format", "json", "--session-id", sessionId]
+    );
+    relay = relayFor(sessionId, status.mode);
+  }
   return {
     content: [],
-    structuredContent: await relayFor(sessionId).receive(requestId, afterCursor, waitMs)
+    structuredContent: await relay.receive(requestId, afterCursor, waitMs)
   };
 }
 
