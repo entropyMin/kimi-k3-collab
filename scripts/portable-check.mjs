@@ -386,7 +386,14 @@ try {
     checkedGit(isolationFixture, ["branch", "--list", orphanBranch]) ||
     !prunedResources.deleted.some((candidate) => samePath(candidate.worktree_root, orphanRoot))
   ) {
-    throw new Error("Session-targeted prune did not remove only the selected worktree.");
+    throw new Error(`Session-targeted prune did not remove only the selected worktree: ${JSON.stringify({
+      scoped_exists: fs.existsSync(scoped.workspace.worktree_root),
+      orphan_exists: fs.existsSync(orphanRoot),
+      unknown_exists: fs.existsSync(unknownRoot),
+      orphan_branch: checkedGit(isolationFixture, ["branch", "--list", orphanBranch]),
+      deleted: prunedResources.deleted,
+      errors: prunedResources.errors
+    })}`);
   }
   const originalRmdirSync = fs.rmdirSync;
   fs.rmdirSync = (target) => {
