@@ -327,7 +327,10 @@ function checkedGit(args) {
   return result.stdout.trim();
 }
 
-async function runMcpFullChain(mode = "analyze", { writeExecuteChange = true } = {}) {
+async function runMcpFullChain(
+  mode = "analyze",
+  { writeExecuteChange = true, failFollowupBeforeAwait = false } = {}
+) {
   executeWritesChange = writeExecuteChange;
   const child = spawn(process.execPath, [mcpServer], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -402,12 +405,21 @@ async function runMcpFullChain(mode = "analyze", { writeExecuteChange = true } =
       cursor = batch?.cursor ?? cursor;
       events.push(...(batch?.events || []));
     }
+    let failedFollowup = null;
+    if (failFollowupBeforeAwait) {
+      rejectNextPrompt = true;
+      failedFollowup = await request("tools/call", {
+        name: "send_k3_message",
+        arguments: { session_id: sessionId, prompt: "This fake follow-up must fail." }
+      });
+    }
     const awaited = await request("tools/call", {
       name: "await_k3_result",
       arguments: { session_id: sessionId, wait_seconds: 5 }
     });
     if (
       !events.some((event) => event.type === "prompt.completed") ||
+      (failFollowupBeforeAwait && !failedFollowup?.result?.isError) ||
       awaited.result?.structuredContent?.complete !== true ||
       !awaited.result?.structuredContent?.result_markdown?.includes(mode === "execute" ? "# Execute K3 report" : "# Fake K3 report") ||
       (mode === "analyze" && !approvalRejected) ||
@@ -595,7 +607,7 @@ try {
   promptCount = 0;
   activePromptId = successPromptId;
   profile = null;
-  await runMcpFullChain("execute");
+  await runMcpFullChain("execute", { failFollowupBeforeAwait: true });
   if (
     fs.readFileSync(path.join(fixtureCwd, "feature.txt"), "utf8") !== "base\n" ||
     fs.readFileSync(path.join(fixtureCwd, "semi;colon.txt"), "utf8") !== "base semicolon\n" ||
@@ -636,9 +648,16 @@ try {
     path.join(temporaryHome, "codex-jobs", `${sessionId}.json`),
     "utf8"
   ));
+  const rereadNoChange = await runBridge([
+    "result",
+    "--session-id", sessionId,
+    "--wait-seconds", "0"
+  ]);
   if (
     !failedNoChangeFollowup?.message.includes("fake prompt submission failure") ||
     noChangeRecord.integration?.state !== "no_changes" ||
+    rereadNoChange.integration?.state !== "no_changes" ||
+    rereadNoChange.error ||
     fs.existsSync(noChangeRecord.workspace?.worktree_root) ||
     checkedGit(["branch", "--list", "codex-k3/*"])
   ) {

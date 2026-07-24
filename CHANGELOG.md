@@ -22,7 +22,7 @@
 - Reuse durable Provider terminal-error classification in the live relay without reconnect churn.
 - Close idle relays while their WebSocket remains healthy.
 - Remove no-change worktree branches and recreate follow-up worktrees from the persisted base commit.
-- Roll back a temporarily recreated no-change branch when follow-up prompt submission fails.
+- Finalize an unread execute handoff before follow-up and restore the prior handoff when prompt submission fails.
 - Return preserved worktree paths with manual review guidance.
 - Add conservative orphan inspection and session-targeted worktree or branch cleanup.
 - Remove known terminal worktree directories only when they are already empty.

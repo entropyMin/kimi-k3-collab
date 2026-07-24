@@ -158,6 +158,18 @@ function checkedGit(cwd, args) {
   return result.stdout.trim();
 }
 
+function samePath(left, right) {
+  const identity = (value) => {
+    let resolved = path.resolve(value);
+    try {
+      resolved = fs.realpathSync.native(resolved);
+    } catch {}
+    if (process.platform === "darwin") resolved = resolved.normalize("NFC");
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  return identity(left) === identity(right);
+}
+
 const isolationFixture = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-isolation-"));
 try {
   checkedGit(isolationFixture, ["init"]);
@@ -329,23 +341,23 @@ try {
     !untargetedPruneError?.message.includes("explicit session id") ||
     !prunePreview.candidates.some((candidate) =>
       candidate.type === "worktree" &&
-      candidate.worktree_root === scoped.workspace.worktree_root &&
+      samePath(candidate.worktree_root, scoped.workspace.worktree_root) &&
       !candidate.deletable
     ) ||
     !prunePreview.candidates.some((candidate) =>
       candidate.type === "worktree" &&
-      candidate.worktree_root === orphanRoot &&
+      samePath(candidate.worktree_root, orphanRoot) &&
       candidate.deletable
     ) ||
     !prunePreview.candidates.some((candidate) =>
       candidate.type === "worktree" &&
-      candidate.worktree_root === unknownRoot &&
+      samePath(candidate.worktree_root, unknownRoot) &&
       !candidate.deletable &&
       candidate.reason === "missing-record"
     ) ||
     !prunePreview.candidates.some((candidate) =>
       candidate.type === "unowned_directory" &&
-      candidate.worktree_root === emptyRoot &&
+      samePath(candidate.worktree_root, emptyRoot) &&
       candidate.deletable &&
       candidate.reason === "empty-terminal-directory"
     )
@@ -358,7 +370,7 @@ try {
     fs.existsSync(orphanRoot) ||
     !fs.existsSync(unknownRoot) ||
     checkedGit(isolationFixture, ["branch", "--list", orphanBranch]) ||
-    !prunedResources.deleted.some((candidate) => candidate.worktree_root === orphanRoot)
+    !prunedResources.deleted.some((candidate) => samePath(candidate.worktree_root, orphanRoot))
   ) {
     throw new Error("Session-targeted prune did not remove only the selected worktree.");
   }
@@ -381,7 +393,7 @@ try {
     !fs.existsSync(emptyRoot) ||
     busyEmptyDirectory.deleted.length !== 0 ||
     !busyEmptyDirectory.errors.some((candidate) =>
-      candidate.worktree_root === emptyRoot &&
+      samePath(candidate.worktree_root, emptyRoot) &&
       candidate.delete_error.includes("fixture directory is busy")
     )
   ) {
@@ -390,7 +402,7 @@ try {
   const prunedEmptyDirectory = pruneExecutionResources(true, emptySessionId);
   if (
     fs.existsSync(emptyRoot) ||
-    !prunedEmptyDirectory.deleted.some((candidate) => candidate.worktree_root === emptyRoot) ||
+    !prunedEmptyDirectory.deleted.some((candidate) => samePath(candidate.worktree_root, emptyRoot)) ||
     prunedEmptyDirectory.errors.length !== 0
   ) {
     throw new Error("Session-targeted prune did not remove a known empty terminal directory.");

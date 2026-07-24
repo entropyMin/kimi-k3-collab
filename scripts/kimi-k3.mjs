@@ -1401,7 +1401,7 @@ async function startJob(options) {
 async function sendMessage(options) {
   const sessionId = requireSessionId(options);
   const prompt = readPromptInput(options);
-  const record = readJobRecord(sessionId);
+  let record = readJobRecord(sessionId);
   if (!record) {
     throw new Error(`No persisted Kimi K3 job was found for ${sessionId}.`);
   }
@@ -1415,8 +1415,15 @@ async function sendMessage(options) {
 
   const readOnly = record.mode !== "execute";
   let previousIntegration = null;
+  let previousFinalizedFor = null;
   let preserveWorktreeOnSendFailure = false;
   if (!readOnly) {
+    if (!record.integration) {
+      ({ record } = await syncJobRecord(sessionId, record, true));
+      if (!record.integration) {
+        throw new Error(`The previous K3 execute turn is not ready for a follow-up in ${sessionId}.`);
+      }
+    }
     if (["scope_violation", "integration_error"].includes(record.integration?.state)) {
       throw new Error(`K3 execute workspace requires manual review after ${record.integration.state}; refusing a follow-up turn.`);
     }
@@ -1430,6 +1437,7 @@ async function sendMessage(options) {
     if (record.workspace?.isolation === "git-worktree") {
       record.workspace.base_commit = runGit(record.workspace.worktree_root, ["rev-parse", "HEAD"]).trim();
     }
+    previousFinalizedFor = record.workspace?.turn_finalized_for ?? null;
     record.workspace.turn_finalized_for = null;
     bindSingleWriter(record.workspace, sessionId);
     writeJobRecord(record);
@@ -1454,6 +1462,7 @@ async function sendMessage(options) {
         record.integration = previousIntegration;
         record.integration_history = (record.integration_history || []).slice(0, -1);
       }
+      record.workspace.turn_finalized_for = previousFinalizedFor;
       if (record.workspace?.isolation === "single-writer") releaseSingleWriter(record.workspace);
       if (record.workspace?.isolation === "git-worktree" && !preserveWorktreeOnSendFailure) {
         try {
