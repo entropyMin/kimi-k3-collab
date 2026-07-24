@@ -750,8 +750,10 @@ async function getJobResult(requestId, rawArguments) {
   }
   const status = normalizeStatus(record.state || record.status || "running");
   const complete = Boolean(record.complete) || TERMINAL_STATUSES.has(status);
-  const report = typeof record.result === "string" && record.result.trim()
-    ? record.result.trim()
+  const report = record.error
+    ? `Kimi K3 collaboration failed: ${record.error}`
+    : typeof record.result === "string" && record.result.trim()
+      ? record.result.trim()
     : complete
       ? `Kimi K3 returned ${status} without a Markdown report.`
       : "Kimi K3 is still working.";
@@ -767,7 +769,9 @@ async function getJobResult(requestId, rawArguments) {
       focus: record.focus || null,
       server_reported_model: model,
       verified_k3: true,
-      result_markdown: typeof record.result === "string" && record.result.trim() ? record.result.trim() : null,
+      error: record.error || null,
+      error_code: record.error_code || null,
+      result_markdown: !record.error && typeof record.result === "string" && record.result.trim() ? record.result.trim() : null,
       ...handoff.structured
     }
   };
@@ -791,8 +795,10 @@ async function awaitK3Result(requestId, rawArguments) {
   const status = normalizeStatus(record.state || record.status || "running");
   const complete = Boolean(record.complete) || TERMINAL_STATUSES.has(status);
   const handoffReady = complete || status === "blocked";
-  const report = handoffReady && typeof record.result === "string" && record.result.trim()
-    ? record.result.trim()
+  const report = handoffReady && record.error
+    ? `Kimi K3 collaboration failed: ${record.error}`
+    : handoffReady && typeof record.result === "string" && record.result.trim()
+      ? record.result.trim()
     : handoffReady
       ? `Kimi K3 returned ${status} without a Markdown report.`
       : "Kimi K3 is still working. If useful independent Codex work remains, do only that. Otherwise let the trusted Stop hook perform the longer event wait. If the hook is unavailable, make one later await without filler work; if K3 is still running, tell the user once and ask whether to keep waiting or cancel. During automatic waiting, do not narrate the same waiting state, inspect Git/status as filler, or use get_k3_status/get_k3_result for polling.";
@@ -808,7 +814,9 @@ async function awaitK3Result(requestId, rawArguments) {
       focus: record.focus || null,
       server_reported_model: model,
       verified_k3: true,
-      result_markdown: handoffReady && typeof record.result === "string" && record.result.trim()
+      error: record.error || null,
+      error_code: record.error_code || null,
+      result_markdown: handoffReady && !record.error && typeof record.result === "string" && record.result.trim()
         ? record.result.trim()
         : null,
       ...handoff.structured

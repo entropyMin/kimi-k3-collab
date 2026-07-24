@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,18 +11,20 @@ import { connectLocalWebSocket } from "./lib/local-websocket.mjs";
 import { READ_ONLY_TOOLS, isReadOnlyTool } from "./lib/k3-policy.mjs";
 
 const K3_MODEL = "kimi-code/k3";
-const TESTED_KIMI_CODE_VERSIONS = new Set(["0.26.0"]);
+const TESTED_KIMI_CODE_VERSIONS = new Set(["0.26.0", "0.29.0"]);
 const KIMI_HOME = path.resolve(process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code"));
 const JOB_ROOT = path.join(KIMI_HOME, "codex-jobs");
 const WORKTREE_ROOT = path.join(KIMI_HOME, "codex-worktrees");
 const WRITE_LOCK_ROOT = path.join(JOB_ROOT, "write-locks");
 const LOCK_FILE = path.join(KIMI_HOME, "server", "lock");
+const INSTANCE_ROOT = path.join(KIMI_HOME, "server", "instances");
 const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMPLETE_STATES = new Set(["completed", "cancelled", "failed", "error", "stopped", "end_turn"]);
 const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped"]);
 const PROMPT_TERMINAL_EVENTS = new Set(["prompt.completed", "prompt.aborted"]);
-const CHECKPOINT_EVENTS = new Set(["turn.ended", ...PROMPT_TERMINAL_EVENTS]);
+const CHECKPOINT_EVENTS = new Set(["turn.ended", "error", ...PROMPT_TERMINAL_EVENTS]);
+const TERMINAL_PROVIDER_ERROR_CODES = new Set(["provider.api_error", "provider.rate_limit"]);
 const PROCESS_DEADLINE = Date.now() + 115000;
 const STREAM_EXIT_RESERVE_MS = 10000;
 
@@ -347,37 +349,110 @@ function removeGitWorktree(workspace, deleteBranch = false) {
   workspace.worktree_active = false;
 }
 
-function releaseSingleWriter(workspace) {
-  if (!workspace?.lock_path || !fs.existsSync(workspace.lock_path)) return;
-  const ownerFile = path.join(workspace.lock_path, "owner.json");
-  let owner = null;
+function readSingleWriterOwner(lockPath) {
+  const ownerFile = path.join(lockPath, "owner.json");
   try {
-    owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
-  } catch {}
-  if (owner?.token && owner.token !== workspace.lock_token) return;
-  fs.rmSync(workspace.lock_path, { recursive: true, force: true });
+    return JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function removeSingleWriterLock(lockPath, expectedToken = null) {
+  if (!fs.existsSync(lockPath)) return true;
+  const owner = readSingleWriterOwner(lockPath);
+  if (expectedToken ? owner?.token !== expectedToken : owner?.token || owner?.session_id) return false;
+  try {
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+function releaseSingleWriter(workspace) {
+  if (!workspace?.lock_path || !removeSingleWriterLock(workspace.lock_path, workspace.lock_token)) return;
   workspace.lock_active = false;
 }
 
-function acquireSingleWriter(cwd) {
+function singleWriterContention(canonicalCwd, detail = "") {
+  const suffix = detail ? ` ${detail}` : "";
+  return new Error(`A K3 execute session already owns the non-Git directory: ${canonicalCwd}.${suffix}`);
+}
+
+function missingKimiSession(error) {
+  return /\bsession\b[^\r\n]{0,240}\b(?:does not exist|not found)\b/i.test(String(error?.message || error));
+}
+
+async function reclaimSingleWriter(lockPath, canonicalCwd, getOwnerStatus) {
+  const owner = readSingleWriterOwner(lockPath);
+  const stat = fs.statSync(lockPath, { throwIfNoEntry: false });
+  if (!stat) return true;
+  const createdAt = Date.parse(owner?.created_at || "");
+  const age = Date.now() - (Number.isFinite(createdAt) ? createdAt : stat.mtimeMs);
+  if (!owner?.session_id) {
+    if (age <= 120000) return false;
+    return removeSingleWriterLock(lockPath, owner?.token || null);
+  }
+
+  const record = readJobRecord(owner.session_id);
+  let status = null;
+  try {
+    status = await getOwnerStatus(owner.session_id);
+  } catch (error) {
+    if (!missingKimiSession(error)) {
+      throw singleWriterContention(
+        canonicalCwd,
+        `The previous owner could not be verified, so the lock was kept: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+  if (status?.busy || (status?.pending_interaction && status.pending_interaction !== "none")) return false;
+  const terminal = !status || COMPLETE_STATES.has(status.state);
+  const expiredIdle = status?.state === "idle" && age > 120000;
+  if (!terminal && !expiredIdle) return false;
+
+  if (record) {
+    if (
+      record.workspace?.isolation !== "single-writer" ||
+      record.workspace.lock_token !== owner.token ||
+      path.resolve(record.workspace.lock_path || "") !== lockPath
+    ) {
+      throw singleWriterContention(canonicalCwd, "The previous owner record does not match the lock.");
+    }
+    if (record.complete) {
+      if (status && age <= 120000) return false;
+      return removeSingleWriterLock(lockPath, owner.token);
+    }
+    Object.assign(record, {
+      state: status?.state || "stopped",
+      complete: true,
+      updated_at: new Date().toISOString()
+    });
+    finalizeExecutionSafely(record);
+    writeJobRecord(record);
+  } else {
+    return removeSingleWriterLock(lockPath, owner.token);
+  }
+  return !fs.existsSync(lockPath);
+}
+
+async function acquireSingleWriter(cwd, getOwnerStatus) {
   const canonicalCwd = canonicalPath(cwd);
   fs.mkdirSync(WRITE_LOCK_ROOT, { recursive: true, mode: 0o700 });
   const lockPath = path.join(WRITE_LOCK_ROOT, createHash("sha256").update(canonicalCwd).digest("hex"));
-  if (fs.existsSync(lockPath)) {
-    const ownerFile = path.join(lockPath, "owner.json");
-    let owner = null;
+  while (true) {
     try {
-      owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
-    } catch {}
-    const record = owner?.session_id ? readJobRecord(owner.session_id) : null;
-    const age = Date.now() - fs.statSync(lockPath).mtimeMs;
-    if (record?.complete || (!record && age > 120000)) {
-      fs.rmSync(lockPath, { recursive: true, force: true });
-    } else {
-      throw new Error(`A K3 execute session already owns the non-Git directory: ${canonicalCwd}`);
+      fs.mkdirSync(lockPath);
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      if (!await reclaimSingleWriter(lockPath, canonicalCwd, getOwnerStatus)) {
+        throw singleWriterContention(canonicalCwd);
+      }
     }
   }
-  fs.mkdirSync(lockPath);
   const token = randomUUID();
   writeJsonFile(path.join(lockPath, "owner.json"), {
     token,
@@ -420,42 +495,116 @@ async function fetchJson(url, options = {}, timeoutMs = 20000) {
   }
 }
 
+function serviceDescriptors() {
+  const descriptors = [];
+  const readDescriptor = (filename) => {
+    try {
+      const value = JSON.parse(fs.readFileSync(filename, "utf8"));
+      descriptors.push({
+        ...value,
+        version: value.version ?? value.host_version ?? "",
+        freshness: Number(value.heartbeat_at ?? value.started_at ?? 0)
+      });
+    } catch {
+      // Ignore incomplete or stale discovery files and try the remaining candidates.
+    }
+  };
+
+  if (fs.existsSync(LOCK_FILE)) readDescriptor(LOCK_FILE);
+  if (fs.existsSync(INSTANCE_ROOT)) {
+    for (const entry of fs.readdirSync(INSTANCE_ROOT, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith(".json")) {
+        readDescriptor(path.join(INSTANCE_ROOT, entry.name));
+      }
+    }
+  }
+  return descriptors.sort((left, right) => right.freshness - left.freshness);
+}
+
 async function readService() {
-  if (!fs.existsSync(LOCK_FILE) || !fs.existsSync(TOKEN_FILE)) {
+  const descriptors = serviceDescriptors();
+  if (!descriptors.length || !fs.existsSync(TOKEN_FILE)) {
     return null;
   }
 
-  try {
-    const lock = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
-    const host = String(lock.host ?? "");
+  const token = fs.readFileSync(TOKEN_FILE, "utf8").trim();
+  if (!token) return null;
+  let refusedHost = null;
+  for (const descriptor of descriptors) {
+    const host = String(descriptor.host ?? "");
     if (!LOOPBACK_HOSTS.has(host)) {
-      throw new Error(`Refusing non-loopback Kimi server host: ${host}`);
+      refusedHost ||= host;
+      continue;
     }
-    const token = fs.readFileSync(TOKEN_FILE, "utf8").trim();
-    if (!token) {
-      return null;
+    const port = Number(descriptor.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
+    try {
+      const urlHost = host === "::1" ? "[::1]" : host;
+      const baseUrl = `http://${urlHost}:${port}`;
+      const headers = { Authorization: `Bearer ${token}` };
+      const health = await fetchJson(`${baseUrl}/api/v1/healthz`, { headers }, 3000);
+      if (health?.code !== 0) continue;
+      let meta = null;
+      try {
+        const response = await fetchJson(`${baseUrl}/api/v1/meta`, { headers }, 3000);
+        if (response?.code === 0) meta = response.data;
+      } catch {
+        // Kimi Code 0.26 does not require the optional metadata endpoint.
+      }
+      return {
+        baseUrl,
+        headers,
+        host,
+        port,
+        pid: Number(descriptor.pid) || null,
+        version: String(descriptor.version || meta?.server_version || ""),
+        capabilities: meta?.capabilities || null,
+        backend: meta?.backend || null
+      };
+    } catch {
+      // A stale instance file must not hide another live loopback instance.
     }
-    const urlHost = host === "::1" ? "[::1]" : host;
-    const baseUrl = `http://${urlHost}:${Number(lock.port)}`;
-    const headers = { Authorization: `Bearer ${token}` };
-    const health = await fetchJson(`${baseUrl}/api/v1/healthz`, { headers }, 3000);
-    if (health?.code !== 0) {
-      return null;
-    }
-    return {
-      baseUrl,
-      headers,
-      host,
-      port: Number(lock.port),
-      pid: Number(lock.pid),
-      version: String(lock.version ?? "")
-    };
-  } catch (error) {
-    if (String(error?.message).startsWith("Refusing non-loopback")) {
-      throw error;
-    }
-    return null;
   }
+  if (refusedHost) throw new Error(`Refusing non-loopback Kimi server host: ${refusedHost}`);
+  return null;
+}
+
+export function kimiServerLaunchSpec(serverHelp) {
+  if (/^\s*run(?:\s|\[)/m.test(String(serverHelp || ""))) {
+    return {
+      args: ["server", "run", "--keep-alive", "--log-level", "warn"],
+      detached: false
+    };
+  }
+  return {
+    args: ["web", "--no-open", "--log-level", "warn"],
+    detached: true
+  };
+}
+
+async function launchKimiService(command) {
+  const help = runCommand(command, ["server", "--help"], { timeout: 10000 });
+  const launch = kimiServerLaunchSpec(`${help.stdout || ""}\n${help.stderr || ""}`);
+  if (!launch.detached) {
+    const started = runCommand(command, launch.args, { timeout: 60000 });
+    if (started.error) throw started.error;
+    if (started.status !== 0) {
+      throw new Error((started.stderr || started.stdout || `Kimi server exited with ${started.status}`).trim());
+    }
+    return;
+  }
+
+  const child = spawn(command, launch.args, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    shell: process.platform === "win32" && command === "kimi"
+  });
+  await new Promise((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  child.unref();
 }
 
 async function ensureService() {
@@ -465,13 +614,7 @@ async function ensureService() {
   }
 
   const command = resolveKimiCommand();
-  const started = runCommand(command, ["server", "run", "--keep-alive", "--log-level", "warn"], { timeout: 60000 });
-  if (started.error) {
-    throw started.error;
-  }
-  if (started.status !== 0) {
-    throw new Error((started.stderr || started.stdout || `Kimi server exited with ${started.status}`).trim());
-  }
+  await launchKimiService(command);
 
   const deadline = Math.min(Date.now() + 15000, PROCESS_DEADLINE - 1000);
   while (Date.now() < deadline) {
@@ -580,12 +723,12 @@ function verifyWithinRoot(root, candidate) {
   throw new Error(`Allowed path is outside the working directory: ${candidate}`);
 }
 
-export function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths) {
+export async function prepareExecutionWorkspace(sourceCwd, allowedAbsolutePaths, getOwnerStatus = getJobStatus) {
   const sourceRoot = canonicalPath(sourceCwd);
   const allowedSourcePaths = allowedAbsolutePaths.map((item) => verifyWithinRoot(sourceRoot, item));
   const repo = findGitRepo(sourceRoot);
   if (!repo) {
-    const lock = acquireSingleWriter(sourceRoot);
+    const lock = await acquireSingleWriter(sourceRoot, getOwnerStatus);
     return {
       cwd: sourceRoot,
       allowed: allowedSourcePaths,
@@ -664,10 +807,10 @@ function bindSingleWriter(workspace, sessionId) {
   });
 }
 
-export function restoreExecutionWorkspace(record) {
+export async function restoreExecutionWorkspace(record, getOwnerStatus = getJobStatus) {
   const workspace = record?.workspace;
   if (workspace?.isolation === "single-writer") {
-    const lock = acquireSingleWriter(workspace.source_cwd);
+    const lock = await acquireSingleWriter(workspace.source_cwd, getOwnerStatus);
     Object.assign(workspace, lock);
     return;
   }
@@ -941,7 +1084,7 @@ async function startJob(options) {
   let workspace = null;
   let scopeText = "";
   if (!readOnly) {
-    const prepared = prepareExecutionWorkspace(sourceRoot, allowedOriginal);
+    const prepared = await prepareExecutionWorkspace(sourceRoot, allowedOriginal);
     root = prepared.cwd;
     workspace = prepared.workspace;
     const allowed = prepared.allowed;
@@ -949,7 +1092,7 @@ async function startJob(options) {
   }
 
   const systemPrompt = readOnly
-    ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Do not call Bash, Shell, or another command-execution tool; use the configured read-only inspection tools instead. You may use TodoList to organize the review. Inspect relevant project files and assets as needed.\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
+    ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Do not call Bash, Shell, another command-execution tool, WebSearch, or FetchURL; use the configured local read-only inspection tools instead. You may use TodoList to organize the review. Inspect relevant project files and assets as needed.\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
     : `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe user has authorized the scoped implementation described in the task. Inspect before editing, preserve unrelated user changes, and do not touch files outside the allowed paths.${scopeText}\n${workspace?.isolation === "git-worktree" ? `You are inside an isolated Git worktree on branch ${workspace.branch}. Do not create commits, branches, merges, or additional worktrees; the collaboration bridge owns integration.` : "This is a non-Git single-writer session. Codex must pause local writes until your turn completes."}\nImplement the requested work, verify it with appropriate tests, static checks, or rendered evidence, and return the files changed, decisions made, and verification results.`;
 
   try {
@@ -1059,7 +1202,7 @@ async function sendMessage(options) {
       record.integration_history = [...(record.integration_history || []), record.integration];
       record.integration = null;
     }
-    restoreExecutionWorkspace(record);
+    await restoreExecutionWorkspace(record);
     if (record.workspace?.isolation === "git-worktree") {
       record.workspace.base_commit = runGit(record.workspace.worktree_root, ["rev-parse", "HEAD"]).trim();
     }
@@ -1103,6 +1246,8 @@ async function sendMessage(options) {
     state: String(submitted.status),
     complete: false,
     result: null,
+    error: null,
+    error_code: null,
     updated_at: new Date().toISOString()
   });
   writeJobRecord(record);
@@ -1176,14 +1321,14 @@ async function syncJobRecord(sessionId, record = readJobRecord(sessionId), settl
   };
   const observedState = String(next.state || "");
   const observedTerminal = Boolean(next.complete) || observedState === "blocked" || FAILURE_STATES.has(observedState);
-  const preserveObserved = settle && observedTerminal && !complete;
+  const preserveObserved = observedTerminal && (Boolean(next.error) || (settle && !complete));
   Object.assign(next, {
     state: preserveObserved ? observedState : status.state,
     complete: preserveObserved ? Boolean(next.complete) : complete,
     server_reported_model: status.server_reported_model,
     verified_k3: status.verified_k3,
     updated_at: new Date().toISOString(),
-    result: text ?? next.result ?? null,
+    result: next.error ? next.result ?? null : text ?? next.result ?? null,
     mode: next.mode || status.mode,
     focus: next.focus || status.focus
   });
@@ -1302,6 +1447,14 @@ export function eventMatchesCurrentPrompt(record, event) {
   return !eventPromptId || !recordPromptId || eventPromptId === recordPromptId;
 }
 
+function terminalProviderFailure(event) {
+  if (event?.type !== "error" || !event.session_id) return null;
+  const payload = event.payload || {};
+  const code = String(payload.code || payload.type || "").trim();
+  if (!code.startsWith("provider.")) return null;
+  return payload.fatal === true || TERMINAL_PROVIDER_ERROR_CODES.has(code) ? payload : null;
+}
+
 export function applyK3Event(record, event) {
   if (Number.isInteger(event?.seq)) {
     record.cursor = { seq: event.seq, ...(event.epoch ? { epoch: event.epoch } : {}) };
@@ -1309,13 +1462,29 @@ export function applyK3Event(record, event) {
   record.last_event_type = String(event?.type || "");
   record.updated_at = new Date().toISOString();
   const payload = event?.payload || {};
-  if (event?.type === "turn.started") {
+  const failure = terminalProviderFailure(event)
+    || (event?.type === "turn.ended" && payload.reason === "failed"
+      ? payload.error || payload
+      : event?.type === "prompt.completed" && payload.reason === "failed"
+        ? payload.error || payload
+        : null);
+  if (failure) {
+    const code = compact(failure.code || failure.name || "");
+    const message = compact(failure.message || payload.message || "");
+    record.state = "failed";
+    record.complete = true;
+    record.error_code = code || null;
+    record.error = [code && `[${code}]`, message || "Kimi turn failed."].filter(Boolean).join(" ");
+  } else if (event?.type === "turn.started") {
     record.state = "running";
     record.complete = false;
+    record.error = null;
+    record.error_code = null;
   } else if (event?.type === "turn.ended") {
     record.state = payload.reason === "blocked" ? "blocked" : "running";
     record.complete = false;
   } else if (event?.type === "prompt.completed") {
+    if (record.complete && record.error) return record;
     record.state = String(payload.reason || "completed");
     record.complete = true;
   } else if (event?.type === "prompt.aborted") {
@@ -1401,7 +1570,8 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
           onText(actionLine(renderState, "Event history resynced from the durable session"));
           continue;
         }
-        if (frame.type === "error" && frame.payload?.fatal) {
+        const sessionProviderFailure = frame.session_id === sessionId && terminalProviderFailure(frame);
+        if (frame.type === "error" && frame.payload?.fatal && !sessionProviderFailure) {
           throw new Error(`Kimi WebSocket error: ${frame.payload.msg || frame.payload.code}`);
         }
         if (frame.session_id && frame.session_id !== sessionId) continue;
@@ -1455,11 +1625,13 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
         applyK3Event(record, frame);
         const rendered = renderK3Event(frame, renderState);
         if (rendered) onText(rendered);
-        if (!frame.volatile || Date.now() - lastWrite >= 500 || CHECKPOINT_EVENTS.has(frame.type)) {
+        const checkpoint = CHECKPOINT_EVENTS.has(frame.type)
+          && (frame.type !== "error" || Boolean(sessionProviderFailure));
+        if (!frame.volatile || Date.now() - lastWrite >= 500 || checkpoint) {
           writeJobRecord(record);
           lastWrite = Date.now();
         }
-        if (CHECKPOINT_EVENTS.has(frame.type)) {
+        if (checkpoint) {
           const synced = await syncJobRecord(sessionId, record, true);
           record = synced.record;
           if (PROMPT_TERMINAL_EVENTS.has(frame.type) || record.complete || record.state === "blocked" || FAILURE_STATES.has(record.state)) {
@@ -1525,6 +1697,8 @@ async function main() {
       version: service.version,
       kimi_code_version: compatibility.version,
       compatibility_status: compatibility.status,
+      server_backend: service.backend,
+      server_capabilities: service.capabilities,
       model: model.model,
       display_name: model.display_name,
       max_context_size: model.max_context_size

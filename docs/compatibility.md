@@ -10,9 +10,12 @@ The plugin validates required runtime capabilities instead of accepting a versio
 
 | Kimi Code version | Status | Coverage |
 | --- | --- | --- |
-| 0.26.0 | Tested | Real local use plus fake protocol regression fixtures |
+| 0.29.0 | Tested (preferred) | Real Windows session/prompt/WebSocket/result handoff plus fake protocol regression fixtures |
+| 0.26.0 | Tested (legacy baseline) | Real Windows session/prompt/WebSocket/result handoff plus fake protocol regression fixtures |
 | Other versions | Untested | Runtime capability failures are reported; no compatibility guarantee yet |
 
-The fake server used by `npm test` verifies this repository's expected REST/WebSocket contract but is not a substitute for running the real Kimi release. Use `npm run test:real-kimi` against an installed and authenticated version before adding it to the tested table.
+The project prioritizes the latest official stable Kimi Code release and retains 0.26.0 as a regression baseline. As of 2026-07-24, the preferred version is 0.29.0. Compatibility is not inferred from the version alone: 0.26 uses the legacy background-server lock, while 0.29 uses foreground `kimi web` processes and per-instance discovery records. The bridge detects the available server-launch command and verifies the loopback health, advertised K3 model, and required REST/WebSocket behavior.
 
-When the local lock file contains a parseable version, tool results expose `kimi_code_version` and `compatibility_status`. An untested version is not blocked when the required capabilities still work.
+The fake server used by `npm test` verifies this repository's expected REST/WebSocket contract on all CI platforms but is not a substitute for running the real Kimi release. `npm run test:real-kimi` creates a real session, submits a no-tool prompt, consumes WebSocket events, verifies the result handoff, and checks the durable record. It requires an installed and authenticated Kimi Code and consumes one model request.
+
+When the local lock or instance record contains a parseable version, tool results expose `kimi_code_version` and `compatibility_status`. An untested version is not blocked when the required capabilities still work.
