@@ -305,7 +305,13 @@ function pathIdentity(value) {
   try {
     resolved = fs.realpathSync.native(resolved);
   } catch {}
+  if (process.platform === "darwin") resolved = resolved.normalize("NFC");
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isManagedWorktreePath(value) {
+  const relative = path.relative(pathIdentity(WORKTREE_ROOT), pathIdentity(value));
+  return Boolean(relative && !relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function kimiCompatibility(version) {
@@ -374,10 +380,8 @@ function deleteK3Branch(repo, branch) {
 
 function removeGitWorktree(workspace, deleteBranch = false) {
   if (!workspace?.source_repo || !workspace?.worktree_root) return;
-  const expectedRoot = path.resolve(WORKTREE_ROOT);
   const target = path.resolve(workspace.worktree_root);
-  const relative = path.relative(expectedRoot, target);
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+  if (!isManagedWorktreePath(target)) {
     throw new Error(`Refusing to remove unexpected K3 worktree path: ${target}`);
   }
   if (fs.existsSync(target)) {
@@ -811,8 +815,7 @@ export function pruneExecutionResources(deleteResources = false, targetSessionId
     const worktrees = registeredGitWorktrees(repo);
     for (const worktree of worktrees) {
       const target = path.resolve(worktree.worktree_root);
-      const relative = path.relative(path.resolve(WORKTREE_ROOT), target);
-      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+      if (!isManagedWorktreePath(target)) continue;
       registeredRoots.add(pathIdentity(target));
       const record = recordsByRoot.get(pathIdentity(target)) || null;
       const state = record?.integration?.state || null;
