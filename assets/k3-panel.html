@@ -595,6 +595,9 @@
           if (frame.payload?.status === "resynced") {
             setConnection("Live", "live");
             addNotice(frame.payload?.message || "K3 event relay resynchronized its event cursor.");
+          } else if (frame.payload?.turn_terminal) {
+            setConnection("K3 turn failed", "error");
+            addNotice(frame.payload?.message || "K3 turn failed.", true);
           } else if (frame.payload?.status === "connected") {
             setConnection("Live", "live");
             addNotice("K3 event relay reconnected.");

@@ -183,7 +183,7 @@ async function startJob(requestId, input) {
     requestId,
     [
       "start", "--format", "json", "--mode", input.mode, "--focus", input.focus, "--cwd", input.cwd,
-      ...(input.mode === "execute" ? ["--allowed-path", input.allowedPaths.join(";")] : [])
+      ...(input.mode === "execute" ? input.allowedPaths.flatMap((item) => ["--allowed-path", item]) : [])
     ],
     input.prompt
   );
@@ -541,6 +541,7 @@ class SessionRelay {
           if (this.isDuplicateDurable(frame)) continue;
           this.updateServerCursor(frame);
           this.enqueue(frame);
+          if (frame.type === "turn.started") this.providerFailureNotified = false;
           if (this.mode === "analyze" && frame.type === "event.approval.requested") {
             const approvalId = String(frame.payload?.approval_id || "").trim();
             if (!approvalId) {
@@ -612,7 +613,8 @@ class SessionRelay {
               payload: {
                 status: "failed",
                 message: [code && `[${code}]`, detail].filter(Boolean).join(" "),
-                terminal: true
+                terminal: true,
+                turn_terminal: true
               }
             });
           }

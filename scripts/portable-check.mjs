@@ -26,7 +26,7 @@ for (const script of [bridge, mcpServer, handoffHook, websocketModule, policyMod
   }
 }
 
-const bridgeUnitHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-bridge-unit-"));
+const bridgeUnitHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-bridge-unit-ü;-"));
 const originalKimiHome = process.env.KIMI_CODE_HOME;
 process.env.KIMI_CODE_HOME = bridgeUnitHome;
 const {
@@ -37,6 +37,7 @@ const {
   kimiServerLaunchSpec,
   pathsOverlap,
   prepareExecutionWorkspace,
+  pruneExecutionResources,
   renderK3Event,
   restoreExecutionWorkspace,
   scopeViolations
@@ -187,8 +188,34 @@ try {
       mode: "execute",
       workspace: linked.workspace
     });
-    if (linkedHandoff.state !== "no_changes" || fs.existsSync(linked.workspace.worktree_root)) {
+    if (
+      linkedHandoff.state !== "no_changes" ||
+      fs.existsSync(linked.workspace.worktree_root) ||
+      checkedGit(isolationFixture, ["branch", "--list", linked.workspace.branch])
+    ) {
       throw new Error("A canonicalized working directory did not finalize cleanly.");
+    }
+    const linkedFollowup = {
+      session_id: "session_linked_cwd_followup",
+      prompt_id: "prompt_linked_cwd_followup",
+      mode: "execute",
+      workspace: linked.workspace
+    };
+    await restoreExecutionWorkspace(linkedFollowup);
+    if (
+      !fs.existsSync(linked.workspace.worktree_root) ||
+      checkedGit(linked.workspace.worktree_root, ["rev-parse", "HEAD"]) !== linked.workspace.base_commit
+    ) {
+      throw new Error("A no-change follow-up did not recreate its worktree from the persisted base commit.");
+    }
+    linked.workspace.turn_finalized_for = null;
+    const linkedFollowupHandoff = finalizeExecutionWorkspace(linkedFollowup);
+    if (
+      linkedFollowupHandoff.state !== "no_changes" ||
+      fs.existsSync(linked.workspace.worktree_root) ||
+      checkedGit(isolationFixture, ["branch", "--list", linked.workspace.branch])
+    ) {
+      throw new Error("A recreated no-change worktree did not clean up its branch.");
     }
   } finally {
     fs.unlinkSync(linkedFixture);
@@ -252,6 +279,124 @@ try {
   if (scopedHandoff.state !== "scope_violation" || !fs.existsSync(scoped.workspace.worktree_root)) {
     throw new Error("A scope violation was not blocked and preserved for review.");
   }
+  const pruneJobs = path.join(bridgeUnitHome, "codex-jobs");
+  fs.mkdirSync(pruneJobs, { recursive: true });
+  fs.writeFileSync(path.join(pruneJobs, `${scopedRecord.session_id}.json`), JSON.stringify({
+    ...scopedRecord,
+    complete: true,
+    integration: scopedHandoff
+  }));
+  const orphanSessionId = "session_portable_orphan";
+  const orphanRoot = path.join(bridgeUnitHome, "codex-worktrees", "portable-orphan");
+  const orphanBranch = "codex-k3/portable-orphan";
+  checkedGit(isolationFixture, ["worktree", "add", "-b", orphanBranch, orphanRoot, "HEAD"]);
+  fs.writeFileSync(path.join(pruneJobs, `${orphanSessionId}.json`), JSON.stringify({
+    session_id: orphanSessionId,
+    complete: true,
+    workspace: {
+      isolation: "git-worktree",
+      source_repo: isolationFixture,
+      worktree_root: orphanRoot,
+      branch: orphanBranch
+    },
+    integration: { state: "ready" }
+  }));
+  const unknownRoot = path.join(bridgeUnitHome, "codex-worktrees", "portable-unknown");
+  const unknownBranch = "codex-k3/portable-unknown";
+  checkedGit(isolationFixture, ["worktree", "add", "-b", unknownBranch, unknownRoot, "HEAD"]);
+  const emptySessionId = "session_portable_empty_directory";
+  const emptyRoot = path.join(bridgeUnitHome, "codex-worktrees", "portable-empty");
+  fs.mkdirSync(emptyRoot);
+  fs.writeFileSync(path.join(pruneJobs, `${emptySessionId}.json`), JSON.stringify({
+    session_id: emptySessionId,
+    complete: true,
+    workspace: {
+      isolation: "git-worktree",
+      source_repo: isolationFixture,
+      worktree_root: emptyRoot,
+      branch: "codex-k3/portable-empty"
+    },
+    integration: { state: "ready" }
+  }));
+  const prunePreview = pruneExecutionResources(false);
+  let untargetedPruneError = null;
+  try {
+    pruneExecutionResources(true);
+  } catch (error) {
+    untargetedPruneError = error;
+  }
+  if (
+    !untargetedPruneError?.message.includes("explicit session id") ||
+    !prunePreview.candidates.some((candidate) =>
+      candidate.type === "worktree" &&
+      candidate.worktree_root === scoped.workspace.worktree_root &&
+      !candidate.deletable
+    ) ||
+    !prunePreview.candidates.some((candidate) =>
+      candidate.type === "worktree" &&
+      candidate.worktree_root === orphanRoot &&
+      candidate.deletable
+    ) ||
+    !prunePreview.candidates.some((candidate) =>
+      candidate.type === "worktree" &&
+      candidate.worktree_root === unknownRoot &&
+      !candidate.deletable &&
+      candidate.reason === "missing-record"
+    ) ||
+    !prunePreview.candidates.some((candidate) =>
+      candidate.type === "unowned_directory" &&
+      candidate.worktree_root === emptyRoot &&
+      candidate.deletable &&
+      candidate.reason === "empty-terminal-directory"
+    )
+  ) {
+    throw new Error("Prune preview did not distinguish preserved, explicit, and unknown worktrees.");
+  }
+  const prunedResources = pruneExecutionResources(true, orphanSessionId);
+  if (
+    !fs.existsSync(scoped.workspace.worktree_root) ||
+    fs.existsSync(orphanRoot) ||
+    !fs.existsSync(unknownRoot) ||
+    checkedGit(isolationFixture, ["branch", "--list", orphanBranch]) ||
+    !prunedResources.deleted.some((candidate) => candidate.worktree_root === orphanRoot)
+  ) {
+    throw new Error("Session-targeted prune did not remove only the selected worktree.");
+  }
+  const originalRmdirSync = fs.rmdirSync;
+  fs.rmdirSync = (target) => {
+    if (target === emptyRoot) {
+      const error = new Error("fixture directory is busy");
+      error.code = "EBUSY";
+      throw error;
+    }
+    return originalRmdirSync(target);
+  };
+  let busyEmptyDirectory;
+  try {
+    busyEmptyDirectory = pruneExecutionResources(true, emptySessionId);
+  } finally {
+    fs.rmdirSync = originalRmdirSync;
+  }
+  if (
+    !fs.existsSync(emptyRoot) ||
+    busyEmptyDirectory.deleted.length !== 0 ||
+    !busyEmptyDirectory.errors.some((candidate) =>
+      candidate.worktree_root === emptyRoot &&
+      candidate.delete_error.includes("fixture directory is busy")
+    )
+  ) {
+    throw new Error("A locked empty terminal directory was not reported without forced deletion.");
+  }
+  const prunedEmptyDirectory = pruneExecutionResources(true, emptySessionId);
+  if (
+    fs.existsSync(emptyRoot) ||
+    !prunedEmptyDirectory.deleted.some((candidate) => candidate.worktree_root === emptyRoot) ||
+    prunedEmptyDirectory.errors.length !== 0
+  ) {
+    throw new Error("Session-targeted prune did not remove a known empty terminal directory.");
+  }
+  checkedGit(isolationFixture, ["worktree", "remove", "--force", unknownRoot]);
+  checkedGit(isolationFixture, ["branch", "-D", unknownBranch]);
   checkedGit(isolationFixture, ["worktree", "remove", "--force", scoped.workspace.worktree_root]);
   checkedGit(isolationFixture, ["branch", "-D", scoped.workspace.branch]);
 
@@ -388,6 +533,46 @@ try {
     providerRecord.workspace.turn_finalized_for !== providerRecord.prompt_id
   ) {
     throw new Error("A Provider failure did not finalize its partial execute handoff exactly once.");
+  }
+
+  const submoduleSource = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-submodule-source-"));
+  try {
+    checkedGit(submoduleSource, ["init"]);
+    checkedGit(submoduleSource, ["config", "user.name", "Portable Check"]);
+    checkedGit(submoduleSource, ["config", "user.email", "portable-check@local"]);
+    fs.writeFileSync(path.join(submoduleSource, "feature.txt"), "submodule base\n");
+    checkedGit(submoduleSource, ["add", "--all"]);
+    checkedGit(submoduleSource, ["commit", "-m", "submodule fixture"]);
+    const submoduleRelative = "module ü; space";
+    checkedGit(isolationFixture, [
+      "-c", "protocol.file.allow=always",
+      "submodule", "add", submoduleSource, submoduleRelative
+    ]);
+    checkedGit(isolationFixture, ["commit", "-am", "add submodule fixture"]);
+    const submoduleRoot = path.join(isolationFixture, submoduleRelative);
+    const submoduleSourceText = fs.readFileSync(path.join(submoduleRoot, "feature.txt"), "utf8");
+    const submoduleWorkspace = await prepareExecutionWorkspace(
+      submoduleRoot,
+      [path.join(submoduleRoot, "feature.txt")]
+    );
+    fs.writeFileSync(path.join(submoduleWorkspace.cwd, "feature.txt"), "submodule K3 change\n");
+    const submoduleHandoff = finalizeExecutionWorkspace({
+      session_id: "session_submodule_fixture",
+      prompt_id: "prompt_submodule_fixture",
+      mode: "execute",
+      workspace: submoduleWorkspace.workspace
+    });
+    if (
+      submoduleWorkspace.workspace.source_repo !== fs.realpathSync.native(submoduleRoot) ||
+      submoduleHandoff.state !== "ready" ||
+      submoduleHandoff.changed_paths.join(",") !== "feature.txt" ||
+      fs.existsSync(submoduleWorkspace.workspace.worktree_root) ||
+      fs.readFileSync(path.join(submoduleRoot, "feature.txt"), "utf8") !== submoduleSourceText
+    ) {
+      throw new Error("Submodule execute isolation or special-path handoff failed.");
+    }
+  } finally {
+    fs.rmSync(submoduleSource, { recursive: true, force: true });
   }
 
   const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-single-writer-"));
@@ -670,8 +855,10 @@ relayServer.on("upgrade", (request, socket) => {
         { type: "resync_required", payload: { session_id: "session_portable_mcp", current_seq: 5, epoch: "epoch_portable_resync" } },
         { type: "tool.result", session_id: "session_portable_mcp", seq: 6, payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
         { type: "error", session_id: "session_portable_mcp", seq: 7, payload: { code: "provider.rate_limit", message: "429 overloaded", fatal: true } },
-        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 8, payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
-        { type: "turn.ended", session_id: "session_portable_mcp", seq: 9, payload: { turnId: "turn_fixture", reason: "completed" } }
+        { type: "turn.started", session_id: "session_portable_mcp", seq: 8, payload: { turnId: "turn_followup" } },
+        { type: "error", session_id: "session_portable_mcp", seq: 9, payload: { code: "provider.rate_limit", message: "429 overloaded again", fatal: true } },
+        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 10, payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
+        { type: "turn.ended", session_id: "session_portable_mcp", seq: 11, payload: { turnId: "turn_followup", reason: "completed" } }
       ];
   socket.write(Buffer.concat([headers, ...frames.map(websocketFrame)]));
   if (relayConnectionCount === 1) setTimeout(() => socket.destroy(), 20);
@@ -939,7 +1126,12 @@ try {
     !relayedFrames.some((frame) => frame.type === "tool.result") ||
     !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.status === "rejected") ||
     !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.message?.includes("Stopped disallowed tool")) ||
-    relayedFrames.filter((frame) => frame.type === "relay.status" && frame.payload?.status === "failed" && frame.payload?.terminal === true).length !== 1 ||
+    relayedFrames.filter((frame) =>
+      frame.type === "relay.status" &&
+      frame.payload?.status === "failed" &&
+      frame.payload?.terminal === true &&
+      frame.payload?.turn_terminal === true
+    ).length !== 2 ||
     !relayedFrames.some((frame) => frame.type === "relay.status" && frame.payload?.status === "resynced") ||
     relayedFrames.findIndex((frame) => frame.type === "error" && frame.payload?.code === "provider.rate_limit") < 0 ||
     relayedFrames.findIndex((frame) => frame.type === "error" && frame.payload?.code === "provider.rate_limit") >
