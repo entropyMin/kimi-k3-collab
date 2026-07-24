@@ -1,6 +1,6 @@
 {
   "name": "kimi-k3-collab",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "type": "module",
   "description": "Concurrent Codex and Kimi K3 collaboration with direct results and isolated Git execution.",
