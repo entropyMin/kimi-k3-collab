@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Pass only an explicit environment allowlist from the MCP server to the Kimi bridge.
+- Reject execute scopes outside `cwd` at the MCP boundary and fail closed when persisted session policy is missing or invalid.
+- Document credential-free execute environments and pinned, test-first plugin upgrades.
+
 ## 0.5.1 - 2026-07-24
 
 - Disable non-Git execute by default and require explicit confirmation for direct writes.

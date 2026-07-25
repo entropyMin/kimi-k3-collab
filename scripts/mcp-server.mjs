@@ -52,6 +52,29 @@ const DEFAULT_RECEIVE_WAIT_MS = 45000;
 const DEFAULT_MODEL_WAIT_SECONDS = 100;
 const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed", "error", "stopped"]);
 const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files"]);
+const BRIDGE_ENVIRONMENT_KEYS = new Set([
+  "APPDATA",
+  "COMSPEC",
+  "HOME",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "KIMI_CODE_BIN",
+  "KIMI_CODE_HOME",
+  "KIMI_K3_SERVER_WRAPPER",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LOCALAPPDATA",
+  "PATH",
+  "PATHEXT",
+  "PROGRAMDATA",
+  "SYSTEMROOT",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "USERPROFILE",
+  "WINDIR"
+]);
 let transportClosed = false;
 
 function closeTransport() {
@@ -91,6 +114,11 @@ function requireObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
+function isWithinPath(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function requireSessionId(value) {
   const sessionId = requireString(value, "session_id");
   if (!/^[A-Za-z0-9_-]{1,200}$/.test(sessionId)) throw new Error("session_id contains unsupported characters.");
@@ -105,14 +133,21 @@ function parseJobArguments(value) {
   if (!new Set(["engineering", "visual", "general"]).has(focus)) {
     throw new Error("focus must be engineering, visual, or general.");
   }
-  const allowedPaths = Array.isArray(input.allowed_paths)
+  const requestedAllowedPaths = Array.isArray(input.allowed_paths)
     ? input.allowed_paths.map((item) => requireString(item, "allowed_paths[]"))
     : [];
-  if (mode === "execute" && allowedPaths.length === 0) {
+  if (mode === "execute" && requestedAllowedPaths.length === 0) {
     throw new Error("execute mode requires at least one allowed_paths entry.");
   }
   const cwd = requireString(input.cwd, "cwd");
   if (!path.isAbsolute(cwd)) throw new Error("cwd must be an absolute path.");
+  const resolvedCwd = path.resolve(cwd);
+  const allowedPaths = requestedAllowedPaths.map((item) => {
+    if (!isWithinPath(resolvedCwd, path.resolve(resolvedCwd, item))) {
+      throw new Error(`allowed_paths entry is outside cwd: ${item}`);
+    }
+    return item;
+  });
   if (input.allow_non_git_execute != null && typeof input.allow_non_git_execute !== "boolean") {
     throw new Error("allow_non_git_execute must be a boolean.");
   }
@@ -122,7 +157,7 @@ function parseJobArguments(value) {
   return {
     mode,
     focus,
-    cwd: path.resolve(cwd),
+    cwd: resolvedCwd,
     prompt: requireString(input.prompt, "prompt"),
     allowedPaths,
     allowNonGitExecute: input.allow_non_git_execute === true,
@@ -156,11 +191,19 @@ function normalizeStatus(value) {
   return value === "end_turn" ? "completed" : value;
 }
 
+export function bridgeEnvironment(source = process.env) {
+  return Object.fromEntries(
+    Object.entries(source)
+      .filter(([key, value]) => value != null && BRIDGE_ENVIRONMENT_KEYS.has(key.toUpperCase()))
+      .map(([key, value]) => [key, String(value)])
+  );
+}
+
 function runBridgeWindow(requestId, args, stdinText = "") {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE, ...args], {
       cwd: ROOT,
-      env: process.env,
+      env: bridgeEnvironment(),
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -291,19 +334,53 @@ function latestSessionId() {
   }
 }
 
-function readSessionPolicy(sessionId) {
+export function readSessionPolicy(sessionId, jobRoot = JOB_ROOT) {
   try {
-    const record = JSON.parse(fs.readFileSync(path.join(JOB_ROOT, `${requireSessionId(sessionId)}.json`), "utf8"));
+    const record = JSON.parse(fs.readFileSync(path.join(jobRoot, `${requireSessionId(sessionId)}.json`), "utf8"));
+    const mode = new Set(["analyze", "execute"]).has(record.mode) ? record.mode : null;
+    const recordedCwd = record.cwd || record.source_cwd;
+    const cwd = typeof recordedCwd === "string" && path.isAbsolute(recordedCwd)
+      ? path.resolve(recordedCwd)
+      : null;
+    const allowedPaths = Array.isArray(record.allowed_paths)
+      && record.allowed_paths.every((item) => typeof item === "string" && path.isAbsolute(item))
+      ? record.allowed_paths.map((item) => path.resolve(item))
+      : null;
+    if (
+      !mode ||
+      !cwd ||
+      !allowedPaths ||
+      (mode === "execute" && (
+        allowedPaths.length === 0 ||
+        allowedPaths.some((item) => !isWithinPath(cwd, item))
+      ))
+    ) {
+      throw new Error("Session security policy is incomplete.");
+    }
     return {
-      mode: record.mode,
-      cwd: record.cwd || record.source_cwd,
-      allowedPaths: record.allowed_paths || [],
+      valid: true,
+      mode,
+      cwd,
+      allowedPaths,
       sensitivePathsAcknowledged: Boolean(record.sensitive_paths_acknowledged),
       sandboxed: Boolean(record.sandboxed)
     };
   } catch {
-    return { mode: null, cwd: process.cwd(), allowedPaths: [] };
+    return { valid: false };
   }
+}
+
+export function inspectSessionToolSecurity(sessionId, payload, relayMode, jobRoot = JOB_ROOT) {
+  const policy = readSessionPolicy(sessionId, jobRoot);
+  if (!policy.valid || (relayMode && relayMode !== policy.mode)) {
+    return {
+      action: "block",
+      event: "session_policy_unavailable",
+      path: null,
+      message: "Blocked K3 tool execution because the persisted session security policy is missing, invalid, or inconsistent."
+    };
+  }
+  return inspectToolSecurity(payload, { ...policy, mode: relayMode || policy.mode });
 }
 
 function readPanelService() {
@@ -580,11 +657,11 @@ class SessionRelay {
           this.enqueue(frame);
           if (frame.type === "turn.started") this.providerFailureNotified = false;
           if (frame.type === "tool.call.started") {
-            const policy = readSessionPolicy(this.sessionId);
-            const finding = inspectToolSecurity(frame.payload, {
-              ...policy,
-              mode: this.mode || policy.mode
-            });
+            const finding = inspectSessionToolSecurity(
+              this.sessionId,
+              frame.payload,
+              this.mode
+            );
             if (finding) {
               const eventId = `${frame.epoch || ""}:${frame.seq || ""}:${frame.payload?.toolCallId || ""}:${finding.event}`;
               appendSecurityAudit(JOB_ROOT, this.sessionId, {
