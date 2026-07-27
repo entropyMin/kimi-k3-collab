@@ -28,6 +28,7 @@ const LOCK_FILE = path.join(KIMI_HOME, "server", "lock");
 const INSTANCE_ROOT = path.join(KIMI_HOME, "server", "instances");
 const TOKEN_FILE = path.join(KIMI_HOME, "server.token");
 const SANDBOX_MARKER = path.join(JOB_ROOT, "sandbox-service.json");
+const SERVER_LAUNCH_LOG = path.join(JOB_ROOT, "server-launch.log");
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMPLETE_STATES = new Set(["completed", "cancelled", "failed", "error", "stopped", "end_turn"]);
 const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped"]);
@@ -36,6 +37,7 @@ const CHECKPOINT_EVENTS = new Set(["turn.ended", "error", ...PROMPT_TERMINAL_EVE
 const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files"]);
 const PROCESS_DEADLINE = Date.now() + 115000;
 const STREAM_EXIT_RESERVE_MS = 10000;
+export const KIMI_SERVER_STARTUP_TIMEOUT_MS = 30000;
 
 function boundedTimeout(requested, reserve = 1000) {
   const remaining = PROCESS_DEADLINE - Date.now() - reserve;
@@ -672,17 +674,23 @@ async function launchKimiService(command) {
     return;
   }
 
-  const child = spawn(wrapped.command, wrapped.args, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-    shell: wrapped.shell
-  });
-  await new Promise((resolve, reject) => {
-    child.once("spawn", resolve);
-    child.once("error", reject);
-  });
-  child.unref();
+  fs.mkdirSync(path.dirname(SERVER_LAUNCH_LOG), { recursive: true, mode: 0o700 });
+  const launchLog = fs.openSync(SERVER_LAUNCH_LOG, "w", 0o600);
+  try {
+    const child = spawn(wrapped.command, wrapped.args, {
+      detached: true,
+      stdio: ["ignore", launchLog, launchLog],
+      windowsHide: true,
+      shell: wrapped.shell
+    });
+    await new Promise((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    child.unref();
+  } finally {
+    fs.closeSync(launchLog);
+  }
 }
 
 async function ensureService() {
@@ -702,7 +710,7 @@ async function ensureService() {
   const wrapped = Boolean(String(process.env.KIMI_K3_SERVER_WRAPPER || "").trim());
   await launchKimiService(command);
 
-  const deadline = Math.min(Date.now() + 15000, PROCESS_DEADLINE - 1000);
+  const deadline = Math.min(Date.now() + KIMI_SERVER_STARTUP_TIMEOUT_MS, PROCESS_DEADLINE - 1000);
   while (Date.now() < deadline) {
     await sleep(250);
     service = await readService();
@@ -713,7 +721,10 @@ async function ensureService() {
       return { ...service, sandboxed: wrapped };
     }
   }
-  throw new Error("Kimi local server did not become healthy within 15 seconds.");
+  throw new Error(
+    `Kimi local server did not become healthy within ${KIMI_SERVER_STARTUP_TIMEOUT_MS / 1000} seconds. ` +
+      `Startup output was saved to ${SERVER_LAUNCH_LOG}.`
+  );
 }
 
 async function callApi(method, endpoint, body) {
