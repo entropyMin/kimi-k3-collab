@@ -34,6 +34,7 @@ const {
   createRenderState,
   eventMatchesCurrentPrompt,
   finalizeExecutionWorkspace,
+  KIMI_SERVER_STARTUP_TIMEOUT_MS,
   kimiServerLaunchSpec,
   pathsOverlap,
   prepareExecutionWorkspace,
@@ -54,6 +55,7 @@ const wrappedLaunch = wrappedServerCommand("kimi", ["web", "--no-open"]);
 if (originalServerWrapper == null) delete process.env.KIMI_K3_SERVER_WRAPPER;
 else process.env.KIMI_K3_SERVER_WRAPPER = originalServerWrapper;
 if (
+  KIMI_SERVER_STARTUP_TIMEOUT_MS !== 30000 ||
   legacyServerLaunch.detached ||
   legacyServerLaunch.args.join(" ") !== "server run --keep-alive --log-level warn" ||
   !currentServerLaunch.detached ||
@@ -2083,7 +2085,11 @@ if (
 ) {
   throw new Error("Analysis mode does not allow safe planning while forbidding shell execution.");
 }
-if (!bridgeText.includes("PROCESS_DEADLINE = Date.now() + 115000") || !bridgeText.includes("cursor: { seq: 0 }")) {
+if (
+  !bridgeText.includes("PROCESS_DEADLINE = Date.now() + 115000") ||
+  !bridgeText.includes('stdio: ["ignore", launchLog, launchLog]') ||
+  !bridgeText.includes("cursor: { seq: 0 }")
+) {
   throw new Error("The command budget or replay-from-zero cursor guard is missing.");
 }
 

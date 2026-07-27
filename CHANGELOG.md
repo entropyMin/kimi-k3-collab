@@ -5,6 +5,7 @@
 - Pass only an explicit environment allowlist from the MCP server to the Kimi bridge.
 - Reject execute scopes outside `cwd` at the MCP boundary and fail closed when persisted session policy is missing or invalid.
 - Document credential-free execute environments and pinned, test-first plugin upgrades.
+- Allow 30 seconds for Kimi Code cold starts and retain the latest detached server startup output for diagnosis.
 
 ## 0.5.1 - 2026-07-24
 
