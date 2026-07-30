@@ -8,9 +8,13 @@ Git `execute` mode protects the source checkout with a temporary worktree and va
 
 The bridge preflights the effective workspace and refuses sessions that expose default-sensitive paths unless `sensitive_paths_ack` is explicitly confirmed; runtime tool paths are checked again. Confirmation and policy events are stored as metadata-only JSONL under `$KIMI_CODE_HOME/codex-jobs/audit`; file contents and bearer tokens are never written to this audit.
 
+Dangerous unrestricted access is a separate, default-off posture. The model can request it but cannot enable it: the host must start with `KIMI_K3_ENABLE_UNRESTRICTED=1`, and the user must complete a private, short-lived, one-time panel confirmation for the displayed task and directory. The host signs the bound launch grant, strips it before launching Kimi, and refuses model-visible follow-ups for the resulting single-turn session. A confirmed unrestricted session disables the plugin's tool, path, shell, network, and sensitive-path restrictions and writes directly under the current OS user's authority. Model verification, loopback authentication, event/result transport, cancellation, and metadata-only auditing remain enabled. The UI warning and audit are not containment; use a dedicated `KIMI_CODE_HOME`, OS sandbox/container, and no production credentials.
+
 ## Out of scope
 
 The plugin cannot reliably parse or confine arbitrary shell commands. It may also lose a race against a process that creates, uses, and deletes a link before inspection. Use an operating-system sandbox or container when prevention is required. Configure `KIMI_K3_SERVER_WRAPPER` with a dedicated `KIMI_CODE_HOME` before Kimi starts; the executable receives the resolved Kimi command and its server arguments. The bridge refuses to reuse an active service that was not marked as launched by the configured wrapper.
+
+In unrestricted mode the plugin intentionally does not attempt those checks. K3 may read or change any resource available to the current OS user and may cause irreversible external effects. Audit files are best-effort when an unsandboxed unrestricted process can access the same Kimi home.
 
 ## Operational recommendations
 
@@ -24,7 +28,7 @@ Install the plugin pinned to a Git tag or commit instead of tracking a moving br
 2. REST and WebSocket traffic is restricted to loopback hosts.
 3. The MCP App receives event frames through the host bridge and does not receive the bearer token or browser URL.
 4. The completed Markdown is returned to Codex through `await_k3_result`; a structured `result_markdown` copy is included as a host-compatibility fallback.
-5. Browser fallback exchanges a 60-second single-use loopback ticket for a 10-minute HttpOnly gateway session. Only the gateway's upstream loopback request carries the persistent Kimi bearer token.
+5. Browser fallback uses a private app-only tool to create a 2-minute single-use loopback ticket and launch the default browser. The ticket never reaches the widget; the browser exchanges it for a 10-minute HttpOnly gateway session. Only the gateway's upstream loopback request carries the persistent Kimi bearer token.
 
 ## Reporting
 

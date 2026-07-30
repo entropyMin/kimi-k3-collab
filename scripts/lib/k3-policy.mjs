@@ -3,7 +3,7 @@ import path from "node:path";
 
 export const READ_ONLY_TOOLS = Object.freeze([
   "Read", "ReadMediaFile", "Glob", "Grep", "TodoList",
-  "Agent", "Skill", "TaskList", "TaskOutput", "GetGoal"
+  "Skill", "TaskList", "TaskOutput", "GetGoal"
 ]);
 
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "Delete", "Move", "Rename"]);
@@ -102,9 +102,18 @@ export function inspectToolSecurity(payload, {
   cwd,
   allowedPaths = [],
   sensitivePathsAcknowledged = false,
-  sandboxed = false
+  sandboxed = false,
+  unrestricted = false
 } = {}) {
   const name = String(payload?.name || "");
+  if (unrestricted) {
+    return {
+      action: "allow",
+      event: "unrestricted_tool_allowed",
+      path: null,
+      message: "Allowed by the user-confirmed unrestricted session."
+    };
+  }
   const paths = toolPaths(payload);
   const root = cwd || process.cwd();
   if (!sensitivePathsAcknowledged) {
