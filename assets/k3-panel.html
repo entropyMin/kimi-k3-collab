@@ -31,7 +31,7 @@
         color: var(--text);
       }
 
-      button, textarea { font: inherit; }
+      button, textarea, input { font: inherit; }
 
       .shell {
         display: grid;
@@ -87,6 +87,17 @@
       #connection.busy::before { background: var(--running); box-shadow: 0 0 0 3px var(--running-soft); }
       #connection.error::before { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
 
+      #access {
+        border: 1px solid var(--danger);
+        border-radius: 999px;
+        padding: 2px 6px;
+        background: var(--danger-soft);
+        color: var(--danger);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+      }
+
       #session {
         display: block;
         overflow: hidden;
@@ -138,6 +149,32 @@
       #empty strong { font-size: 14px; }
       #empty span { max-width: 52ch; color: var(--muted); font-size: 13px; line-height: 1.5; }
       #empty.error strong { color: var(--danger); }
+
+      #danger-confirm {
+        display: grid;
+        width: min(100%, 620px);
+        gap: 10px;
+        margin-top: 12px;
+        border: 1px solid var(--danger);
+        border-radius: 10px;
+        padding: 14px;
+        background: var(--danger-soft);
+        text-align: left;
+      }
+
+      #danger-confirm p { margin: 0; color: var(--text); font-size: 12px; line-height: 1.55; }
+      #danger-context { color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+      #danger-phrase {
+        width: 100%;
+        min-height: 36px;
+        border: 1px solid var(--danger);
+        border-radius: 8px;
+        padding: 8px 10px;
+        background: var(--panel);
+        color: var(--text);
+      }
+      #danger-enable { border-color: var(--danger); background: var(--danger); color: #fff; }
+      #danger-enable:hover { color: #fff; filter: brightness(0.95); }
 
       #timeline {
         display: grid;
@@ -282,6 +319,7 @@
           <div class="title-row">
             <h1>Kimi K3 live session</h1>
             <span id="connection">Waiting</span>
+            <span id="access" hidden>UNRESTRICTED</span>
           </div>
           <span id="session">Waiting for private session metadata</span>
         </div>
@@ -295,6 +333,14 @@
         <div id="empty">
           <strong>Connecting to Kimi K3</strong>
           <span>This panel subscribes to Kimi's pushed events. It does not poll and Codex does not rewrite the output.</span>
+          <div id="danger-confirm" hidden>
+            <p><strong>Unrestricted access can run arbitrary commands; read, modify, or delete files available to your OS user; access credentials; use the network; and cause irreversible external effects.</strong></p>
+            <p>The plugin cannot confine shell writes or guarantee recovery. Use an isolated environment without production credentials.</p>
+            <div id="danger-context"></div>
+            <label for="danger-phrase">Type <code>ENABLE UNRESTRICTED</code> to allow this request once.</label>
+            <input id="danger-phrase" type="text" autocomplete="off" spellcheck="false" />
+            <button id="danger-enable" type="button" disabled>Enable unrestricted access once</button>
+          </div>
         </div>
         <div id="timeline" hidden></div>
       </section>
@@ -308,6 +354,7 @@
     <script>
       const elements = {
         connection: document.getElementById("connection"),
+        access: document.getElementById("access"),
         session: document.getElementById("session"),
         external: document.getElementById("external"),
         fullscreen: document.getElementById("fullscreen"),
@@ -316,15 +363,26 @@
         timeline: document.getElementById("timeline"),
         composer: document.getElementById("composer"),
         prompt: document.getElementById("prompt"),
-        send: document.getElementById("send")
+        send: document.getElementById("send"),
+        dangerConfirm: document.getElementById("danger-confirm"),
+        dangerContext: document.getElementById("danger-context"),
+        dangerPhrase: document.getElementById("danger-phrase"),
+        dangerEnable: document.getElementById("danger-enable")
       };
 
       const state = {
         sessionId: "",
+        unrestrictedRequestId: "",
+        unrestrictedConfirmationToken: "",
+        unrestricted: false,
         cursor: 0,
         relayGeneration: "",
         generation: 0,
         receiveFailures: 0,
+        receiveLoopGeneration: 0,
+        receiveSequence: 0,
+        orphanedReceives: 0,
+        streamStopped: false,
         terminal: false,
         disposed: false,
         tools: new Map(),
@@ -346,13 +404,31 @@
           value?.call_tool_result?.result?._meta,
           value?.metadata?._meta
         ];
-        return candidates.find((item) => item?.["kimi-k3/sessionId"]) || null;
+        return candidates.find((item) =>
+          item?.["kimi-k3/sessionId"] ||
+          item?.["kimi-k3/unrestrictedRequestId"]
+        ) || null;
       }
 
       function privateConnection(meta) {
+        const unrestrictedRequestId = meta?.["kimi-k3/unrestrictedRequestId"] || "";
+        if (unrestrictedRequestId) {
+          return {
+            unrestrictedRequestId,
+            unrestrictedConfirmationToken: meta?.["kimi-k3/unrestrictedConfirmationToken"] || "",
+            unrestrictedCwd: meta?.["kimi-k3/unrestrictedCwd"] || "",
+            unrestrictedPrompt: meta?.["kimi-k3/unrestrictedPrompt"] || "",
+            unrestrictedSandboxed: Boolean(meta?.["kimi-k3/unrestrictedSandboxed"]),
+            unrestrictedDedicatedHome: Boolean(meta?.["kimi-k3/unrestrictedDedicatedHome"]),
+            unrestrictedExpiresAt: Number(meta?.["kimi-k3/unrestrictedExpiresAt"] || 0)
+          };
+        }
         const sessionId = meta?.["kimi-k3/sessionId"] || "";
         if (!sessionId) return null;
-        return { sessionId };
+        return {
+          sessionId,
+          unrestricted: Boolean(meta?.["kimi-k3/unrestricted"])
+        };
       }
 
       function setConnection(label, kind = "") {
@@ -666,6 +742,12 @@
         }
       }
 
+      // receive-loop:start
+      const RECEIVE_WAIT_MS = 45000;
+      const RECEIVE_WATCHDOG_MS = 60000;
+      const RECEIVE_PROBE_WATCHDOG_MS = 15000;
+      const MAX_ORPHANED_RECEIVES = 2;
+
       function callResult(response) {
         const candidates = [
           response?.result,
@@ -693,71 +775,198 @@
         return /(?:session_id|after_cursor|wait_ms) must|unsupported characters|unknown tool/i.test(String(error));
       }
 
+      function receiveTimedOut(error) {
+        return error?.code === "K3_RECEIVE_TIMEOUT";
+      }
+
+      function receiveOnce(waitMs, watchdogMs) {
+        const call = Promise.resolve().then(() => window.openai.callTool("receive_k3_events", {
+          session_id: state.sessionId,
+          after_cursor: state.cursor,
+          wait_ms: waitMs
+        }));
+        let timer;
+        const watchdog = new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error("The MCP Apps host bridge did not return the K3 event receive call.");
+            error.code = "K3_RECEIVE_TIMEOUT";
+            reject(error);
+          }, watchdogMs);
+        });
+        return Promise.race([call, watchdog]).finally(() => clearTimeout(timer));
+      }
+
+      function validBatch(response) {
+        const result = callResult(response);
+        const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
+        if (result?.isError) throw new Error(errorText || "The K3 event relay rejected the receive call.");
+        const batch = batchFrom(response);
+        if (
+          typeof batch.relay_generation !== "string" ||
+          !Number.isInteger(batch.cursor) ||
+          !Array.isArray(batch.events)
+        ) {
+          throw new Error("The K3 event relay returned an invalid batch.");
+        }
+        return batch;
+      }
+
+      function stopReceiveStream() {
+        state.streamStopped = true;
+        setConnection("Stream unavailable", "error");
+        elements.empty.hidden = false;
+        elements.empty.className = "error";
+        elements.empty.querySelector("strong").textContent = "K3 live stream is unavailable";
+        elements.empty.querySelector("span").textContent =
+          "The host event bridge stopped responding. Reopen this panel or use Open Kimi Code.";
+        addNotice(
+          "K3 event receive stopped after two host-bridge timeouts. Reopen the panel or use Open Kimi Code.",
+          true
+        );
+      }
+
       async function receiveLoop(generation) {
-        while (!state.disposed && generation === state.generation && state.sessionId) {
-          try {
-            if (!window.openai?.callTool) throw new Error("The MCP Apps tool bridge is unavailable.");
-            const response = await window.openai.callTool("receive_k3_events", {
-              session_id: state.sessionId,
-              after_cursor: state.cursor,
-              wait_ms: 45000
-            });
-            if (generation !== state.generation || state.disposed) return;
-            const result = callResult(response);
-            const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
-            if (result?.isError) throw new Error(errorText || "The K3 event relay rejected the receive call.");
-            const batch = batchFrom(response);
-            if (batch.relay_generation) {
-              if (state.relayGeneration && state.relayGeneration !== batch.relay_generation) {
+        if (state.receiveLoopGeneration === generation) return;
+        state.receiveLoopGeneration = generation;
+        let probe = false;
+        try {
+          while (!state.disposed && generation === state.generation && state.sessionId) {
+            if (state.orphanedReceives >= MAX_ORPHANED_RECEIVES) {
+              stopReceiveStream();
+              return;
+            }
+            try {
+              if (!window.openai?.callTool) throw new Error("The MCP Apps tool bridge is unavailable.");
+              const sequence = ++state.receiveSequence;
+              const response = await receiveOnce(
+                probe ? 0 : RECEIVE_WAIT_MS,
+                probe ? RECEIVE_PROBE_WATCHDOG_MS : RECEIVE_WATCHDOG_MS
+              );
+              if (
+                sequence !== state.receiveSequence ||
+                generation !== state.generation ||
+                state.disposed
+              ) return;
+              const batch = validBatch(response);
+              probe = false;
+              if (batch.relay_generation) {
+                if (state.relayGeneration && state.relayGeneration !== batch.relay_generation) {
+                  state.relayGeneration = batch.relay_generation;
+                  state.cursor = 0;
+                  state.tools = new Map();
+                  state.subagents = new Map();
+                  state.assistants = new Map();
+                  state.currentTurnId = "";
+                  elements.timeline.replaceChildren();
+                  elements.timeline.hidden = true;
+                  elements.empty.hidden = false;
+                  addNotice("K3 event relay restarted; replaying the retained session stream.");
+                  continue;
+                }
                 state.relayGeneration = batch.relay_generation;
-                state.cursor = 0;
-                state.tools = new Map();
-                state.subagents = new Map();
-                state.assistants = new Map();
-                state.currentTurnId = "";
-                elements.timeline.replaceChildren();
-                elements.timeline.hidden = true;
-                elements.empty.hidden = false;
-                addNotice("K3 event relay restarted; replaying the retained session stream.");
+              }
+              elements.prompt.disabled = false;
+              elements.send.disabled = false;
+              if (["Connecting", "Reconnecting", "Relay unavailable"].includes(elements.connection.textContent)) {
+                setConnection("Live", "live");
+              }
+              if (batch.dropped_before_cursor != null) {
+                addNotice("The live panel buffer rolled over; continuing with the oldest retained K3 event.");
+              }
+              for (const frame of batch.events || []) handleFrame(frame);
+              if (Number.isInteger(batch.cursor)) state.cursor = Math.max(state.cursor, batch.cursor);
+              state.receiveFailures = 0;
+              if (state.terminal) return;
+            } catch (error) {
+              if (generation !== state.generation || state.disposed) return;
+              state.receiveFailures += 1;
+              if (receiveTimedOut(error)) {
+                state.orphanedReceives += 1;
+                ++state.receiveSequence;
+                if (state.orphanedReceives >= MAX_ORPHANED_RECEIVES) {
+                  stopReceiveStream();
+                  return;
+                }
+                probe = true;
+                setConnection("Reconnecting", "error");
+                addNotice("The K3 event receive call timed out; trying one bounded recovery probe.", true);
                 continue;
               }
-              state.relayGeneration = batch.relay_generation;
+              const delay = Math.min(10000, 500 * (2 ** Math.min(state.receiveFailures, 5)));
+              setConnection("Relay unavailable", "error");
+              if (state.receiveFailures === 1 || terminalReceiveError(error)) {
+                addNotice(`K3 event receive failed: ${error instanceof Error ? error.message : String(error)}`, true);
+              }
+              if (terminalReceiveError(error)) return;
+              await wait(delay);
             }
-            elements.prompt.disabled = false;
-            elements.send.disabled = false;
-            if (["Connecting", "Reconnecting", "Relay unavailable"].includes(elements.connection.textContent)) {
-              setConnection("Live", "live");
-            }
-            if (batch.dropped_before_cursor != null) {
-              addNotice("The live panel buffer rolled over; continuing with the oldest retained K3 event.");
-            }
-            for (const frame of batch.events || []) handleFrame(frame);
-            if (Number.isInteger(batch.cursor)) state.cursor = Math.max(state.cursor, batch.cursor);
-            state.receiveFailures = 0;
-            if (state.terminal) return;
-          } catch (error) {
-            if (generation !== state.generation || state.disposed) return;
-            state.receiveFailures += 1;
-            const delay = Math.min(10000, 500 * (2 ** Math.min(state.receiveFailures, 5)));
-            setConnection("Relay unavailable", "error");
-            if (state.receiveFailures === 1 || terminalReceiveError(error)) {
-              addNotice(`K3 event receive failed: ${error instanceof Error ? error.message : String(error)}`, true);
-            }
-            if (terminalReceiveError(error)) return;
-            await wait(delay);
           }
+        } finally {
+          if (state.receiveLoopGeneration === generation) state.receiveLoopGeneration = 0;
         }
       }
+      // receive-loop:end
 
       function configure(value) {
         const connection = privateConnection(hiddenMeta(value));
         if (!connection) return false;
-        if (connection.sessionId === state.sessionId) return true;
+        if (connection.unrestrictedRequestId) {
+          if (connection.unrestrictedRequestId === state.unrestrictedRequestId) return true;
+          state.generation += 1;
+          Object.assign(state, connection, {
+            sessionId: "",
+            unrestricted: false,
+            disposed: false,
+            terminal: false
+          });
+          elements.timeline.replaceChildren();
+          elements.timeline.hidden = true;
+          elements.empty.hidden = false;
+          elements.empty.className = "error";
+          elements.empty.querySelector("strong").textContent = "Dangerous unrestricted access requested";
+          elements.empty.querySelector("span").textContent =
+            "No K3 session has started. Confirm only if you understand and accept the full risk.";
+          elements.dangerConfirm.hidden = false;
+          elements.dangerPhrase.value = "";
+          elements.dangerEnable.disabled = true;
+          const expires = connection.unrestrictedExpiresAt
+            ? new Date(connection.unrestrictedExpiresAt).toLocaleTimeString()
+            : "soon";
+          elements.dangerContext.textContent = [
+            `cwd: ${connection.unrestrictedCwd}`,
+            `task: ${connection.unrestrictedPrompt}`,
+            `OS sandbox wrapper: ${connection.unrestrictedSandboxed ? "configured" : "NOT CONFIGURED"}`,
+            `Dedicated KIMI_CODE_HOME: ${connection.unrestrictedDedicatedHome ? "yes" : "NO"}`,
+            `Expires: ${expires}`
+          ].join("\n");
+          elements.session.textContent = connection.unrestrictedRequestId;
+          elements.access.hidden = true;
+          elements.external.disabled = true;
+          elements.prompt.disabled = true;
+          elements.send.disabled = true;
+          setConnection("Confirmation required", "error");
+          return true;
+        }
+        if (connection.sessionId === state.sessionId) {
+          if (state.receiveLoopGeneration || state.terminal) return true;
+          state.generation += 1;
+          Object.assign(state, {
+            receiveFailures: 0,
+            streamStopped: false,
+            disposed: false
+          });
+          setConnection("Reconnecting", "busy");
+          void receiveLoop(state.generation);
+          return true;
+        }
         state.generation += 1;
         Object.assign(state, connection, {
+          unrestrictedRequestId: "",
+          unrestrictedConfirmationToken: "",
           cursor: 0,
           relayGeneration: "",
           receiveFailures: 0,
+          streamStopped: false,
           disposed: false,
           terminal: false,
           tools: new Map(),
@@ -771,8 +980,10 @@
         elements.empty.className = "";
         elements.empty.querySelector("strong").textContent = "Connecting to Kimi K3";
         elements.empty.querySelector("span").textContent = "Receiving K3 output and actions directly from Kimi's pushed event stream.";
+        elements.dangerConfirm.hidden = true;
         elements.session.textContent = state.sessionId;
-        elements.external.disabled = !state.sessionId;
+        elements.access.hidden = !state.unrestricted;
+        elements.external.disabled = false;
         setConnection("Connecting", "busy");
         void receiveLoop(state.generation);
         return true;
@@ -804,22 +1015,55 @@
         }
       });
 
-      elements.external.addEventListener("click", async () => {
+      // browser-open:start
+      async function openK3InBrowser() {
         if (!state.sessionId) return;
         elements.external.disabled = true;
         try {
-          if (window.openai?.callTool) {
-            const response = await window.openai.callTool("open_k3_in_browser", { session_id: state.sessionId });
-            const result = callResult(response);
-            const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
-            if (result?.isError) throw new Error(errorText || "Kimi Code could not be opened.");
-          } else {
-            throw new Error("This host cannot request a protected browser fallback.");
-          }
+          if (!window.openai?.callTool) throw new Error("This host cannot request the protected browser fallback.");
+          const response = await window.openai.callTool("open_k3_in_browser", { session_id: state.sessionId });
+          const result = callResult(response);
+          const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
+          if (result?.isError) throw new Error(errorText || "Kimi Code could not be opened.");
         } catch (error) {
           addNotice(`Open Kimi Code failed: ${error instanceof Error ? error.message : String(error)}`, true);
         } finally {
           elements.external.disabled = false;
+        }
+      }
+      // browser-open:end
+
+      elements.external.addEventListener("click", openK3InBrowser);
+
+      elements.dangerPhrase.addEventListener("input", () => {
+        elements.dangerEnable.disabled = elements.dangerPhrase.value.trim() !== "ENABLE UNRESTRICTED";
+      });
+
+      elements.dangerEnable.addEventListener("click", async () => {
+        if (
+          !state.unrestrictedRequestId ||
+          !state.unrestrictedConfirmationToken ||
+          elements.dangerPhrase.value.trim() !== "ENABLE UNRESTRICTED" ||
+          !window.openai?.callTool
+        ) return;
+        elements.dangerPhrase.disabled = true;
+        elements.dangerEnable.disabled = true;
+        setConnection("Starting unrestricted K3", "busy");
+        try {
+          const response = await window.openai.callTool("confirm_unrestricted_k3", {
+            request_id: state.unrestrictedRequestId,
+            confirmation: "ENABLE UNRESTRICTED",
+            confirmation_token: state.unrestrictedConfirmationToken
+          });
+          const result = response?.result || response;
+          const errorText = result?.content?.find?.((item) => item.type === "text")?.text;
+          if (result?.isError) throw new Error(errorText || "Unrestricted K3 confirmation failed.");
+          if (!configure(response)) throw new Error("The unrestricted K3 session metadata is unavailable.");
+        } catch (error) {
+          addNotice(`Unrestricted access failed: ${error instanceof Error ? error.message : String(error)}`, true);
+          setConnection("Confirmation failed", "error");
+          elements.dangerPhrase.disabled = false;
+          elements.dangerEnable.disabled = false;
         }
       });
 
@@ -861,7 +1105,7 @@
 
       if (!configure(window.openai?.toolResponseMetadata)) {
         setTimeout(() => {
-          if (!state.sessionId) showMetadataError();
+          if (!state.sessionId && !state.unrestrictedRequestId) showMetadataError();
         }, 5000);
       }
     </script>

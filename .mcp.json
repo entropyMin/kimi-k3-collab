@@ -4,6 +4,7 @@
       "command": "node",
       "args": ["./scripts/mcp-server.mjs"],
       "cwd": ".",
+      "env_vars": ["KIMI_K3_ENABLE_UNRESTRICTED"],
       "startup_timeout_sec": 10,
       "tool_timeout_sec": 120,
       "supports_parallel_tool_calls": true

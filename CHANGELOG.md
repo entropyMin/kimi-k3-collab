@@ -6,6 +6,12 @@
 - Reject execute scopes outside `cwd` at the MCP boundary and fail closed when persisted session policy is missing or invalid.
 - Document credential-free execute environments and pinned, test-first plugin upgrades.
 - Allow 30 seconds for Kimi Code cold starts and retain the latest detached server startup output for diagnosis.
+- Let analysis continue after an approval-gated tool is rejected, remove unconstrained subagents from the read-only tool set, and require `needs_authorization` for safe-session scope expansion.
+- Add a default-off unrestricted request flow with private one-time user confirmation, persistent danger UI, and metadata-only audit events.
+- Bind unrestricted launch grants to the displayed task and directory, keep them out of the Kimi service environment, reject unrestricted follow-ups, and return scope escalation as a structured terminal `needs_authorization` result.
+- Bound stalled MCP App event receives with one recovery probe, late-response isolation, and an explicit browser/reopen fallback instead of leaving the panel on `Connecting`.
+- Keep browser tickets inside the MCP server and open the fallback through the existing private app-only launcher, avoiding host-specific external-link and dynamic CSP behavior.
+- Forward the explicitly configured unrestricted feature flag into the plugin MCP process without enabling it by default.
 
 ## 0.5.1 - 2026-07-24
 

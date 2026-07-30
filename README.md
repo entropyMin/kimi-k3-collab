@@ -65,9 +65,9 @@ Normal collaboration has no model-driven status loop or token-consuming retries:
 ## Security
 
 - The bridge accepts only `127.0.0.1`, `localhost`, or `::1` Kimi server locks.
-- The component never receives the Kimi bearer token or an authenticated browser URL.
-- **Open Kimi Code** uses a loopback gateway with a 60-second single-use ticket and a 10-minute HttpOnly browser session. The gateway adds the persistent Kimi bearer token only on its upstream loopback connection.
-- Neither the persistent bearer token nor the one-time ticket is returned in model-visible text, `structuredContent`, or component metadata.
+- The component never receives the persistent Kimi bearer token or its upstream bearer-authenticated URL.
+- **Open Kimi Code** calls a private app-only tool that creates a 2-minute single-use loopback ticket, launches the default browser, and exchanges it for a 10-minute HttpOnly browser session. The gateway adds the persistent Kimi bearer token only on its upstream loopback connection.
+- Neither the persistent bearer token nor the one-time ticket is returned to the component, model-visible text, or `structuredContent`. The MCP server handles the browser launcher concurrently with long-held event receives.
 - The MCP App makes no loopback HTTP, WebSocket, or iframe connection. Its CSP has no loopback connect allowlist.
 - `receive_k3_events` is private, app-only, and unavailable to the model.
 - The panel does not embed Kimi Code as an iframe. **Open Kimi Code** remains an authenticated browser fallback.
@@ -123,6 +123,14 @@ start_k3_collaboration {
   allowed_paths: ["src", "tests"]
 }
 ```
+
+### Dangerous unrestricted access
+
+Unrestricted access is disabled unless the Codex host process starts with `KIMI_K3_ENABLE_UNRESTRICTED=1`. After the user explicitly asks for it, call `request_unrestricted_k3` with only the task, focus, and absolute `cwd`. This creates no K3 session by itself. The private panel shows the exact task and directory, sandbox-wrapper state, dedicated-home state, expiry, and a persistent danger warning; the user must type `ENABLE UNRESTRICTED` to issue a short-lived one-time confirmation that is never exposed to the model. The host signs a task- and directory-bound launch grant, and the Kimi service does not inherit that grant.
+
+The plugin MCP manifest allowlists only the name of this operator flag for forwarding from the local host; it does not provide a value or enable unrestricted access by default.
+
+The confirmed session is single-turn: model-visible follow-up messaging is refused, so another task requires another private confirmation. It reuses the execute pipeline but writes the source directory directly under an advisory single-writer lock and disables plugin tool, path, shell, network, and sensitive-path restrictions. It retains loopback authentication, K3 model verification, event/result handoff, cancellation, and metadata-only audit events. It cannot prevent writes outside `cwd`, credential access, destructive commands, or external actions such as pushes and messages. Use a dedicated `KIMI_CODE_HOME`, an OS sandbox/container, and an environment with no production credentials. Safe sessions never upgrade in place; a structured terminal `needs_authorization` result requires fresh user approval and a new session.
 
 ## Continue the same session
 
@@ -188,7 +196,7 @@ cancel_k3_job { session_id: "SESSION" }
 
 ## Host fallback
 
-MCP Apps-compatible hosts with app-initiated tool calls render the pushed event panel inline. The component does not need loopback network access. If a host lacks the MCP Apps tool bridge, use **Open Kimi Code**; the fallback opens the same authenticated session.
+MCP Apps-compatible hosts with app-initiated tool calls render the pushed event panel inline. The component does not need loopback network access. If the embedded event stream is unavailable but the app tool bridge still works, use **Open Kimi Code** to open the same authenticated session.
 
 CLI clients without MCP Apps UI still expose the control tools and readable fallback results, but they cannot render the live panel.
 

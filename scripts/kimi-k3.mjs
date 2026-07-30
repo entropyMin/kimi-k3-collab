@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createPublicKey, randomUUID, verify } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -67,6 +67,7 @@ function parseArgs(argv) {
     deleteResources: false,
     allowNonGitExecute: false,
     sensitivePathsAcknowledged: false,
+    unrestricted: false,
     allowedPaths: []
   };
   const names = new Map([
@@ -97,6 +98,11 @@ function parseArgs(argv) {
     }
     if (flag === "--ack-sensitive-paths") {
       options.sensitivePathsAcknowledged = true;
+      index += 1;
+      continue;
+    }
+    if (flag === "--unrestricted") {
+      options.unrestricted = true;
       index += 1;
       continue;
     }
@@ -270,10 +276,19 @@ function runCommand(command, args, options = {}) {
     windowsHide: true,
     shell: process.platform === "win32" && command === "kimi",
     cwd: options.cwd,
+    env: options.env,
     input: options.input,
     timeout: boundedTimeout(options.timeout ?? 20000),
     maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024
   });
+}
+
+export function kimiServiceEnvironment(source = process.env) {
+  const environment = { ...source };
+  for (const key of Object.keys(environment)) {
+    if (key.toUpperCase().startsWith("KIMI_K3_")) delete environment[key];
+  }
+  return environment;
 }
 
 function checkedCommand(command, args, options = {}) {
@@ -666,7 +681,10 @@ async function launchKimiService(command) {
   const launch = kimiServerLaunchSpec(`${help.stdout || ""}\n${help.stderr || ""}`);
   const wrapped = wrappedServerCommand(command, launch.args);
   if (!launch.detached) {
-    const started = runCommand(wrapped.command, wrapped.args, { timeout: 60000 });
+    const started = runCommand(wrapped.command, wrapped.args, {
+      timeout: 60000,
+      env: kimiServiceEnvironment()
+    });
     if (started.error) throw started.error;
     if (started.status !== 0) {
       throw new Error((started.stderr || started.stdout || `Kimi server exited with ${started.status}`).trim());
@@ -681,7 +699,8 @@ async function launchKimiService(command) {
       detached: true,
       stdio: ["ignore", launchLog, launchLog],
       windowsHide: true,
-      shell: wrapped.shell
+      shell: wrapped.shell,
+      env: kimiServiceEnvironment()
     });
     await new Promise((resolve, reject) => {
       child.once("spawn", resolve);
@@ -789,6 +808,8 @@ function createJobRecord(job, options) {
     allowed_paths: job.workspace?.allowed_paths || [],
     allow_non_git_execute: Boolean(options.allowNonGitExecute),
     sensitive_paths_acknowledged: Boolean(options.sensitivePathsAcknowledged),
+    unrestricted: Boolean(options.unrestricted),
+    unrestricted_request_id: options.unrestrictedRequestId || null,
     sandboxed: Boolean(job.sandboxed),
     workspace: job.workspace || null,
     explicit_model: job.explicit_model,
@@ -808,6 +829,7 @@ function createJobRecord(job, options) {
     allowed_paths: record.allowed_paths,
     sensitive_paths_acknowledged: record.sensitive_paths_acknowledged,
     allow_non_git_execute: record.allow_non_git_execute,
+    unrestricted: record.unrestricted,
     sandboxed: record.sandboxed
   });
   return record;
@@ -1017,12 +1039,13 @@ export async function prepareExecutionWorkspace(
   sourceCwd,
   allowedAbsolutePaths,
   getOwnerStatus = getJobStatus,
-  allowNonGitExecute = false
+  allowNonGitExecute = false,
+  forceSingleWriter = false
 ) {
   const sourceRoot = canonicalPath(sourceCwd);
   const allowedSourcePaths = allowedAbsolutePaths.map((item) => verifyWithinRoot(sourceRoot, item));
   const repo = findGitRepo(sourceRoot);
-  if (!repo) {
+  if (forceSingleWriter || !repo) {
     if (!allowNonGitExecute) {
       throw new Error(
         "Non-Git execute mode is disabled by default because it writes the source directory directly. " +
@@ -1158,7 +1181,10 @@ export function finalizeExecutionWorkspace(record) {
       isolation: "single-writer",
       state: "direct_changes",
       source_cwd: workspace.source_cwd,
-      note: "Non-Git execution changed the source directory directly while holding the advisory single-writer lock."
+      changes_verified: false,
+      note: record.unrestricted
+        ? "Unrestricted direct-write access was available while holding the advisory single-writer lock; writes outside the source directory were not path-confined, and whether changes occurred is unverified."
+        : "Non-Git direct-write access was available while holding the advisory single-writer lock; whether changes occurred is unverified."
     };
     return record.integration;
   }
@@ -1360,7 +1386,8 @@ async function getJobStatus(sessionId) {
     verified_k3: String(runtime.model || "") === K3_MODEL,
     message_count: Number(session.message_count || 0),
     mode: mode || "",
-    focus: String(record?.focus || session.metadata?.focus || "")
+    focus: String(record?.focus || session.metadata?.focus || ""),
+    unrestricted: Boolean(record?.unrestricted)
   };
 }
 
@@ -1387,6 +1414,45 @@ function readPromptInput(options) {
   return prompt.trim();
 }
 
+export function validateUnrestrictedGrant(prompt, cwd, environment = process.env) {
+  const [encodedPayload, encodedSignature, ...extra] =
+    String(environment.KIMI_K3_UNRESTRICTED_GRANT || "").split(".");
+  const encodedPublicKey = String(environment.KIMI_K3_UNRESTRICTED_PUBLIC_KEY || "");
+  if (!encodedPayload || !encodedSignature || extra.length > 0 || !encodedPublicKey) {
+    throw new Error("Unrestricted K3 execution requires a valid host-issued confirmation grant.");
+  }
+  let payload;
+  let payloadBytes;
+  try {
+    payloadBytes = Buffer.from(encodedPayload, "base64url");
+    payload = JSON.parse(payloadBytes.toString("utf8"));
+    const publicKey = createPublicKey({
+      key: Buffer.from(encodedPublicKey, "base64url"),
+      type: "spki",
+      format: "der"
+    });
+    if (!verify(null, payloadBytes, publicKey, Buffer.from(encodedSignature, "base64url"))) {
+      throw new Error("invalid signature");
+    }
+  } catch {
+    throw new Error("Unrestricted K3 execution requires a valid host-issued confirmation grant.");
+  }
+  const promptSha256 = createHash("sha256").update(String(prompt), "utf8").digest("hex");
+  if (
+    payload?.v !== 1 ||
+    typeof payload.request_id !== "string" ||
+    typeof payload.nonce !== "string" ||
+    !Number.isFinite(payload.expires_at) ||
+    payload.expires_at <= Date.now() ||
+    payload.expires_at > Date.now() + 60_000 ||
+    pathIdentity(payload.cwd) !== pathIdentity(cwd) ||
+    payload.prompt_sha256 !== promptSha256
+  ) {
+    throw new Error("The unrestricted confirmation grant is expired or does not match this task.");
+  }
+  return payload;
+}
+
 async function startJob(options) {
   const prompt = readPromptInput(options);
 
@@ -1394,10 +1460,15 @@ async function startJob(options) {
   if (!fs.statSync(sourceRoot, { throwIfNoEntry: false })?.isDirectory()) {
     throw new Error(`Working directory does not exist: ${sourceRoot}`);
   }
+  if (options.unrestricted) {
+    options.unrestrictedRequestId = validateUnrestrictedGrant(prompt, sourceRoot).request_id;
+  }
   const readOnly = options.mode === "analyze";
   let allowedOriginal = null;
   if (!readOnly) {
-    const items = options.allowedPaths.map((value) => value.trim()).filter(Boolean);
+    const items = options.unrestricted
+      ? [sourceRoot]
+      : options.allowedPaths.map((value) => value.trim()).filter(Boolean);
     if (items.length === 0) {
       throw new Error("Execution mode requires at least one --allowed-path.");
     }
@@ -1419,7 +1490,8 @@ async function startJob(options) {
       sourceRoot,
       allowedOriginal,
       getJobStatus,
-      options.allowNonGitExecute
+      options.allowNonGitExecute || options.unrestricted,
+      options.unrestricted
     );
     root = prepared.cwd;
     workspace = prepared.workspace;
@@ -1427,7 +1499,7 @@ async function startJob(options) {
     scopeText = `\nYou may edit only these paths:\n- ${allowed.join("\n- ")}`;
   }
   const sensitivePaths = findSensitivePaths(root);
-  if (sensitivePaths.length > 0 && !options.sensitivePathsAcknowledged) {
+  if (sensitivePaths.length > 0 && !options.sensitivePathsAcknowledged && !options.unrestricted) {
     if (workspace) cleanupPreparedWorkspace(workspace);
     throw new Error(
       `Sensitive paths are accessible to K3: ${sensitivePaths.join(", ")}. ` +
@@ -1435,9 +1507,15 @@ async function startJob(options) {
     );
   }
 
-  const systemPrompt = readOnly
-    ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Do not call Bash, Shell, another command-execution tool, WebSearch, or FetchURL; use the configured local read-only inspection tools instead. You may use TodoList to organize the review. ${options.sensitivePathsAcknowledged ? "The user explicitly authorized access to sensitive paths for this session." : "Do not access credentials, private keys, .env files, or other sensitive paths."} Inspect relevant project files and assets as needed.\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
-    : `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe user has authorized the scoped implementation described in the task. Inspect before editing, preserve unrelated user changes, and do not touch files outside the allowed paths.${scopeText}\n${options.sensitivePathsAcknowledged ? "The user explicitly authorized access to sensitive paths for this session." : "Do not access credentials, private keys, .env files, or other sensitive paths."}\n${workspace?.isolation === "git-worktree" ? `You are inside an isolated Git worktree on branch ${workspace.branch}. Do not create commits, branches, merges, or additional worktrees; the collaboration bridge owns integration.` : "This is an explicitly authorized non-Git single-writer session. Codex must pause local writes until your turn completes."}\nImplement the requested work, verify it with appropriate tests, static checks, or rendered evidence, and return the files changed, decisions made, and verification results.`;
+  const authorizationProtocol =
+    "If broader access is essential, stop safely without further tool calls and end the final response with exactly one fenced needs_authorization JSON block: " +
+    '```needs_authorization\n{"capability":"short capability","paths":["absolute or cwd-relative path"],"reason":"why it is required","minimum_scope":"smallest sufficient new authority"}\n```. ' +
+    "This is a terminal request for Codex to present to the user, not permission, and this session cannot resume after emitting it.";
+  const systemPrompt = options.unrestricted
+    ? `You are Kimi K3, collaborating with Codex in a user-confirmed UNRESTRICTED session.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe plugin is not restricting your tools, file paths, shell commands, network access, or sensitive paths. You have only the permissions of the current OS user; do not attempt privilege escalation. This mode can cause irreversible local or external effects. Inspect before acting, preserve unrelated work where practical, perform only the task the user approved, and report every material action, external side effect, and verification result. You are writing the source directory directly under an advisory single-writer lock; writes outside it are not confined or recoverable by the plugin.`
+    : readOnly
+    ? `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nANALYSIS ONLY: do not create, edit, delete, move, or rename files. Do not call Bash, Shell, another command-execution tool, Agent, WebSearch, or FetchURL; use the configured local read-only inspection tools instead. You may use TodoList to organize the review. ${options.sensitivePathsAcknowledged ? "The user explicitly authorized access to sensitive paths for this session." : "Do not access credentials, private keys, .env files, or other sensitive paths."} Inspect relevant project files and assets as needed.\nThese limits are enforced by the collaboration bridge and cannot be expanded inside this session. If a tool is denied, do not retry it or route around the denial; use an allowed alternative and continue. ${authorizationProtocol}\nReview the proposal or implementation, challenge assumptions, compare material tradeoffs, and identify concrete risks or defects. Return a concise verdict, ranked findings backed by evidence, recommended changes, and acceptance checks. Distinguish observed facts from inference.`
+    : `You are Kimi K3, collaborating with Codex as an independent engineering and design partner.\nPrimary preference for this task: ${focusPrompt(options.focus)}\nThe user has authorized the scoped implementation described in the task. Inspect before editing, preserve unrelated user changes, do not launch subagents, and do not touch files outside the allowed paths.${scopeText}\n${options.sensitivePathsAcknowledged ? "The user explicitly authorized access to sensitive paths for this session." : "Do not access credentials, private keys, .env files, or other sensitive paths."}\nThese limits are enforced by the collaboration bridge and cannot be expanded inside this session. If a tool is denied, do not retry it or route around the denial; use an allowed alternative and continue. ${authorizationProtocol}\n${workspace?.isolation === "git-worktree" ? `You are inside an isolated Git worktree on branch ${workspace.branch}. Do not create commits, branches, merges, or additional worktrees; the collaboration bridge owns integration.` : "This is an explicitly authorized non-Git single-writer session. Codex must pause local writes until your turn completes."}\nImplement the requested work, verify it with appropriate tests, static checks, or rendered evidence, and return the files changed, decisions made, and verification results.`;
 
   try {
     const session = await callApi("POST", "/api/v1/sessions", {
@@ -1502,6 +1580,7 @@ async function startJob(options) {
       thinking: String(configured.thinking_level),
       plan_mode: Boolean(configured.plan_mode),
       read_only_tools: readOnly ? READ_ONLY_TOOLS : null,
+      unrestricted: options.unrestricted,
       kimi_code_version: compatibility.version,
       compatibility_status: compatibility.status,
       verified_k3: configured.model === K3_MODEL,
@@ -1525,6 +1604,12 @@ async function sendMessage(options) {
   let record = readJobRecord(sessionId);
   if (!record) {
     throw new Error(`No persisted Kimi K3 job was found for ${sessionId}.`);
+  }
+  if (record.unrestricted) {
+    throw new Error("Unrestricted K3 sessions are single-turn; start a newly confirmed request for another task.");
+  }
+  if (record.state === "needs_authorization" || record.authorization_request) {
+    throw new Error("This K3 session ended with needs_authorization; obtain user approval and start a new session.");
   }
   const status = await getJobStatus(sessionId);
   if (!status.verified_k3 || status.server_reported_model !== K3_MODEL) {
@@ -1564,8 +1649,10 @@ async function sendMessage(options) {
     writeJobRecord(record);
   }
   const reminder = readOnly
-    ? "Continue in analysis-only mode. Do not modify files or run shell commands."
-    : "Continue within the previously authorized file scope and verify any changes.";
+    ? "Continue in analysis-only mode without subagents, file changes, shell, network tools, or retries of denied tools. If broader access is essential, return needs_authorization and stop safely."
+    : record.unrestricted
+      ? "Continue in the user-confirmed unrestricted session. Stay on the approved task and report material actions and external side effects."
+      : "Continue within the previously authorized file scope without subagents. Do not retry denied tools; return needs_authorization if broader access is essential.";
   let submitted;
   try {
     submitted = await callApi("POST", `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompts`, {
@@ -1654,6 +1741,34 @@ async function getLatestAssistantText(sessionId) {
   return text;
 }
 
+export function parseNeedsAuthorization(text) {
+  const match = String(text || "").match(/```needs_authorization\s*([\s\S]*?)```/i);
+  if (!match) return null;
+  let value;
+  try {
+    value = JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+  if (
+    !value ||
+    typeof value !== "object" ||
+    typeof value.capability !== "string" ||
+    typeof value.reason !== "string" ||
+    typeof value.minimum_scope !== "string" ||
+    !Array.isArray(value.paths) ||
+    value.paths.some((item) => typeof item !== "string")
+  ) {
+    return null;
+  }
+  return {
+    capability: value.capability.trim(),
+    paths: value.paths.map((item) => item.trim()).filter(Boolean),
+    reason: value.reason.trim(),
+    minimum_scope: value.minimum_scope.trim()
+  };
+}
+
 async function syncJobRecord(sessionId, record = readJobRecord(sessionId), settle = false) {
   let status = await getJobStatus(sessionId);
   if (settle) {
@@ -1675,7 +1790,11 @@ async function syncJobRecord(sessionId, record = readJobRecord(sessionId), settl
   };
   const observedState = String(next.state || "");
   const observedTerminal = Boolean(next.complete) || observedState === "blocked" || FAILURE_STATES.has(observedState);
-  const preserveObserved = observedTerminal && (Boolean(next.error) || (settle && !complete));
+  const preserveObserved = observedTerminal && (
+    Boolean(next.error) ||
+    Boolean(next.authorization_request) ||
+    (settle && !complete)
+  );
   Object.assign(next, {
     state: preserveObserved ? observedState : status.state,
     complete: preserveObserved ? Boolean(next.complete) : complete,
@@ -1686,6 +1805,12 @@ async function syncJobRecord(sessionId, record = readJobRecord(sessionId), settl
     mode: next.mode || status.mode,
     focus: next.focus || status.focus
   });
+  const authorizationRequest = parseNeedsAuthorization(text);
+  if (authorizationRequest) {
+    next.state = "needs_authorization";
+    next.complete = true;
+    next.authorization_request = authorizationRequest;
+  }
   if (next.complete) finalizeExecutionSafely(next);
   writeJobRecord(next);
   return {
@@ -1936,7 +2061,8 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
           await rejectAnalysisApproval(sessionId, frame.payload);
           const toolCallId = String(frame.payload.tool_call_id || "");
           if (!toolCallId) throw new Error("Kimi approval event did not include a tool call id.");
-          record.denied_tool_call_ids = [...new Set([...(record.denied_tool_call_ids || []), toolCallId])];
+          record.denied_tool_call_ids =
+            [...new Set([...(record.denied_tool_call_ids || []), toolCallId])].slice(-1024);
           applyK3Event(record, frame);
           writeJobRecord(record);
           onText(actionLine(renderState, `Denied ${frame.payload.tool_name || "approval-gated tool"} in read-only analysis`));
@@ -1950,6 +2076,27 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
           applyK3Event(record, frame);
           if (frame.type === "tool.result") {
             record.denied_tool_call_ids = record.denied_tool_call_ids.filter((id) => id !== frame.payload.toolCallId);
+            if (frame.payload?.isError !== true) {
+              const message = "A tool rejected in read-only analysis returned a successful result.";
+              appendSecurityAudit(JOB_ROOT, sessionId, {
+                event: "denied_tool_returned_success",
+                decision: "block",
+                tool: String(frame.payload?.name || ""),
+                path: null,
+                message
+              });
+              const cancellation = await abortActivePrompt(sessionId);
+              Object.assign(record, {
+                state: "error",
+                complete: true,
+                error: message,
+                error_code: "denied_tool_returned_success",
+                cancellation
+              });
+              writeJobRecord(record);
+              websocket.close();
+              return { record, assistantStreamed: renderState.assistantStreamed };
+            }
           }
           writeJobRecord(record);
           continue;
@@ -1960,7 +2107,8 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
             cwd: record.cwd,
             allowedPaths: record.allowed_paths,
             sensitivePathsAcknowledged: record.sensitive_paths_acknowledged,
-            sandboxed: record.sandboxed
+            sandboxed: record.sandboxed,
+            unrestricted: record.unrestricted
           });
           const findingId = `${frame.epoch || ""}:${frame.seq || ""}:${frame.payload?.toolCallId || ""}:${finding?.event || ""}`;
           if (finding && !record.security_event_ids?.includes(findingId)) {
@@ -1973,7 +2121,9 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
               path: finding.path,
               message: finding.message
             });
-            onText(actionLine(renderState, `Security ${finding.action}: ${finding.message}`));
+            if (finding.action !== "allow") {
+              onText(actionLine(renderState, `Security ${finding.action}: ${finding.message}`));
+            }
             if (finding.action === "block") {
               applyK3Event(record, frame);
               const cancellation = await abortActivePrompt(sessionId);

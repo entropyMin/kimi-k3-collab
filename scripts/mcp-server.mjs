@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -39,17 +39,27 @@ const activeRequests = new Set();
 const cancelledRequests = new Set();
 const relayReceivers = new Map();
 const relays = new Map();
+const unrestrictedRequests = new Map();
 let browserGateway = null;
 const MAX_RELAY_EVENTS = 2000;
 const MAX_EVENT_BATCH = 100;
 const MAX_RELAY_BUFFER_BYTES = 16 * 1024 * 1024;
 const MAX_EVENT_BATCH_BYTES = 512 * 1024;
 const MAX_RELAY_FAILURES = 30;
+const MAX_DENIED_TOOL_CALL_IDS = 1024;
 const DEFAULT_RELAY_IDLE_MS = 3 * 60 * 1000;
 const MIN_RELAY_IDLE_MS = 1000;
 const RELAY_IDLE_MS = Math.max(Number(process.env.KIMI_K3_RELAY_IDLE_MS) || DEFAULT_RELAY_IDLE_MS, MIN_RELAY_IDLE_MS);
 const DEFAULT_RECEIVE_WAIT_MS = 45000;
 const DEFAULT_MODEL_WAIT_SECONDS = 100;
+const BROWSER_TICKET_TTL_MS = 2 * 60 * 1000;
+const UNRESTRICTED_REQUEST_TTL_MS = 5 * 60 * 1000;
+const UNRESTRICTED_CONFIRMATION = "ENABLE UNRESTRICTED";
+const { privateKey: unrestrictedSigningKey, publicKey: unrestrictedVerificationKey } =
+  generateKeyPairSync("ed25519");
+const unrestrictedPublicKey = unrestrictedVerificationKey
+  .export({ type: "spki", format: "der" })
+  .toString("base64url");
 const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed", "error", "stopped"]);
 const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files"]);
 const BRIDGE_ENVIRONMENT_KEYS = new Set([
@@ -84,6 +94,10 @@ function closeTransport() {
   for (const child of activeChildren.values()) child.kill();
   for (const cancel of relayReceivers.values()) cancel();
   for (const relay of relays.values()) relay.stop();
+  for (const request of unrestrictedRequests.values()) {
+    for (const finish of request.waiters) finish();
+  }
+  unrestrictedRequests.clear();
   browserGateway?.close();
   browserGateway = null;
 }
@@ -123,6 +137,16 @@ function requireSessionId(value) {
   const sessionId = requireString(value, "session_id");
   if (!/^[A-Za-z0-9_-]{1,200}$/.test(sessionId)) throw new Error("session_id contains unsupported characters.");
   return sessionId;
+}
+
+function safeTokenEqual(left, right) {
+  const a = Buffer.from(String(left || ""));
+  const b = Buffer.from(String(right || ""));
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function sha256(value) {
+  return createHash("sha256").update(String(value), "utf8").digest("hex");
 }
 
 function parseJobArguments(value) {
@@ -169,6 +193,21 @@ function parseSessionArguments(value) {
   return { sessionId: requireSessionId(requireObject(value).session_id) };
 }
 
+function parseUnrestrictedArguments(value) {
+  const input = requireObject(value);
+  const focus = input.focus ?? "general";
+  if (!new Set(["engineering", "visual", "general"]).has(focus)) {
+    throw new Error("focus must be engineering, visual, or general.");
+  }
+  const cwd = requireString(input.cwd, "cwd");
+  if (!path.isAbsolute(cwd)) throw new Error("cwd must be an absolute path.");
+  return {
+    focus,
+    cwd: path.resolve(cwd),
+    prompt: requireString(input.prompt, "prompt")
+  };
+}
+
 function lastMatch(text, pattern) {
   let result = null;
   for (const match of text.matchAll(pattern)) result = match[1].trim();
@@ -199,11 +238,11 @@ export function bridgeEnvironment(source = process.env) {
   );
 }
 
-function runBridgeWindow(requestId, args, stdinText = "") {
+function runBridgeWindow(requestId, args, stdinText = "", extraEnvironment = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE, ...args], {
       cwd: ROOT,
-      env: bridgeEnvironment(),
+      env: { ...bridgeEnvironment(), ...extraEnvironment },
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -229,8 +268,8 @@ function runBridgeWindow(requestId, args, stdinText = "") {
   });
 }
 
-async function runBridgeJson(requestId, args, stdinText = "") {
-  const result = await runBridgeWindow(requestId, args, stdinText);
+async function runBridgeJson(requestId, args, stdinText = "", extraEnvironment = {}) {
+  const result = await runBridgeWindow(requestId, args, stdinText, extraEnvironment);
   try {
     return JSON.parse(result.stdout);
   } catch {
@@ -255,12 +294,193 @@ async function startJob(requestId, input) {
   return { ...job, session_id: requireSessionId(job.session_id) };
 }
 
+function notifyUnrestrictedRequest(request) {
+  for (const finish of [...request.waiters]) finish();
+}
+
+async function startUnrestrictedJob(requestId, request) {
+  const grantPayload = Buffer.from(JSON.stringify({
+    v: 1,
+    request_id: request.id,
+    cwd: request.cwd,
+    prompt_sha256: request.promptSha256,
+    expires_at: Date.now() + 30_000,
+    nonce: randomBytes(16).toString("base64url")
+  }), "utf8");
+  const grant = `${grantPayload.toString("base64url")}.${
+    sign(null, grantPayload, unrestrictedSigningKey).toString("base64url")
+  }`;
+  const job = await runBridgeJson(
+    requestId,
+    [
+      "start", "--format", "json", "--mode", "execute", "--focus", request.focus,
+      "--cwd", request.cwd, "--unrestricted"
+    ],
+    request.prompt,
+    {
+      KIMI_K3_UNRESTRICTED_GRANT: grant,
+      KIMI_K3_UNRESTRICTED_PUBLIC_KEY: unrestrictedPublicKey
+    }
+  );
+  if (!job.verified_k3 || job.server_reported_model !== K3_MODEL || !job.unrestricted) {
+    throw new Error(`Kimi server did not verify the unrestricted ${K3_MODEL} session.`);
+  }
+  return { ...job, session_id: requireSessionId(job.session_id) };
+}
+
+async function requestUnrestrictedCollaboration(requestId, rawArguments) {
+  if (process.env.KIMI_K3_ENABLE_UNRESTRICTED !== "1") {
+    throw new Error(
+      "Unrestricted K3 access is disabled. Set KIMI_K3_ENABLE_UNRESTRICTED=1 before starting Codex, " +
+      "then request it again and confirm the warning in the private panel."
+    );
+  }
+  const input = parseUnrestrictedArguments(rawArguments);
+  if (!fs.statSync(input.cwd, { throwIfNoEntry: false })?.isDirectory()) {
+    throw new Error(`Working directory does not exist: ${input.cwd}`);
+  }
+  await ensurePanelService(requestId);
+  for (const [id, request] of unrestrictedRequests) {
+    if (request.expiresAt <= Date.now() && request.state === "awaiting_user_confirmation") {
+      request.state = "expired";
+      request.confirmationToken = null;
+      notifyUnrestrictedRequest(request);
+    }
+  }
+  const id = `unrestricted_${randomUUID()}`;
+  const confirmationToken = randomBytes(32).toString("base64url");
+  const request = {
+    id,
+    ...input,
+    promptSha256: sha256(input.prompt),
+    confirmationToken,
+    state: "awaiting_user_confirmation",
+    createdAt: Date.now(),
+    expiresAt: Date.now() + UNRESTRICTED_REQUEST_TTL_MS,
+    sandboxed: Boolean(String(process.env.KIMI_K3_SERVER_WRAPPER || "").trim()),
+    dedicatedHome: Boolean(
+      process.env.KIMI_CODE_HOME &&
+      path.resolve(process.env.KIMI_CODE_HOME) !== path.join(os.homedir(), ".kimi-code")
+    ),
+    waiters: new Set(),
+    sessionId: null,
+    error: null
+  };
+  unrestrictedRequests.set(id, request);
+  appendSecurityAudit(JOB_ROOT, id, {
+    event: "unrestricted_access_requested",
+    decision: "pending_user_confirmation",
+    cwd: request.cwd,
+    prompt_sha256: request.promptSha256,
+    sandboxed: request.sandboxed,
+    dedicated_kimi_home: request.dedicatedHome
+  });
+  return {
+    content: [{
+      type: "text",
+      text:
+        "Unrestricted K3 access is awaiting explicit user confirmation in the private panel. " +
+        "It has not started and cannot be enabled by model text."
+    }],
+    structuredContent: {
+      session_id: id,
+      status: request.state,
+      mode: "unrestricted",
+      access_mode: "unrestricted",
+      complete: false,
+      handoff_ready: false,
+      view: "unrestricted-confirmation"
+    },
+    _meta: {
+      "kimi-k3/unrestrictedRequestId": id,
+      "kimi-k3/unrestrictedConfirmationToken": confirmationToken,
+      "kimi-k3/unrestrictedCwd": request.cwd,
+      "kimi-k3/unrestrictedPrompt": request.prompt,
+      "kimi-k3/unrestrictedSandboxed": request.sandboxed,
+      "kimi-k3/unrestrictedDedicatedHome": request.dedicatedHome,
+      "kimi-k3/unrestrictedExpiresAt": request.expiresAt
+    }
+  };
+}
+
+async function confirmUnrestrictedCollaboration(requestId, rawArguments) {
+  const input = requireObject(rawArguments);
+  const id = requireString(input.request_id, "request_id");
+  const request = unrestrictedRequests.get(id);
+  if (!request) throw new Error("The unrestricted access request is missing, expired, or belongs to another host process.");
+  if (request.expiresAt <= Date.now()) {
+    request.state = "expired";
+    request.confirmationToken = null;
+    notifyUnrestrictedRequest(request);
+    throw new Error("The unrestricted access request expired; create a new request.");
+  }
+  if (request.state !== "awaiting_user_confirmation") {
+    throw new Error(`The unrestricted access request is already ${request.state}.`);
+  }
+  if (
+    input.confirmation !== UNRESTRICTED_CONFIRMATION ||
+    !safeTokenEqual(input.confirmation_token, request.confirmationToken)
+  ) {
+    throw new Error("The private unrestricted confirmation is invalid.");
+  }
+  request.state = "starting";
+  appendSecurityAudit(JOB_ROOT, id, {
+    event: "unrestricted_access_confirmed",
+    decision: "allow_once",
+    cwd: request.cwd,
+    prompt_sha256: request.promptSha256,
+    sandboxed: request.sandboxed,
+    dedicated_kimi_home: request.dedicatedHome
+  });
+  try {
+    const job = await startUnrestrictedJob(requestId, request);
+    request.state = "running";
+    request.sessionId = job.session_id;
+    request.confirmationToken = null;
+    relayFor(job.session_id, job.mode);
+    notifyUnrestrictedRequest(request);
+    return await panelToolResult(
+      job.session_id,
+      structuredJob(job),
+      "User-confirmed unrestricted Kimi K3 collaboration started.",
+      { "kimi-k3/unrestricted": true }
+    );
+  } catch (error) {
+    request.state = "failed";
+    request.error = error instanceof Error ? error.message : String(error);
+    notifyUnrestrictedRequest(request);
+    appendSecurityAudit(JOB_ROOT, id, {
+      event: "unrestricted_access_start_failed",
+      decision: "failed",
+      message: request.error
+    });
+    throw error;
+  }
+}
+
+function waitForUnrestrictedRequest(request, milliseconds) {
+  if (!["awaiting_user_confirmation", "starting"].includes(request.state)) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      request.waiters.delete(finish);
+      resolve();
+    };
+    request.waiters.add(finish);
+    timer = setTimeout(finish, milliseconds);
+  });
+}
+
 function structuredJob(job) {
   const integration = job.integration || null;
   return {
     session_id: job.session_id,
     status: normalizeStatus(job.state || job.status || "running"),
     mode: job.mode || null,
+    access_mode: job.unrestricted ? "unrestricted" : (job.mode || null),
+    unrestricted: Boolean(job.unrestricted),
+    authorization_request: job.authorization_request || null,
     focus: job.focus || null,
     kimi_code_version: job.kimi_code_version || null,
     compatibility_status: job.compatibility_status || "untested",
@@ -278,12 +498,16 @@ export function integrationHandoff(record) {
   const integration = record?.integration;
   if (!integration) return { text: "", structured: {} };
   if (integration.isolation === "single-writer") {
+    const changesVerified = integration.changes_verified === true;
     return {
-      text: `\n\n---\nExecution handoff: non-Git changes were made directly in ${integration.source_cwd} under the single-writer protocol.`,
+      text: changesVerified
+        ? `\n\n---\nExecution handoff: verified changes were made directly in ${integration.source_cwd} under the single-writer protocol.`
+        : `\n\n---\nExecution handoff: direct-write access was available for ${integration.source_cwd} under the single-writer protocol; whether changes occurred is unverified.`,
       structured: {
         isolation: "single-writer",
         integration_state: integration.state,
-        source_cwd: integration.source_cwd
+        source_cwd: integration.source_cwd,
+        changes_verified: changesVerified
       }
     };
   }
@@ -336,7 +560,8 @@ function latestSessionId() {
 
 export function readSessionPolicy(sessionId, jobRoot = JOB_ROOT) {
   try {
-    const record = JSON.parse(fs.readFileSync(path.join(jobRoot, `${requireSessionId(sessionId)}.json`), "utf8"));
+    const requiredSessionId = requireSessionId(sessionId);
+    const record = JSON.parse(fs.readFileSync(path.join(jobRoot, `${requiredSessionId}.json`), "utf8"));
     const mode = new Set(["analyze", "execute"]).has(record.mode) ? record.mode : null;
     const recordedCwd = record.cwd || record.source_cwd;
     const cwd = typeof recordedCwd === "string" && path.isAbsolute(recordedCwd)
@@ -346,6 +571,43 @@ export function readSessionPolicy(sessionId, jobRoot = JOB_ROOT) {
       && record.allowed_paths.every((item) => typeof item === "string" && path.isAbsolute(item))
       ? record.allowed_paths.map((item) => path.resolve(item))
       : null;
+    if (record.unrestricted === true) {
+      const sourceCwd = typeof record.source_cwd === "string" && path.isAbsolute(record.source_cwd)
+        ? path.resolve(record.source_cwd)
+        : null;
+      const workspace = record.workspace;
+      const workspaceCwd = typeof workspace?.cwd === "string" && path.isAbsolute(workspace.cwd)
+        ? path.resolve(workspace.cwd)
+        : null;
+      const workspaceSourceCwd = typeof workspace?.source_cwd === "string" && path.isAbsolute(workspace.source_cwd)
+        ? path.resolve(workspace.source_cwd)
+        : null;
+      if (
+        record.kind !== "kimi-k3-native-delegation" ||
+        record.session_id !== requiredSessionId ||
+        mode !== "execute" ||
+        !/^unrestricted_[A-Za-z0-9_-]+$/.test(String(record.unrestricted_request_id || "")) ||
+        !cwd ||
+        !sourceCwd ||
+        path.relative(cwd, sourceCwd) !== "" ||
+        workspace?.isolation !== "single-writer" ||
+        !workspaceCwd ||
+        !workspaceSourceCwd ||
+        path.relative(cwd, workspaceCwd) !== "" ||
+        path.relative(cwd, workspaceSourceCwd) !== ""
+      ) {
+        throw new Error("Confirmed unrestricted session policy is incomplete.");
+      }
+      return {
+        valid: true,
+        mode,
+        cwd,
+        allowedPaths: [],
+        sensitivePathsAcknowledged: true,
+        sandboxed: Boolean(record.sandboxed),
+        unrestricted: true
+      };
+    }
     if (
       !mode ||
       !cwd ||
@@ -363,7 +625,8 @@ export function readSessionPolicy(sessionId, jobRoot = JOB_ROOT) {
       cwd,
       allowedPaths,
       sensitivePathsAcknowledged: Boolean(record.sensitive_paths_acknowledged),
-      sandboxed: Boolean(record.sandboxed)
+      sandboxed: Boolean(record.sandboxed),
+      unrestricted: false
     };
   } catch {
     return { valid: false };
@@ -466,6 +729,7 @@ class SessionRelay {
     this.stopped = false;
     this.outage = false;
     this.providerFailureNotified = false;
+    this.deniedToolCallIds = new Set();
     this.lastReceiveAt = Date.now();
   }
 
@@ -656,7 +920,9 @@ class SessionRelay {
           this.updateServerCursor(frame);
           this.enqueue(frame);
           if (frame.type === "turn.started") this.providerFailureNotified = false;
-          if (frame.type === "tool.call.started") {
+          const frameToolCallId = String(frame.payload?.toolCallId || "");
+          const deniedToolCall = this.deniedToolCallIds.has(frameToolCallId);
+          if (frame.type === "tool.call.started" && !deniedToolCall) {
             const finding = inspectSessionToolSecurity(
               this.sessionId,
               frame.payload,
@@ -680,20 +946,23 @@ class SessionRelay {
                   );
                 } catch {}
               }
-              this.enqueue({
-                type: "relay.policy",
-                session_id: this.sessionId,
-                volatile: true,
-                payload: {
-                  status: finding.action === "block" ? "failed" : "warning",
-                  message: finding.message,
-                  security_event: finding.event
-                }
-              });
+              if (finding.action !== "allow") {
+                this.enqueue({
+                  type: "relay.policy",
+                  session_id: this.sessionId,
+                  volatile: true,
+                  payload: {
+                    status: finding.action === "block" ? "failed" : "warning",
+                    message: finding.message,
+                    security_event: finding.event
+                  }
+                });
+              }
             }
           }
           if (this.mode === "analyze" && frame.type === "event.approval.requested") {
             const approvalId = String(frame.payload?.approval_id || "").trim();
+            const toolCallId = String(frame.payload?.tool_call_id || "").trim();
             if (!approvalId) {
               this.enqueue({
                 type: "relay.policy",
@@ -707,6 +976,12 @@ class SessionRelay {
                   `relay-approval:${this.sessionId}:${approvalId}`,
                   ["reject-approval", "--format", "json", "--session-id", this.sessionId, "--approval-id", approvalId]
                 );
+                if (toolCallId) {
+                  this.deniedToolCallIds.add(toolCallId);
+                  while (this.deniedToolCallIds.size > MAX_DENIED_TOOL_CALL_IDS) {
+                    this.deniedToolCallIds.delete(this.deniedToolCallIds.values().next().value);
+                  }
+                }
                 this.enqueue({
                   type: "relay.policy",
                   session_id: this.sessionId,
@@ -726,6 +1001,7 @@ class SessionRelay {
           if (
             this.mode === "analyze" &&
             frame.type === "tool.call.started" &&
+            !this.deniedToolCallIds.has(String(frame.payload?.toolCallId || "")) &&
             !isReadOnlyTool(frame.payload?.name)
           ) {
             try {
@@ -750,6 +1026,40 @@ class SessionRelay {
                 payload: { status: "failed", message: safeRelayError(error) }
               });
             }
+          }
+          if (frame.type === "tool.result" && deniedToolCall) {
+            if (frame.payload?.isError !== true) {
+              const eventId = `${frame.epoch || ""}:${frame.seq || ""}:${frameToolCallId}:denied_tool_returned_success`;
+              const message = "A tool rejected in read-only analysis returned a successful result; stopped the turn.";
+              appendSecurityAudit(JOB_ROOT, this.sessionId, {
+                event_id: eventId,
+                event: "denied_tool_returned_success",
+                decision: "block",
+                tool: String(frame.payload?.name || ""),
+                path: null,
+                message
+              });
+              try {
+                await runBridgeJson(
+                  `relay-integrity:${this.sessionId}:${frameToolCallId || randomUUID()}`,
+                  ["cancel", "--format", "json", "--session-id", this.sessionId]
+                );
+              } catch {}
+              this.enqueue({
+                type: "relay.policy",
+                session_id: this.sessionId,
+                volatile: true,
+                payload: {
+                  status: "failed",
+                  message,
+                  security_event: "denied_tool_returned_success"
+                }
+              });
+            }
+            this.deniedToolCallIds.delete(frameToolCallId);
+          }
+          if (frame.type === "prompt.completed" || frame.type === "prompt.aborted") {
+            this.deniedToolCallIds.clear();
           }
           const sessionProviderFailure = frame.session_id === this.sessionId && terminalProviderFailure(frame);
           if (sessionProviderFailure && !this.providerFailureNotified) {
@@ -855,7 +1165,7 @@ function cookieValue(request, name) {
 
 export function createBrowserGateway(
   serviceProvider = readPanelService,
-  { ticketTtlMs = 60000, sessionTtlMs = 10 * 60 * 1000 } = {}
+  { ticketTtlMs = BROWSER_TICKET_TTL_MS, sessionTtlMs = 10 * 60 * 1000 } = {}
 ) {
   const tickets = new Map();
   const sessions = new Map();
@@ -995,18 +1305,28 @@ export function createBrowserGateway(
     return origin;
   }
 
+  async function issueDetails(sessionId) {
+    const gatewayOrigin = await start();
+    cleanup();
+    const ticket = randomBytes(32).toString("base64url");
+    const expiresAt = Date.now() + ticketTtlMs;
+    tickets.set(ticket, {
+      session_id: requireSessionId(sessionId),
+      session_token: randomBytes(32).toString("base64url"),
+      expires_at: expiresAt
+    });
+    return {
+      url: `${gatewayOrigin}/__kimi_k3_ticket/${ticket}`,
+      expires_at: expiresAt
+    };
+  }
+
   return {
+    origin: start,
     async issue(sessionId) {
-      const gatewayOrigin = await start();
-      cleanup();
-      const ticket = randomBytes(32).toString("base64url");
-      tickets.set(ticket, {
-        session_id: requireSessionId(sessionId),
-        session_token: randomBytes(32).toString("base64url"),
-        expires_at: Date.now() + ticketTtlMs
-      });
-      return `${gatewayOrigin}/__kimi_k3_ticket/${ticket}`;
+      return (await issueDetails(sessionId)).url;
     },
+    issueDetails,
     close() {
       tickets.clear();
       sessions.clear();
@@ -1016,11 +1336,15 @@ export function createBrowserGateway(
   };
 }
 
-function panelToolResult(sessionId, details, text) {
+function panelToolResult(sessionId, details, text, extraMeta = {}) {
   return {
     content: [{ type: "text", text }],
     structuredContent: { ...details, session_id: sessionId, view: "kimi-event-stream" },
-    _meta: { "kimi-k3/sessionId": sessionId }
+    _meta: {
+      "kimi-k3/sessionId": sessionId,
+      ...(details?.unrestricted ? { "kimi-k3/unrestricted": true } : {}),
+      ...extraMeta
+    }
   };
 }
 
@@ -1038,7 +1362,7 @@ async function startCollaboration(requestId, rawArguments) {
     `Model: ${details.server_reported_model} (${details.verified_k3 ? "verified" : "NOT VERIFIED"})`,
     "The live panel renders Kimi's raw pushed frames through the server relay."
   ].join("\n");
-  return panelToolResult(job.session_id, details, text);
+  return await panelToolResult(job.session_id, details, text);
 }
 
 async function openPanel(requestId, rawArguments) {
@@ -1052,7 +1376,7 @@ async function openPanel(requestId, rawArguments) {
     ? `Opened the direct Kimi K3 event stream.\nSession: ${sessionId}`
     : "Opened Kimi K3. Start or select a session in the live panel.";
   if (sessionId) relayFor(sessionId, details.mode);
-  return panelToolResult(sessionId, structuredJob({ ...details, session_id: sessionId }), text);
+  return await panelToolResult(sessionId, structuredJob({ ...details, session_id: sessionId }), text);
 }
 
 async function openK3InBrowser(requestId, rawArguments) {
@@ -1071,6 +1395,10 @@ async function sendMessageToK3(requestId, rawArguments) {
   const input = requireObject(rawArguments);
   const sessionId = requireSessionId(input.session_id);
   const prompt = requireString(input.prompt, "prompt");
+  const policy = readSessionPolicy(sessionId);
+  if (policy.valid && policy.unrestricted) {
+    throw new Error("Unrestricted K3 sessions are single-turn; request and confirm a new session for another task.");
+  }
   const result = await runBridgeJson(
     requestId,
     ["send", "--format", "json", "--session-id", sessionId],
@@ -1101,9 +1429,13 @@ async function receiveK3Events(requestId, rawArguments) {
     );
     relay = relayFor(sessionId, status.mode);
   }
+  const structuredContent = await relay.receive(requestId, afterCursor, waitMs);
   return {
     content: [],
-    structuredContent: await relay.receive(requestId, afterCursor, waitMs)
+    structuredContent,
+    _meta: {
+      "kimi-k3/sessionId": sessionId
+    }
   };
 }
 
@@ -1157,6 +1489,9 @@ async function getJobResult(requestId, rawArguments) {
       complete,
       handoff_ready: complete,
       mode: record.mode || null,
+      access_mode: record.unrestricted ? "unrestricted" : (record.mode || null),
+      unrestricted: Boolean(record.unrestricted),
+      authorization_request: record.authorization_request || null,
       focus: record.focus || null,
       server_reported_model: model,
       verified_k3: true,
@@ -1170,10 +1505,52 @@ async function getJobResult(requestId, rawArguments) {
 
 async function awaitK3Result(requestId, rawArguments) {
   const input = requireObject(rawArguments);
-  const sessionId = requireSessionId(input.session_id);
+  let sessionId = requireSessionId(input.session_id);
   const waitSeconds = input.wait_seconds ?? DEFAULT_MODEL_WAIT_SECONDS;
   if (!Number.isInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > 100) {
     throw new Error("wait_seconds must be an integer from 1 through 100.");
+  }
+  const unrestrictedRequest = unrestrictedRequests.get(sessionId);
+  if (unrestrictedRequest) {
+    if (
+      unrestrictedRequest.state === "awaiting_user_confirmation" &&
+      unrestrictedRequest.expiresAt <= Date.now()
+    ) {
+      unrestrictedRequest.state = "expired";
+    }
+    await waitForUnrestrictedRequest(unrestrictedRequest, waitSeconds * 1000);
+    if (
+      unrestrictedRequest.state === "awaiting_user_confirmation" &&
+      unrestrictedRequest.expiresAt <= Date.now()
+    ) {
+      unrestrictedRequest.state = "expired";
+      unrestrictedRequest.confirmationToken = null;
+    }
+    if (!unrestrictedRequest.sessionId) {
+      const terminal = ["cancelled", "expired", "failed"].includes(unrestrictedRequest.state);
+      const message = unrestrictedRequest.state === "awaiting_user_confirmation"
+        ? "Unrestricted K3 access is awaiting the user's private panel confirmation."
+        : unrestrictedRequest.state === "starting"
+          ? "The user confirmed unrestricted K3 access and the session is starting."
+          : `Unrestricted K3 access ${unrestrictedRequest.state}: ${unrestrictedRequest.error || "create a new request."}`;
+      return {
+        content: [{ type: "text", text: message }],
+        structuredContent: {
+          session_id: unrestrictedRequest.id,
+          status: unrestrictedRequest.state,
+          complete: terminal,
+          handoff_ready: terminal,
+          mode: "unrestricted",
+          access_mode: "unrestricted",
+          server_reported_model: null,
+          verified_k3: false,
+          error: unrestrictedRequest.error,
+          error_code: terminal ? `unrestricted_${unrestrictedRequest.state}` : null,
+          result_markdown: null
+        }
+      };
+    }
+    sessionId = unrestrictedRequest.sessionId;
   }
   const record = await runBridgeJson(
     requestId,
@@ -1202,6 +1579,9 @@ async function awaitK3Result(requestId, rawArguments) {
       complete,
       handoff_ready: handoffReady,
       mode: record.mode || null,
+      access_mode: record.unrestricted ? "unrestricted" : (record.mode || null),
+      unrestricted: Boolean(record.unrestricted),
+      authorization_request: record.authorization_request || null,
       focus: record.focus || null,
       server_reported_model: model,
       verified_k3: true,
@@ -1216,7 +1596,28 @@ async function awaitK3Result(requestId, rawArguments) {
 }
 
 async function cancelJob(requestId, rawArguments) {
-  const { sessionId } = parseSessionArguments(rawArguments);
+  let { sessionId } = parseSessionArguments(rawArguments);
+  const unrestrictedRequest = unrestrictedRequests.get(sessionId);
+  if (unrestrictedRequest && !unrestrictedRequest.sessionId) {
+    unrestrictedRequest.state = "cancelled";
+    unrestrictedRequest.error = "Cancelled before unrestricted access started.";
+    unrestrictedRequest.confirmationToken = null;
+    notifyUnrestrictedRequest(unrestrictedRequest);
+    appendSecurityAudit(JOB_ROOT, unrestrictedRequest.id, {
+      event: "unrestricted_access_cancelled",
+      decision: "cancelled"
+    });
+    return {
+      content: [{ type: "text", text: "The pending unrestricted K3 request was cancelled before it started." }],
+      structuredContent: {
+        session_id: unrestrictedRequest.id,
+        aborted: true,
+        prompt_id: null,
+        reason: "unrestricted_request_cancelled"
+      }
+    };
+  }
+  if (unrestrictedRequest?.sessionId) sessionId = unrestrictedRequest.sessionId;
   const result = await runBridgeJson(requestId, ["cancel", "--format", "json", "--session-id", sessionId]);
   return {
     content: [{
@@ -1271,6 +1672,26 @@ export const startToolDefinition = {
   inputSchema: {
     type: "object",
     properties: jobInputProperties,
+    required: ["prompt", "cwd"],
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  _meta: panelMeta
+};
+
+export const requestUnrestrictedToolDefinition = {
+  name: "request_unrestricted_k3",
+  title: "Request Unrestricted Kimi K3",
+  description:
+    "Request a dangerous unrestricted K3 session. This never starts K3 directly: the user must confirm " +
+    "the exact risk in the private panel, and the feature must be enabled by the host operator.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      prompt: { type: "string", minLength: 1 },
+      focus: { type: "string", enum: ["engineering", "visual", "general"], default: "general" },
+      cwd: { type: "string", minLength: 1 }
+    },
     required: ["prompt", "cwd"],
     additionalProperties: false
   },
@@ -1367,6 +1788,28 @@ export const browserToolDefinition = {
   }
 };
 
+export const confirmUnrestrictedToolDefinition = {
+  name: "confirm_unrestricted_k3",
+  title: "Confirm Unrestricted Kimi K3",
+  description: "App-only one-time confirmation for a pending unrestricted K3 request.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      request_id: { type: "string", minLength: 1 },
+      confirmation: { type: "string", const: UNRESTRICTED_CONFIRMATION },
+      confirmation_token: { type: "string", minLength: 32 }
+    },
+    required: ["request_id", "confirmation", "confirmation_token"],
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  _meta: {
+    ui: { visibility: ["app"] },
+    "openai/visibility": "private",
+    "openai/widgetAccessible": true
+  }
+};
+
 function sessionToolDefinition(name, title, description, annotations) {
   return {
     name,
@@ -1384,11 +1827,13 @@ function sessionToolDefinition(name, title, description, annotations) {
 
 export const toolDefinitions = [
   startToolDefinition,
+  requestUnrestrictedToolDefinition,
   openPanelToolDefinition,
   sendToolDefinition,
   awaitToolDefinition,
   receiveToolDefinition,
   browserToolDefinition,
+  confirmUnrestrictedToolDefinition,
   sessionToolDefinition(
     "get_k3_status",
     "Get Kimi K3 Status",
@@ -1411,11 +1856,13 @@ export const toolDefinitions = [
 
 const toolHandlers = new Map([
   ["start_k3_collaboration", startCollaboration],
+  ["request_unrestricted_k3", requestUnrestrictedCollaboration],
   ["open_k3_panel", openPanel],
   ["send_k3_message", sendMessageToK3],
   ["await_k3_result", awaitK3Result],
   ["receive_k3_events", receiveK3Events],
   ["open_k3_in_browser", openK3InBrowser],
+  ["confirm_unrestricted_k3", confirmUnrestrictedCollaboration],
   ["get_k3_status", getJobStatus],
   ["get_k3_result", getJobResult],
   ["cancel_k3_job", cancelJob]
@@ -1458,7 +1905,7 @@ async function handleMessage(message) {
       capabilities: { tools: {}, resources: {} },
       serverInfo: { name: "Kimi K3 Collab", version: VERSION },
       instructions:
-        "Use start_k3_collaboration once to give K3 a separate subtask, continue Codex's own work, then call await_k3_result before the final response so K3 reports directly back to Codex. If it is still running and no useful Codex work remains, let the trusted Stop hook perform the longer event wait. If that hook is unavailable, make only one later await before asking the user whether to keep waiting or cancel. Never narrate repeated waiting, run filler checks, or poll status/result during automatic waiting."
+        "Use start_k3_collaboration once to give K3 a separate subtask, continue Codex's own work, then call await_k3_result before the final response so K3 reports directly back to Codex. Only when the user explicitly requests dangerous unrestricted access, use request_unrestricted_k3; it cannot start until the user confirms privately in the panel. If K3 is still running and no useful Codex work remains, let the trusted Stop hook perform the longer event wait. Never narrate repeated waiting, run filler checks, or poll status/result during automatic waiting."
     });
     return;
   }
@@ -1483,7 +1930,7 @@ async function handleMessage(message) {
       sendError(id, -32602, `Unknown resource: ${params?.uri ?? ""}`);
       return;
     }
-    sendResult(id, readPanelResource());
+    sendResult(id, await readPanelResource());
     return;
   }
   if (method === "tools/call") {

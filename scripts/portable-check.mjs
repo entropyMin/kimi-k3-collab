@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -36,12 +36,15 @@ const {
   finalizeExecutionWorkspace,
   KIMI_SERVER_STARTUP_TIMEOUT_MS,
   kimiServerLaunchSpec,
+  kimiServiceEnvironment,
+  parseNeedsAuthorization,
   pathsOverlap,
   prepareExecutionWorkspace,
   pruneExecutionResources,
   renderK3Event,
   restoreExecutionWorkspace,
   scopeViolations,
+  validateUnrestrictedGrant,
   wrappedServerCommand
 } = await import(pathToFileURL(bridge));
 if (originalKimiHome == null) delete process.env.KIMI_CODE_HOME;
@@ -66,10 +69,56 @@ if (
 ) {
   throw new Error("Kimi server startup capability negotiation is invalid.");
 }
+const unrestrictedPromptFixture = "Perform the confirmed task";
+const unrestrictedKeyPair = generateKeyPairSync("ed25519");
+const unrestrictedPayload = Buffer.from(JSON.stringify({
+  v: 1,
+  request_id: "unrestricted_fixture",
+  cwd: bridgeUnitHome,
+  prompt_sha256: createHash("sha256").update(unrestrictedPromptFixture).digest("hex"),
+  expires_at: Date.now() + 30_000,
+  nonce: "fixture"
+}), "utf8");
+const unrestrictedGrantFixture = {
+  KIMI_K3_UNRESTRICTED_GRANT:
+    `${unrestrictedPayload.toString("base64url")}.${
+      sign(null, unrestrictedPayload, unrestrictedKeyPair.privateKey).toString("base64url")
+    }`,
+  KIMI_K3_UNRESTRICTED_PUBLIC_KEY: unrestrictedKeyPair.publicKey
+    .export({ type: "spki", format: "der" })
+    .toString("base64url")
+};
+let mismatchedGrantRejected = false;
+try {
+  validateUnrestrictedGrant("different task", bridgeUnitHome, unrestrictedGrantFixture);
+} catch {
+  mismatchedGrantRejected = true;
+}
+const parsedAuthorization = parseNeedsAuthorization(
+  'Need approval.\n```needs_authorization\n{"capability":"write","paths":["src"],"reason":"required","minimum_scope":"src only"}\n```'
+);
+const sanitizedKimiEnvironment = kimiServiceEnvironment({
+  PATH: "fixture",
+  KIMI_CODE_HOME: bridgeUnitHome,
+  KIMI_K3_ENABLE_UNRESTRICTED: "1",
+  KIMI_K3_UNRESTRICTED_GRANT: "secret",
+  KIMI_K3_UNRESTRICTED_PUBLIC_KEY: "public"
+});
+if (
+  validateUnrestrictedGrant(unrestrictedPromptFixture, bridgeUnitHome, unrestrictedGrantFixture).request_id !==
+    "unrestricted_fixture" ||
+  !mismatchedGrantRejected ||
+  parsedAuthorization?.minimum_scope !== "src only" ||
+  sanitizedKimiEnvironment.KIMI_CODE_HOME !== bridgeUnitHome ||
+  Object.keys(sanitizedKimiEnvironment).some((key) => key.startsWith("KIMI_K3_"))
+) {
+  throw new Error("The unrestricted grant or needs_authorization protocol contract failed.");
+}
 const {
   bridgeEnvironment,
   browserCommand,
   browserToolDefinition,
+  confirmUnrestrictedToolDefinition,
   createBrowserGateway,
   awaitToolDefinition,
   inspectSessionToolSecurity,
@@ -78,6 +127,7 @@ const {
   parseBridgeFooter,
   readSessionPolicy,
   receiveToolDefinition,
+  requestUnrestrictedToolDefinition,
   startToolDefinition,
   toolDefinitions
 } = await import(pathToFileURL(mcpServer));
@@ -86,7 +136,8 @@ const {
   appendSecurityAudit,
   findSensitivePaths,
   inspectToolSecurity,
-  isSensitivePath
+  isSensitivePath,
+  READ_ONLY_TOOLS
 } = await import(pathToFileURL(policyModule));
 const footer = parseBridgeFooter("---\nKimi K3 session: session_mcp\nMode: analyze\nFocus: engineering\nStatus: completed\nModel: kimi-code/k3 (verified)\n");
 if (footer.sessionId !== "session_mcp" || footer.status !== "completed" || footer.model !== "kimi-code/k3" || !footer.verifiedK3) {
@@ -99,9 +150,13 @@ if (
   startToolDefinition.inputSchema?.properties?.sensitive_paths_ack?.default !== false ||
   startToolDefinition._meta?.ui?.resourceUri !== panelResource.uri ||
   startToolDefinition._meta?.["openai/outputTemplate"] !== panelResource.uri ||
+  requestUnrestrictedToolDefinition.inputSchema?.properties?.unrestricted !== undefined ||
+  requestUnrestrictedToolDefinition.annotations?.destructiveHint !== true ||
+  confirmUnrestrictedToolDefinition._meta?.ui?.visibility?.join(",") !== "app" ||
+  confirmUnrestrictedToolDefinition._meta?.["openai/visibility"] !== "private" ||
   panelResource.mimeType !== "text/html;profile=mcp-app" ||
   toolDefinitions.map((tool) => tool.name).join(",") !==
-    "start_k3_collaboration,open_k3_panel,send_k3_message,await_k3_result,receive_k3_events,open_k3_in_browser,get_k3_status,get_k3_result,cancel_k3_job"
+    "start_k3_collaboration,request_unrestricted_k3,open_k3_panel,send_k3_message,await_k3_result,receive_k3_events,open_k3_in_browser,confirm_unrestricted_k3,get_k3_status,get_k3_result,cancel_k3_job"
 ) {
   throw new Error("The direct MCP Apps tool contract is invalid.");
 }
@@ -109,6 +164,9 @@ const filteredBridgeEnvironment = bridgeEnvironment({
   Path: "fixture-path",
   KIMI_CODE_HOME: "fixture-home",
   KIMI_K3_SERVER_WRAPPER: "fixture-wrapper",
+  KIMI_K3_ENABLE_UNRESTRICTED: "1",
+  KIMI_K3_UNRESTRICTED_GRANT: "must-not-pass",
+  KIMI_K3_UNRESTRICTED_PUBLIC_KEY: "must-not-pass",
   GH_TOKEN: "must-not-pass",
   AWS_SECRET_ACCESS_KEY: "must-not-pass",
   NODE_OPTIONS: "--require must-not-pass"
@@ -118,7 +176,14 @@ if (
   filteredBridgeEnvironment.KIMI_CODE_HOME !== "fixture-home" ||
   filteredBridgeEnvironment.KIMI_K3_SERVER_WRAPPER !== "fixture-wrapper" ||
   Object.keys(filteredBridgeEnvironment).some((key) =>
-    ["GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "NODE_OPTIONS"].includes(key)
+    [
+      "GH_TOKEN",
+      "AWS_SECRET_ACCESS_KEY",
+      "NODE_OPTIONS",
+      "KIMI_K3_ENABLE_UNRESTRICTED",
+      "KIMI_K3_UNRESTRICTED_GRANT",
+      "KIMI_K3_UNRESTRICTED_PUBLIC_KEY"
+    ].includes(key)
   )
 ) {
   throw new Error("The Kimi bridge environment allowlist leaked an unapproved variable.");
@@ -175,7 +240,8 @@ const gateway = createBrowserGateway(() => ({
 }));
 let expiredGateway;
 try {
-  const ticketUrl = await gateway.issue("session_browser_gateway");
+  const issuedTicket = await gateway.issueDetails("session_browser_gateway");
+  const ticketUrl = issuedTicket.url;
   const exchanged = await fetch(ticketUrl, { redirect: "manual" });
   const cookie = exchanged.headers.get("set-cookie")?.split(";", 1)[0];
   const reused = await fetch(ticketUrl, { redirect: "manual" });
@@ -202,6 +268,8 @@ try {
   const expired = await fetch(expiredTicket, { redirect: "manual" });
   if (
     ticketUrl.includes(gatewayToken) ||
+    issuedTicket.expires_at <= Date.now() ||
+    issuedTicket.expires_at > Date.now() + 121000 ||
     exchanged.status !== 302 ||
     !exchanged.headers.get("location")?.startsWith("/sessions/session_browser_gateway#token=") ||
     exchanged.headers.get("location")?.includes(gatewayToken) ||
@@ -260,11 +328,54 @@ fs.writeFileSync(path.join(persistedPolicyRoot, "session_outside.json"), JSON.st
   sensitive_paths_acknowledged: false,
   sandboxed: false
 }));
+fs.writeFileSync(path.join(persistedPolicyRoot, "session_unrestricted.json"), JSON.stringify({
+  kind: "kimi-k3-native-delegation",
+  session_id: "session_unrestricted",
+  mode: "execute",
+  cwd: policyCwd,
+  source_cwd: policyCwd,
+  allowed_paths: [],
+  unrestricted: true,
+  unrestricted_request_id: "unrestricted_fixture",
+  workspace: {
+    isolation: "single-writer",
+    cwd: policyCwd,
+    source_cwd: policyCwd,
+    allowed_paths: []
+  }
+}));
+fs.writeFileSync(path.join(persistedPolicyRoot, "session_unrestricted_invalid.json"), JSON.stringify({
+  kind: "kimi-k3-native-delegation",
+  session_id: "session_unrestricted_invalid",
+  mode: "execute",
+  cwd: policyCwd,
+  source_cwd: policyCwd,
+  allowed_paths: [],
+  unrestricted: true,
+  workspace: {
+    isolation: "single-writer",
+    cwd: policyCwd,
+    source_cwd: policyCwd,
+    allowed_paths: []
+  }
+}));
+const unrestrictedRelayFindings = [
+  { name: "Bash", args: { command: "pwd" }, toolCallId: "unrestricted_bash_1" },
+  { name: "Bash", args: { command: "ls" }, toolCallId: "unrestricted_bash_2" },
+  { name: "Write", args: { path: path.join(policyCwd, "fixture.txt") }, toolCallId: "unrestricted_write" }
+].map((payload) =>
+  inspectSessionToolSecurity("session_unrestricted", payload, "execute", persistedPolicyRoot)
+);
 if (
   !readSessionPolicy("session_valid", persistedPolicyRoot).valid ||
+  !readSessionPolicy("session_unrestricted", persistedPolicyRoot).unrestricted ||
   readSessionPolicy("session_missing", persistedPolicyRoot).valid ||
   readSessionPolicy("session_invalid", persistedPolicyRoot).valid ||
   readSessionPolicy("session_outside", persistedPolicyRoot).valid ||
+  readSessionPolicy("session_unrestricted_invalid", persistedPolicyRoot).valid ||
+  unrestrictedRelayFindings.some((finding) =>
+    finding?.action !== "allow" || finding?.event !== "unrestricted_tool_allowed"
+  ) ||
   inspectSessionToolSecurity(
     "session_valid",
     { name: "Read", args: { path: "README.md" } },
@@ -276,9 +387,15 @@ if (
     { name: "Read", args: { path: "README.md" } },
     "analyze",
     persistedPolicyRoot
+  )?.event !== "session_policy_unavailable" ||
+  inspectSessionToolSecurity(
+    "session_unrestricted_invalid",
+    { name: "Bash", args: { command: "pwd" } },
+    "execute",
+    persistedPolicyRoot
   )?.event !== "session_policy_unavailable"
 ) {
-  throw new Error("Missing or invalid persisted session policy did not fail closed.");
+  throw new Error("Persisted safe or confirmed unrestricted session policy handling regressed.");
 }
 const sensitiveBlocked = inspectToolSecurity(
   { name: "Read", args: { path: ".env.production" } },
@@ -292,7 +409,12 @@ const shellWarned = inspectToolSecurity(
   { name: "Bash", args: { command: "build" } },
   { mode: "execute", cwd: policyCwd, allowedPaths: [policyAllowed] }
 );
+const unrestrictedAllowed = inspectToolSecurity(
+  { name: "Write", args: { path: path.resolve(policyCwd, "..", ".env.production") } },
+  { mode: "execute", cwd: policyCwd, unrestricted: true }
+);
 if (
+  READ_ONLY_TOOLS.includes("Agent") ||
   !isSensitivePath("config/.env.local") ||
   !isSensitivePath(".ENV") ||
   !isSensitivePath(".env:stream") ||
@@ -302,6 +424,8 @@ if (
   sensitiveBlocked?.event !== "sensitive_path_blocked" ||
   externalBlocked?.event !== "external_write_blocked" ||
   shellWarned?.event !== "unsandboxed_shell_warning" ||
+  unrestrictedAllowed?.action !== "allow" ||
+  unrestrictedAllowed?.event !== "unrestricted_tool_allowed" ||
   inspectToolSecurity(
     { name: "Read", args: { path: ".env.production" } },
     { mode: "analyze", cwd: policyCwd, sensitivePathsAcknowledged: true }
@@ -375,6 +499,23 @@ if (
   integratedHandoff.text.includes("Preserved worktree")
 ) {
   throw new Error("An integrated handoff must expose worktree_root without preserved-worktree guidance.");
+}
+const directWriteHandoff = integrationHandoff({
+  integration: {
+    isolation: "single-writer",
+    state: "direct_changes",
+    source_cwd: policyCwd,
+    changes_verified: false
+  }
+});
+if (
+  directWriteHandoff.structured.integration_state !== "direct_changes" ||
+  directWriteHandoff.structured.changes_verified !== false ||
+  !directWriteHandoff.text.includes("direct-write access was available") ||
+  !directWriteHandoff.text.includes("unverified") ||
+  /changes were made/i.test(directWriteHandoff.text)
+) {
+  throw new Error("An unverified single-writer handoff claimed that files changed.");
 }
 
 if (
@@ -500,6 +641,33 @@ try {
     checkedGit(isolationFixture, ["show", `${followupHandoff.commit}:src/feature.txt`]) !== "k3 follow-up change"
   ) {
     throw new Error("An execute-mode follow-up did not recreate and finalize the isolated worktree.");
+  }
+
+  const unrestrictedWorkspace = await prepareExecutionWorkspace(
+    isolationFixture,
+    [isolationFixture],
+    undefined,
+    true,
+    true
+  );
+  const unrestrictedRecord = {
+    session_id: "session_unrestricted_fixture",
+    prompt_id: "prompt_unrestricted_fixture",
+    mode: "execute",
+    unrestricted: true,
+    workspace: unrestrictedWorkspace.workspace
+  };
+  const unrestrictedHandoff = finalizeExecutionWorkspace(unrestrictedRecord);
+  if (
+    !samePath(unrestrictedWorkspace.cwd, isolationFixture) ||
+    unrestrictedWorkspace.workspace.isolation !== "single-writer" ||
+    unrestrictedHandoff.state !== "direct_changes" ||
+    unrestrictedHandoff.changes_verified !== false ||
+    !unrestrictedHandoff.note.includes("not path-confined") ||
+    !unrestrictedHandoff.note.includes("unverified") ||
+    /changed the source directory/i.test(unrestrictedHandoff.note)
+  ) {
+    throw new Error("Unrestricted execution did not use the direct single-writer path.");
   }
 
   fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "overlapping local change\n");
@@ -1150,20 +1318,25 @@ relayServer.on("upgrade", (request, socket) => {
         { type: "assistant.delta", session_id: "session_portable_mcp", seq: 2, volatile: true, offset: 0, payload: { turnId: "turn_fixture", delta: "A" } },
         { type: "assistant.delta", session_id: "session_portable_mcp", seq: 2, volatile: true, offset: 1, payload: { turnId: "turn_fixture", delta: "B" } },
         sharedToolStart,
-        { type: "event.approval.requested", session_id: "session_portable_mcp", seq: 4, payload: { approval_id: "approval_fixture", tool_call_id: "tool_bash", tool_name: "Bash" } }
+        { type: "event.approval.requested", session_id: "session_portable_mcp", seq: 4, payload: { approval_id: "approval_fixture", tool_call_id: "tool_bash", tool_name: "Bash" } },
+        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 5, payload: { toolCallId: "tool_bash", name: "Bash", args: { command: "echo denied" } } },
+        { type: "tool.result", session_id: "session_portable_mcp", seq: 6, payload: { toolCallId: "tool_bash", output: "denied", isError: true } },
+        { type: "event.approval.requested", session_id: "session_portable_mcp", seq: 7, payload: { approval_id: "approval_integrity", tool_call_id: "tool_integrity", tool_name: "Bash" } },
+        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 8, payload: { toolCallId: "tool_integrity", name: "Bash", args: { command: "echo should-not-run" } } },
+        { type: "tool.result", session_id: "session_portable_mcp", seq: 9, payload: { toolCallId: "tool_integrity", output: "unexpected success", isError: false } }
       ]
     : [
         { type: "server_hello", payload: { protocol_version: 1 } },
         sharedToolStart,
         { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "x".repeat(300000) } } },
         { type: "tool.progress", session_id: "session_portable_mcp", seq: 5, volatile: true, payload: { toolCallId: "tool_fixture", update: { message: "y".repeat(300000) } } },
-        { type: "resync_required", payload: { session_id: "session_portable_mcp", current_seq: 5, epoch: "epoch_portable_resync" } },
-        { type: "tool.result", session_id: "session_portable_mcp", seq: 6, payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
-        { type: "error", session_id: "session_portable_mcp", seq: 7, payload: { code: "provider.rate_limit", message: "429 overloaded", fatal: true } },
-        { type: "turn.started", session_id: "session_portable_mcp", seq: 8, payload: { turnId: "turn_followup" } },
-        { type: "error", session_id: "session_portable_mcp", seq: 9, payload: { code: "provider.rate_limit", message: "429 overloaded again", fatal: true } },
-        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 10, payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
-        { type: "turn.ended", session_id: "session_portable_mcp", seq: 11, payload: { turnId: "turn_followup", reason: "completed" } }
+        { type: "resync_required", payload: { session_id: "session_portable_mcp", current_seq: 9, epoch: "epoch_portable_resync" } },
+        { type: "tool.result", session_id: "session_portable_mcp", seq: 10, epoch: "epoch_portable_resync", payload: { toolCallId: "tool_fixture", output: "ok", isError: false } },
+        { type: "error", session_id: "session_portable_mcp", seq: 11, epoch: "epoch_portable_resync", payload: { code: "provider.rate_limit", message: "429 overloaded", fatal: true } },
+        { type: "turn.started", session_id: "session_portable_mcp", seq: 12, epoch: "epoch_portable_resync", payload: { turnId: "turn_followup" } },
+        { type: "error", session_id: "session_portable_mcp", seq: 13, epoch: "epoch_portable_resync", payload: { code: "provider.rate_limit", message: "429 overloaded again", fatal: true } },
+        { type: "tool.call.started", session_id: "session_portable_mcp", seq: 14, epoch: "epoch_portable_resync", payload: { toolCallId: "tool_disallowed", name: "Bash", args: { command: "echo blocked" } } },
+        { type: "turn.ended", session_id: "session_portable_mcp", seq: 15, epoch: "epoch_portable_resync", payload: { turnId: "turn_followup", reason: "completed" } }
       ];
   socket.write(Buffer.concat([headers, ...frames.map(websocketFrame)]));
   if (relayConnectionCount === 1) setTimeout(() => socket.destroy(), 20);
@@ -1198,7 +1371,9 @@ if (action === "start") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
   fs.appendFileSync(process.env.KIMI_CODE_HOME + "/start-calls", "1\\n");
   fs.appendFileSync(process.env.KIMI_CODE_HOME + "/start-args", JSON.stringify(args) + "\\n");
-  process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
+  const unrestricted = args.includes("--unrestricted");
+  if (unrestricted && (!process.env.KIMI_K3_UNRESTRICTED_GRANT || !process.env.KIMI_K3_UNRESTRICTED_PUBLIC_KEY)) process.exit(3);
+  process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: unrestricted ? "execute" : "analyze", unrestricted, focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "send") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
   process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
@@ -1233,6 +1408,7 @@ const mcpChild = spawn(process.execPath, [mcpServer], {
     KIMI_K3_BRIDGE: stubBridge,
     KIMI_CODE_HOME: mcpFixtureHome,
     KIMI_K3_BROWSER_TEST: "1",
+    KIMI_K3_ENABLE_UNRESTRICTED: "1",
     KIMI_K3_UNSAFE_ENV_FIXTURE: "must-not-pass"
   }
 });
@@ -1286,16 +1462,44 @@ try {
   let relayGeneration = "";
   const relayedFrames = [];
   let maxRelayedBatchBytes = 0;
-  for (let attempt = 0; attempt < 10 && !relayedFrames.some((frame) => frame.type === "turn.ended"); attempt += 1) {
+  for (let attempt = 0; attempt < 30 && !relayedFrames.some((frame) => frame.type === "turn.ended"); attempt += 1) {
     const received = await request(nextRequestId++, "tools/call", {
       name: "receive_k3_events",
       arguments: { session_id: "session_portable_mcp", after_cursor: relayCursor, wait_ms: 1000 }
     });
     const batch = received.result?.structuredContent;
+    if (
+      typeof batch?.session_id !== "string" ||
+      typeof batch?.relay_generation !== "string" ||
+      !Number.isInteger(batch?.cursor) ||
+      !Array.isArray(batch?.events) ||
+      (batch?.dropped_before_cursor !== null && !Number.isInteger(batch?.dropped_before_cursor)) ||
+      received.result?._meta?.["kimi-k3/browserTicketUrl"] !== undefined ||
+      received.result?._meta?.["kimi-k3/browserTicketExpiresAt"] !== undefined
+    ) {
+      throw new Error("The K3 event relay returned an invalid batch contract.");
+    }
     relayGeneration ||= batch?.relay_generation || "";
     maxRelayedBatchBytes = Math.max(maxRelayedBatchBytes, Buffer.byteLength(JSON.stringify(batch?.events || []), "utf8"));
     relayedFrames.push(...(batch?.events || []));
     relayCursor = batch?.cursor ?? relayCursor;
+  }
+  const invalidReceives = await Promise.all([
+    request(nextRequestId++, "tools/call", {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_portable_mcp", after_cursor: 0, wait_ms: 55001 }
+    }),
+    request(nextRequestId++, "tools/call", {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_portable_mcp", after_cursor: 0, wait_ms: 1.5 }
+    }),
+    request(nextRequestId++, "tools/call", {
+      name: "receive_k3_events",
+      arguments: { session_id: "session_portable_mcp", after_cursor: -1, wait_ms: 0 }
+    })
+  ]);
+  if (invalidReceives.some((response) => !response.result?.isError)) {
+    throw new Error("The K3 event relay accepted an invalid cursor or wait boundary.");
   }
   const started = await request(nextRequestId++, "tools/call", {
     name: "start_k3_collaboration",
@@ -1313,16 +1517,50 @@ try {
       sensitive_paths_ack: true
     }
   });
+  const unrestrictedRequested = await request(nextRequestId++, "tools/call", {
+    name: "request_unrestricted_k3",
+    arguments: { prompt: "Stub unrestricted execute", focus: "engineering", cwd: root }
+  });
+  const unrestrictedRequestId = unrestrictedRequested.result?.structuredContent?.session_id;
+  const unrestrictedToken = unrestrictedRequested.result?._meta?.["kimi-k3/unrestrictedConfirmationToken"];
+  const invalidUnrestrictedConfirmation = await request(nextRequestId++, "tools/call", {
+    name: "confirm_unrestricted_k3",
+    arguments: {
+      request_id: unrestrictedRequestId,
+      confirmation: "ENABLE UNRESTRICTED",
+      confirmation_token: "x".repeat(43)
+    }
+  });
+  const unrestrictedConfirmed = await request(nextRequestId++, "tools/call", {
+    name: "confirm_unrestricted_k3",
+    arguments: {
+      request_id: unrestrictedRequestId,
+      confirmation: "ENABLE UNRESTRICTED",
+      confirmation_token: unrestrictedToken
+    }
+  });
+  const unrestrictedAwaited = await request(nextRequestId++, "tools/call", {
+    name: "await_k3_result",
+    arguments: { session_id: unrestrictedRequestId, wait_seconds: 1 }
+  });
   const propagatedStartArgs = fs.readFileSync(path.join(mcpFixtureHome, "start-args"), "utf8")
     .trim().split(/\r?\n/).map(JSON.parse);
   const opened = await request(nextRequestId++, "tools/call", {
     name: "open_k3_panel",
     arguments: { session_id: "session_portable_mcp" }
   });
+  let overlappingReceiveSettled = false;
+  const overlappingReceive = request(nextRequestId++, "tools/call", {
+    name: "receive_k3_events",
+    arguments: { session_id: "session_portable_mcp", after_cursor: relayCursor, wait_ms: 1000 }
+  }).finally(() => { overlappingReceiveSettled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
   const browserOpened = await request(nextRequestId++, "tools/call", {
     name: "open_k3_in_browser",
     arguments: { session_id: "session_portable_mcp" }
   });
+  const browserOpenedBeforeReceive = !overlappingReceiveSettled;
+  await overlappingReceive;
   const awaited = await request(nextRequestId++, "tools/call", {
     name: "await_k3_result",
     arguments: { session_id: "session_portable_mcp", wait_seconds: 1 }
@@ -1384,7 +1622,7 @@ try {
 
   if (
     initialized.result?.serverInfo?.name !== "Kimi K3 Collab" ||
-    listed.result?.tools?.length !== 9 ||
+    listed.result?.tools?.length !== 11 ||
     resources.result?.resources?.[0]?.uri !== panelResource.uri ||
     panel.result?.contents?.[0]?.mimeType !== panelResource.mimeType ||
     !panel.result?.contents?.[0]?.text?.includes("Kimi K3 live session") ||
@@ -1393,8 +1631,15 @@ try {
     panel.result?.contents?.[0]?.text?.includes("new WebSocket") ||
     panel.result?.contents?.[0]?.text?.includes("kimi-code.bearer.") ||
     !panel.result?.contents?.[0]?.text?.includes("receive_k3_events") ||
-    !panel.result?.contents?.[0]?.text?.includes("open_k3_in_browser") ||
+    !panel.result?.contents?.[0]?.text?.includes('callTool("open_k3_in_browser"') ||
+    panel.result?.contents?.[0]?.text?.includes("window.openai.openExternal") ||
     !panel.result?.contents?.[0]?.text?.includes("send_k3_message") ||
+    !panel.result?.contents?.[0]?.text?.includes("confirm_unrestricted_k3") ||
+    !panel.result?.contents?.[0]?.text?.includes("ENABLE UNRESTRICTED") ||
+    !panel.result?.contents?.[0]?.text?.includes("const RECEIVE_WATCHDOG_MS = 60000") ||
+    !panel.result?.contents?.[0]?.text?.includes("const MAX_ORPHANED_RECEIVES = 2") ||
+    !panel.result?.contents?.[0]?.text?.includes("state.receiveLoopGeneration || state.terminal") ||
+    !panel.result?.contents?.[0]?.text?.includes("Stream unavailable") ||
     !panel.result?.contents?.[0]?.text?.includes("relay.policy") ||
     !panel.result?.contents?.[0]?.text?.includes("resynced") ||
     !panel.result?.contents?.[0]?.text?.includes("stream gap: resumed at source offset") ||
@@ -1412,12 +1657,195 @@ try {
   const panelScript = panel.result?.contents?.[0]?.text?.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   if (!panelScript) throw new Error("The K3 event panel script is missing.");
   Function(panelScript);
+  const browserOpenSource = panelScript.match(
+    /\/\/ browser-open:start([\s\S]*?)\/\/ browser-open:end/
+  )?.[1];
+  if (!browserOpenSource) throw new Error("The private Kimi browser launcher is missing.");
+  const createBrowserOpenHarness = Function(
+    "window",
+    "state",
+    "elements",
+    "addNotice",
+    "callResult",
+    `${browserOpenSource}; return openK3InBrowser;`
+  );
+  const browserCalls = [];
+  const browserNotices = [];
+  const browserElements = { external: { disabled: false } };
+  const openBrowser = createBrowserOpenHarness(
+    {
+      openai: {
+        openExternal() {
+          throw new Error("Host-specific external links must not be used.");
+        },
+        callTool(name, arguments_) {
+          browserCalls.push({ name, arguments_ });
+          return Promise.resolve({ structuredContent: { opened: true } });
+        }
+      }
+    },
+    { sessionId: "session_panel_fixture" },
+    browserElements,
+    (message, error) => browserNotices.push({ message, error }),
+    (response) => response?.result || response
+  );
+  await openBrowser();
+  if (
+    browserCalls.length !== 1 ||
+    browserCalls[0].name !== "open_k3_in_browser" ||
+    browserCalls[0].arguments_?.session_id !== "session_panel_fixture" ||
+    browserElements.external.disabled ||
+    browserNotices.length !== 0
+  ) {
+    throw new Error("The panel did not use the private browser launcher or restore its button state.");
+  }
+  const receiveLoopSource = panelScript.match(
+    /\/\/ receive-loop:start([\s\S]*?)\/\/ receive-loop:end/
+  )?.[1]
+    ?.replace("const RECEIVE_WATCHDOG_MS = 60000;", "const RECEIVE_WATCHDOG_MS = 20;")
+    .replace("const RECEIVE_PROBE_WATCHDOG_MS = 15000;", "const RECEIVE_PROBE_WATCHDOG_MS = 10;");
+  if (!receiveLoopSource) throw new Error("The bounded K3 receive loop is missing.");
+  const createReceiveHarness = Function(
+    "window",
+    "state",
+    "elements",
+    "setConnection",
+    "addNotice",
+    "handleFrame",
+    `${receiveLoopSource};
+     return { receiveLoop, validBatch };`
+  );
+  const createPanelState = () => ({
+    sessionId: "session_panel_fixture",
+    cursor: 0,
+    relayGeneration: "",
+    generation: 1,
+    receiveFailures: 0,
+    receiveLoopGeneration: 0,
+    receiveSequence: 0,
+    orphanedReceives: 0,
+    streamStopped: false,
+    terminal: false,
+    disposed: false,
+    tools: new Map(),
+    subagents: new Map(),
+    assistants: new Map(),
+    currentTurnId: ""
+  });
+  const createPanelElements = () => {
+    const strong = { textContent: "" };
+    const span = { textContent: "" };
+    return {
+      connection: { textContent: "Connecting" },
+      empty: {
+        hidden: false,
+        className: "",
+        querySelector: (selector) => selector === "strong" ? strong : span
+      },
+      timeline: { hidden: true, replaceChildren() {} },
+      prompt: { disabled: true },
+      send: { disabled: true }
+    };
+  };
+  const blackholeCalls = [];
+  const blackholePending = [];
+  const blackholeState = createPanelState();
+  const blackholeElements = createPanelElements();
+  let blackholeFrames = 0;
+  const blackholeHarness = createReceiveHarness(
+    {
+      openai: {
+        callTool(_name, arguments_) {
+          blackholeCalls.push(arguments_);
+          return new Promise((resolve) => blackholePending.push(resolve));
+        }
+      }
+    },
+    blackholeState,
+    blackholeElements,
+    (label) => { blackholeElements.connection.textContent = label; },
+    () => {},
+    () => { blackholeFrames += 1; }
+  );
+  await blackholeHarness.receiveLoop(blackholeState.generation);
+  for (const resolve of blackholePending) {
+    resolve({ structuredContent: { relay_generation: "late", cursor: 99, events: [{ type: "late" }] } });
+  }
+  await Promise.resolve();
+  blackholeState.generation += 1;
+  await blackholeHarness.receiveLoop(blackholeState.generation);
+  if (
+    blackholeCalls.length !== 2 ||
+    blackholeCalls[0]?.wait_ms !== 45000 ||
+    blackholeCalls[1]?.wait_ms !== 0 ||
+    blackholeState.orphanedReceives !== 2 ||
+    !blackholeState.streamStopped ||
+    blackholeState.receiveLoopGeneration !== 0 ||
+    blackholeState.cursor !== 0 ||
+    blackholeFrames !== 0 ||
+    blackholeElements.connection.textContent !== "Stream unavailable"
+  ) {
+    throw new Error("The K3 panel receive watchdog is unbounded, reset its budget, or applied a late orphan response.");
+  }
+  const recoveryCalls = [];
+  const recoveryState = createPanelState();
+  const recoveryElements = createPanelElements();
+  let recoveryFrames = 0;
+  const recoveryHarness = createReceiveHarness(
+    {
+      openai: {
+        callTool(_name, arguments_) {
+          recoveryCalls.push(arguments_);
+          if (recoveryCalls.length === 1) return new Promise(() => {});
+          return Promise.resolve({
+            structuredContent: {
+              relay_generation: "recovered",
+              cursor: 1,
+              events: [{ type: "fixture.completed" }]
+            }
+          });
+        }
+      }
+    },
+    recoveryState,
+    recoveryElements,
+    (label) => { recoveryElements.connection.textContent = label; },
+    () => {},
+    () => {
+      recoveryFrames += 1;
+      recoveryState.terminal = true;
+    }
+  );
+  await recoveryHarness.receiveLoop(recoveryState.generation);
+  let malformedBatchRejected = false;
+  try {
+    recoveryHarness.validBatch({ structuredContent: {} });
+  } catch {
+    malformedBatchRejected = true;
+  }
+  if (
+    (panelScript.match(/orphanedReceives:\s*0/g) || []).length !== 1 ||
+    recoveryCalls.length !== 2 ||
+    recoveryCalls[1]?.wait_ms !== 0 ||
+    recoveryState.orphanedReceives !== 1 ||
+    recoveryState.streamStopped ||
+    recoveryState.cursor !== 1 ||
+    recoveryFrames !== 1 ||
+    recoveryElements.connection.textContent !== "Live" ||
+    !malformedBatchRejected
+  ) {
+    throw new Error("The K3 panel bounded recovery probe or batch validation failed.");
+  }
 
   const privateToken = started.result?._meta?.["kimi-k3/token"];
   const privateOrigin = started.result?._meta?.["kimi-k3/origin"];
   const modelVisible = JSON.stringify({
     content: started.result?.content,
     structuredContent: started.result?.structuredContent
+  });
+  const unrestrictedModelVisible = JSON.stringify({
+    content: unrestrictedRequested.result?.content,
+    structuredContent: unrestrictedRequested.result?.structuredContent
   });
   if (
     started.result?.structuredContent?.status !== "running" ||
@@ -1428,10 +1856,27 @@ try {
       args.includes("--ack-sensitive-paths") &&
       args.includes("--allowed-path")
     ) ||
+    !propagatedStartArgs.some((args) => args.includes("--unrestricted")) ||
+    !unrestrictedRequestId?.startsWith("unrestricted_") ||
+    typeof unrestrictedToken !== "string" ||
+    unrestrictedToken.length < 32 ||
+    unrestrictedRequested.result?._meta?.["kimi-k3/unrestrictedPrompt"] !== "Stub unrestricted execute" ||
+    unrestrictedModelVisible.includes(unrestrictedToken) ||
+    !invalidUnrestrictedConfirmation.result?.isError ||
+    unrestrictedConfirmed.result?._meta?.["kimi-k3/sessionId"] !== "session_portable_mcp" ||
+    unrestrictedConfirmed.result?._meta?.["kimi-k3/unrestricted"] !== true ||
+    !unrestrictedAwaited.result?.structuredContent?.complete ||
+    !unrestrictedAwaited.result?.content?.[0]?.text?.includes("# Stub K3 report") ||
     started.result?._meta?.["kimi-k3/sessionId"] !== "session_portable_mcp" ||
+    started.result?._meta?.["kimi-k3/browserTicketUrl"] !== undefined ||
+    started.result?._meta?.["kimi-k3/browserTicketExpiresAt"] !== undefined ||
+    opened.result?._meta?.["kimi-k3/browserTicketUrl"] !== undefined ||
+    !browserOpenedBeforeReceive ||
     started.result?._meta?.["kimi-k3/panelUrl"] !== undefined ||
     privateToken !== undefined ||
     privateOrigin !== undefined ||
+    JSON.stringify(started.result?._meta).includes(fixtureToken) ||
+    modelVisible.includes("__kimi_k3_ticket") ||
     opened.result?._meta?.["kimi-k3/sessionId"] !== "session_portable_mcp" ||
     browserOpened.result?.structuredContent?.opened !== true ||
     awaited.result?.structuredContent?.complete !== true ||
@@ -1462,7 +1907,12 @@ try {
     relayedFrames.filter((frame) => frame.type === "tool.call.started" && frame.seq === 3).length !== 1 ||
     !relayedFrames.some((frame) => frame.type === "tool.result") ||
     !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.status === "rejected") ||
-    !relayedFrames.some((frame) => frame.type === "relay.policy" && frame.payload?.message?.includes("Stopped disallowed tool")) ||
+    !relayedFrames.some((frame) =>
+      frame.type === "relay.policy" && frame.payload?.security_event === "denied_tool_returned_success"
+    ) ||
+    relayedFrames.filter((frame) =>
+      frame.type === "relay.policy" && frame.payload?.message?.includes("Stopped disallowed tool")
+    ).length !== 1 ||
     relayedFrames.filter((frame) =>
       frame.type === "relay.status" &&
       frame.payload?.status === "failed" &&
@@ -1476,7 +1926,7 @@ try {
     !fs.existsSync(path.join(mcpFixtureHome, "approval-rejected")) ||
     maxRelayedBatchBytes > 520000 ||
     relayCursor < relayedFrames.length ||
-    [started, opened, browserOpened, awaited, runningAwaited, failedAwaited, messaged, status, result, cancelled].some((message) =>
+    [started, unrestrictedRequested, unrestrictedConfirmed, unrestrictedAwaited, opened, browserOpened, awaited, runningAwaited, failedAwaited, messaged, status, result, cancelled].some((message) =>
       message.result?.content?.[0]?.text?.trimStart().startsWith("{")
     )
   ) {
@@ -1989,7 +2439,9 @@ if (
   !skillContract.includes("await_k3_result") ||
   !skillContract.includes("Stop hook") ||
   !skillContract.includes("isolated worktree") ||
-  !skillContract.includes("isolation=single-writer")
+  !skillContract.includes("isolation=single-writer") ||
+  !skillContract.includes("request_unrestricted_k3") ||
+  !skillContract.includes("needs_authorization")
 ) {
   throw new Error("The direct MCP skill lacks parallel work or the K3-to-Codex handoff contract.");
 }
@@ -1997,6 +2449,7 @@ if (
   !securityContract.includes("KIMI_K3_SERVER_WRAPPER") ||
   !securityContract.includes("dedicated `KIMI_CODE_HOME`") ||
   !securityContract.includes("single-use loopback ticket") ||
+  !securityContract.includes("KIMI_K3_ENABLE_UNRESTRICTED") ||
   securityContract.includes("component-private URL metadata")
 ) {
   throw new Error("The published security contract does not describe the sandbox or browser-token boundary.");
@@ -2025,6 +2478,10 @@ if (
   !Number.isInteger(mcpConfig.tool_timeout_sec) ||
   mcpConfig.tool_timeout_sec < 1 ||
   mcpConfig.tool_timeout_sec > 120 ||
+  mcpConfig.env !== undefined ||
+  !Array.isArray(mcpConfig.env_vars) ||
+  mcpConfig.env_vars.length !== 1 ||
+  mcpConfig.env_vars[0] !== "KIMI_K3_ENABLE_UNRESTRICTED" ||
   mcpConfig.supports_parallel_tool_calls !== true
 ) {
   throw new Error("The plugin MCP server or bounded tool timeout is not configured.");
@@ -2057,6 +2514,9 @@ if (
   !mcpServerText.includes('name: "receive_k3_events"') ||
   !mcpServerText.includes('name: "await_k3_result"') ||
   !mcpServerText.includes('name: "open_k3_in_browser"') ||
+  !mcpServerText.includes('name: "request_unrestricted_k3"') ||
+  !mcpServerText.includes('name: "confirm_unrestricted_k3"') ||
+  !mcpServerText.includes("KIMI_K3_ENABLE_UNRESTRICTED") ||
   !mcpServerText.includes("isolated Git commit handoff") ||
   !mcpServerText.includes('frame.type === "event.approval.requested"') ||
   !mcpServerText.includes('"reject-approval"') ||
@@ -2075,12 +2535,16 @@ if (
 }
 if (
   !policyText.includes('"TodoList"') ||
+  policyText.includes('"Agent"') ||
+  !policyText.includes("unrestricted_tool_allowed") ||
   !policyText.includes("terminalProviderFailure") ||
   policyText.includes('"WebSearch"') ||
   policyText.includes('"FetchURL"') ||
   !bridgeText.includes("Do not call Bash") ||
   !bridgeText.includes('isolation: "git-worktree"') ||
   !bridgeText.includes('isolation: "single-writer"') ||
+  !bridgeText.includes("host-issued confirmation grant") ||
+  !bridgeText.includes("needs_authorization") ||
   !bridgeText.includes('state: "scope_violation"')
 ) {
   throw new Error("Analysis mode does not allow safe planning while forbidding shell execution.");

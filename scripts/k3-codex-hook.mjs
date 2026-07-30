@@ -194,6 +194,7 @@ function trackToolResult(input) {
   const k3SessionId = findField(response, ["session_id", "sessionId"]);
   const status = findField(response, ["status", "state"]);
   const complete = findField(response, ["complete"]);
+  const verifiedK3 = findField(response, ["verified_k3", "verifiedK3"]);
   const current = readState(codexSessionId);
 
   if (/start_k3_collaboration$/.test(toolName) && k3SessionId) {
@@ -210,6 +211,16 @@ function trackToolResult(input) {
     writeState({
       ...(current || { codexSessionId, k3SessionId }),
       k3SessionId,
+      delivered: false,
+      stopContinuationIssued: false
+    });
+    return;
+  }
+  if (/await_k3_result$/.test(toolName) && !current && k3SessionId && verifiedK3 === true && status === "running") {
+    writeState({
+      codexSessionId,
+      k3SessionId,
+      startedTurnId: input.turn_id || null,
       delivered: false,
       stopContinuationIssued: false
     });
