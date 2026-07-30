@@ -84,7 +84,7 @@ Normal collaboration has no model-driven status loop or token-consuming retries:
 ## Requirements
 
 - Node.js 18.18 or newer on Windows, macOS, or Linux
-- Kimi Code CLI with local-server and Web UI support, installed and authenticated. The latest stable `0.29.0` is preferred and `0.26.0` remains a tested legacy baseline; other versions are capability-checked but marked untested. See [compatibility](docs/compatibility.md).
+- Kimi Code CLI with local-server and Web UI support, installed and authenticated. The latest stable `0.31.0` is preferred, `0.29.0` remains tested, and `0.26.0` remains a tested legacy baseline; other versions are capability-checked but marked untested. See [compatibility](docs/compatibility.md).
 - A Codex or ChatGPT host with personal plugins, MCP, and MCP Apps UI support
 - Codex lifecycle-hook support for the automatic stop-time handoff safety net
 - Git on `PATH` for the default isolated `execute` mode

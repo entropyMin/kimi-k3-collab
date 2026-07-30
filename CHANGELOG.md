@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Mark Kimi Code 0.31.0 as tested after a successful real Windows session/prompt/WebSocket/result handoff.
+
 ## 0.5.2 - 2026-07-30
 
 - Pass only an explicit environment allowlist from the MCP server to the Kimi bridge.
