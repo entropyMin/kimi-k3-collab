@@ -485,12 +485,12 @@ try {
       port,
       pid: process.pid,
       heartbeat_at: Date.now(),
-      host_version: "0.29.0"
+      host_version: "0.31.0"
     })
   );
   const currentService = await runBridge(["ensure"]);
   if (
-    currentService.kimi_code_version !== "0.29.0" ||
+    currentService.kimi_code_version !== "0.31.0" ||
     currentService.compatibility_status !== "tested"
   ) {
     throw new Error("The current Kimi instance discovery/version contract failed.");

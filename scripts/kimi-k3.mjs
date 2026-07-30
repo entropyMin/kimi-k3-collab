@@ -19,7 +19,7 @@ import {
 } from "./lib/k3-policy.mjs";
 
 const K3_MODEL = "kimi-code/k3";
-const TESTED_KIMI_CODE_VERSIONS = new Set(["0.26.0", "0.29.0"]);
+const TESTED_KIMI_CODE_VERSIONS = new Set(["0.26.0", "0.29.0", "0.31.0"]);
 const KIMI_HOME = path.resolve(process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code"));
 const JOB_ROOT = path.join(KIMI_HOME, "codex-jobs");
 const WORKTREE_ROOT = path.join(KIMI_HOME, "codex-worktrees");
