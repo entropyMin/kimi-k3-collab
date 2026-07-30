@@ -659,7 +659,7 @@ try {
   };
   const unrestrictedHandoff = finalizeExecutionWorkspace(unrestrictedRecord);
   if (
-    unrestrictedWorkspace.cwd !== path.resolve(isolationFixture) ||
+    !samePath(unrestrictedWorkspace.cwd, isolationFixture) ||
     unrestrictedWorkspace.workspace.isolation !== "single-writer" ||
     unrestrictedHandoff.state !== "direct_changes" ||
     unrestrictedHandoff.changes_verified !== false ||
