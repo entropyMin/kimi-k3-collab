@@ -1,26 +1,18 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
-const SCRIPT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const PLUGIN_ROOT = path.resolve(process.env.PLUGIN_ROOT || process.env.CLAUDE_PLUGIN_ROOT || SCRIPT_ROOT);
 const PLUGIN_DATA = path.resolve(
   process.env.PLUGIN_DATA ||
   process.env.CLAUDE_PLUGIN_DATA ||
   path.join(os.homedir(), ".kimi-code", "codex-plugin-data")
 );
-const BRIDGE = path.resolve(process.env.KIMI_K3_HOOK_BRIDGE || path.join(PLUGIN_ROOT, "scripts", "kimi-k3.mjs"));
-const K3_MODEL = "kimi-code/k3";
-const WINDOW_SECONDS = 105;
-const MAX_STOP_WAIT_SECONDS = Math.max(1, Math.min(600, Number(process.env.KIMI_K3_STOP_MAX_WAIT_SECONDS) || 540));
-const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed", "error", "stopped"]);
-const HANDOFF_STATUSES = new Set([...TERMINAL_STATUSES, "blocked"]);
+const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed", "error", "stopped", "stalled"]);
+const HANDOFF_STATUSES = new Set([...TERMINAL_STATUSES, "blocked", "needs_authorization"]);
 const TRACKED_TOOLS = new Set([
   "start_k3_collaboration",
   "send_k3_message",
@@ -29,17 +21,12 @@ const TRACKED_TOOLS = new Set([
   "cancel_k3_job"
 ]);
 const TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024;
+const WAIT_QUESTION_ID = "k3_wait_decision";
+const CONTINUE_WAITING = "Continue waiting";
+const STOP_WAITING = "Stop waiting";
 
 function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
-}
-
-function safeError(error) {
-  return (error instanceof Error ? error.message : String(error))
-    .replace(/(authorization\s*:\s*bearer)\s+\S+/gi, "$1 [redacted]")
-    .replace(/(--?(?:api[-_]?key|token|password|secret)(?:=|\s+))\S+/gi, "$1[redacted]")
-    .replace(/\b([A-Z0-9_]*(?:TOKEN|API_KEY|SECRET|PASSWORD))=\S+/g, "$1=[redacted]")
-    .slice(0, 500);
 }
 
 function statePath(codexSessionId) {
@@ -61,6 +48,77 @@ function writeState(state) {
   fs.writeFileSync(file, `${JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
 }
 
+function findField(value, names, depth = 0) {
+  if (depth > 7 || value == null || typeof value !== "object") return null;
+  for (const name of names) {
+    if (typeof value[name] === "string" && value[name].trim()) return value[name].trim();
+    if (typeof value[name] === "boolean") return value[name];
+  }
+  for (const child of Array.isArray(value) ? value : Object.values(value)) {
+    const found = findField(child, names, depth + 1);
+    if (found != null) return found;
+  }
+  return null;
+}
+
+function containsQuestionId(value, depth = 0) {
+  if (depth > 10 || value == null) return false;
+  if (typeof value === "string") return value === WAIT_QUESTION_ID;
+  if (typeof value !== "object") return false;
+  return Object.entries(value).some(([key, child]) =>
+    key === WAIT_QUESTION_ID ||
+    (key === "id" && child === WAIT_QUESTION_ID) ||
+    containsQuestionId(child, depth + 1)
+  );
+}
+
+function isUserTranscriptEntry(value) {
+  return findField(value, ["role"]) === "user" ||
+    ["user_message", "user_input"].includes(String(value?.payload?.type || value?.type || ""));
+}
+
+function fixedDecision(value, depth = 0, found = new Set()) {
+  if (depth > 10 || value == null) return found;
+  if (typeof value === "string") {
+    const answer = value.trim().toLowerCase();
+    if (answer === CONTINUE_WAITING.toLowerCase()) found.add(CONTINUE_WAITING);
+    if (answer === STOP_WAITING.toLowerCase()) found.add(STOP_WAITING);
+    return found;
+  }
+  if (typeof value === "object") {
+    for (const child of Array.isArray(value) ? value : Object.values(value)) fixedDecision(child, depth + 1, found);
+  }
+  return found;
+}
+
+function applyDecision(state, decision) {
+  if (decision === CONTINUE_WAITING) {
+    return {
+      ...state,
+      running_await_count: 0,
+      waiting_decision: false,
+      user_stopped_waiting: false
+    };
+  }
+  if (decision === STOP_WAITING) {
+    return { ...state, waiting_decision: false, user_stopped_waiting: true };
+  }
+  return state;
+}
+
+function resetHandoff(codexSessionId, k3SessionId, turnId, previous = {}) {
+  return {
+    ...previous,
+    codexSessionId,
+    k3SessionId,
+    startedTurnId: turnId || null,
+    delivered: false,
+    running_await_count: 0,
+    waiting_decision: false,
+    user_stopped_waiting: false
+  };
+}
+
 function recoverStateFromTranscript(input, codexSessionId) {
   const transcript = String(input.transcript_path || "").trim();
   try {
@@ -79,8 +137,8 @@ function recoverStateFromTranscript(input, codexSessionId) {
     const completeText = stat.size > length
       ? firstNewline === -1 ? "" : text.slice(firstNewline + 1)
       : text;
-    for (const line of completeText.split(/\r?\n/).reverse()) {
-      if (!line.includes('"mcp_tool_call_end"') || !line.includes('"kimi-k3"')) continue;
+    let state = null;
+    for (const line of completeText.split(/\r?\n/)) {
       let entry;
       try {
         entry = JSON.parse(line);
@@ -90,146 +148,85 @@ function recoverStateFromTranscript(input, codexSessionId) {
       const payload = entry?.type === "event_msg" ? entry.payload : null;
       const invocation = payload?.type === "mcp_tool_call_end" ? payload.invocation : null;
       const tool = String(invocation?.tool || "");
-      if (invocation?.server !== "kimi-k3" || !TRACKED_TOOLS.has(tool)) continue;
-      const response = payload.result;
-      const k3SessionId = findField(response, ["session_id", "sessionId"])
-        || findField(invocation.arguments, ["session_id", "sessionId"]);
-      if (!k3SessionId) continue;
-      const status = String(findField(response, ["status", "state"]) || "");
-      const complete = findField(response, ["complete"]);
-      const aborted = findField(response, ["aborted"]);
-      if (complete === true || HANDOFF_STATUSES.has(status) || (tool === "cancel_k3_job" && aborted === true)) {
-        return { codexSessionId, k3SessionId, delivered: true, deliveredBy: `transcript:${tool}` };
+      if (invocation?.server === "kimi-k3" && TRACKED_TOOLS.has(tool)) {
+        const response = payload.result;
+        const k3SessionId = findField(response, ["session_id", "sessionId"])
+          || findField(invocation.arguments, ["session_id", "sessionId"]);
+        if (!k3SessionId) continue;
+        const status = String(findField(response, ["status", "state"]) || "");
+        const complete = findField(response, ["complete"]);
+        const verifiedK3 = findField(response, ["verified_k3", "verifiedK3"]);
+        if (tool === "start_k3_collaboration" || tool === "send_k3_message") {
+          state = resetHandoff(codexSessionId, k3SessionId, input.turn_id, { recoveredFrom: "transcript" });
+        } else if (tool === "await_k3_result" && status === "running" && verifiedK3 === true) {
+          state ||= resetHandoff(codexSessionId, k3SessionId, input.turn_id, { recoveredFrom: "transcript" });
+          const count = Math.min(2, Number(state.running_await_count || 0) + 1);
+          state = { ...state, k3SessionId, running_await_count: count, waiting_decision: count >= 2 };
+        } else if (complete === true || HANDOFF_STATUSES.has(status)) {
+          state ||= resetHandoff(codexSessionId, k3SessionId, input.turn_id, { recoveredFrom: "transcript" });
+          state = { ...state, delivered: true, deliveredBy: `transcript:${tool}` };
+        } else if (tool === "cancel_k3_job" && findField(response, ["aborted"]) === true) {
+          state ||= resetHandoff(codexSessionId, k3SessionId, input.turn_id, { recoveredFrom: "transcript" });
+          state = { ...state, delivered: true, deliveredBy: `transcript:${tool}` };
+        }
       }
-      return {
-        codexSessionId,
-        k3SessionId,
-        startedTurnId: input.turn_id || null,
-        delivered: false,
-        stopContinuationIssued: false,
-        recoveredFrom: "transcript"
-      };
+      if (state?.waiting_decision && (containsQuestionId(entry) || isUserTranscriptEntry(entry))) {
+        const decisions = fixedDecision(entry);
+        if (decisions.size === 1) state = applyDecision(state, [...decisions][0]);
+      }
     }
+    return state;
   } catch {
     return null;
   }
-  return null;
-}
-
-function findField(value, names, depth = 0) {
-  if (depth > 7 || value == null || typeof value !== "object") return null;
-  for (const name of names) {
-    if (typeof value[name] === "string" && value[name].trim()) return value[name].trim();
-    if (typeof value[name] === "boolean") return value[name];
-  }
-  for (const child of Array.isArray(value) ? value : Object.values(value)) {
-    const found = findField(child, names, depth + 1);
-    if (found != null) return found;
-  }
-  return null;
-}
-
-function runBridge(sessionId, waitSeconds) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [
-      BRIDGE,
-      "result", "--format", "json", "--session-id", sessionId, "--wait-seconds", String(waitSeconds)
-    ], {
-      cwd: PLUGIN_ROOT,
-      env: process.env,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(stderr.trim() || `Kimi bridge exited with code ${code ?? "unknown"}.`));
-        return;
-      }
-      try {
-        const record = JSON.parse(stdout);
-        const model = record.server_reported_model || record.explicit_model || null;
-        if (!record.verified_k3 || model !== K3_MODEL) {
-          throw new Error(`Kimi handoff did not verify ${K3_MODEL}.`);
-        }
-        const rawStatus = String(record.state || record.status || "unknown");
-        const status = HANDOFF_STATUSES.has(rawStatus)
-          ? rawStatus
-          : record.complete === true || rawStatus === "end_turn"
-            ? "completed"
-            : rawStatus;
-        const report = record.error
-          ? `Kimi K3 collaboration failed: ${record.error}`
-          : typeof record.result === "string" ? record.result.trim() : "";
-        resolve({ status, report });
-      } catch {
-        reject(new Error("Kimi bridge returned invalid JSON to the handoff hook."));
-      }
-    });
-  });
-}
-
-async function waitForHandoff(sessionId) {
-  const deadline = Date.now() + MAX_STOP_WAIT_SECONDS * 1000;
-  let outcome = { report: "", status: "running" };
-  while (Date.now() < deadline && !HANDOFF_STATUSES.has(outcome.status)) {
-    const remaining = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
-    outcome = await runBridge(sessionId, Math.min(WINDOW_SECONDS, remaining));
-  }
-  if (HANDOFF_STATUSES.has(outcome.status)) return runBridge(sessionId, 0);
-  return outcome;
 }
 
 function trackToolResult(input) {
   const codexSessionId = String(input.session_id || "").trim();
   const toolName = String(input.tool_name || "");
   if (!codexSessionId || !toolName) return;
-  const response = input.tool_response;
-  const k3SessionId = findField(response, ["session_id", "sessionId"]);
-  const status = findField(response, ["status", "state"]);
-  const complete = findField(response, ["complete"]);
-  const verifiedK3 = findField(response, ["verified_k3", "verifiedK3"]);
   const current = readState(codexSessionId);
 
+  if (/request_user_input$/.test(toolName) && current?.waiting_decision) {
+    if (!containsQuestionId(input.tool_input) && !containsQuestionId(input.tool_response)) return;
+    const decisions = fixedDecision(input.tool_response);
+    if (decisions.size === 1) writeState(applyDecision(current, [...decisions][0]));
+    return;
+  }
+
+  const response = input.tool_response;
+  const k3SessionId = findField(response, ["session_id", "sessionId"]);
+  const status = String(findField(response, ["status", "state"]) || "");
+  const complete = findField(response, ["complete"]);
+  const verifiedK3 = findField(response, ["verified_k3", "verifiedK3"]);
+
   if (/start_k3_collaboration$/.test(toolName) && k3SessionId) {
-    writeState({
-      codexSessionId,
-      k3SessionId,
-      startedTurnId: input.turn_id || null,
-      delivered: false,
-      stopContinuationIssued: false
-    });
+    writeState(resetHandoff(codexSessionId, k3SessionId, input.turn_id));
     return;
   }
   if (/send_k3_message$/.test(toolName) && k3SessionId) {
-    writeState({
-      ...(current || { codexSessionId, k3SessionId }),
-      k3SessionId,
-      delivered: false,
-      stopContinuationIssued: false
-    });
+    writeState(resetHandoff(codexSessionId, k3SessionId, input.turn_id, current || {}));
     return;
   }
-  if (/await_k3_result$/.test(toolName) && !current && k3SessionId && verifiedK3 === true && status === "running") {
-    writeState({
-      codexSessionId,
-      k3SessionId,
-      startedTurnId: input.turn_id || null,
-      delivered: false,
-      stopContinuationIssued: false
-    });
-    return;
-  }
-  if (/(await_k3_result|get_k3_result)$/.test(toolName) && current) {
-    if (complete === true || HANDOFF_STATUSES.has(String(status || ""))) {
-      writeState({ ...current, delivered: true, deliveredBy: toolName });
+  if (/await_k3_result$/.test(toolName) && k3SessionId) {
+    if (complete === true || HANDOFF_STATUSES.has(status)) {
+      writeState({ ...(current || resetHandoff(codexSessionId, k3SessionId, input.turn_id)), delivered: true, deliveredBy: toolName });
+    } else if (verifiedK3 === true && status === "running") {
+      const state = current || resetHandoff(codexSessionId, k3SessionId, input.turn_id);
+      const count = Math.min(2, Number(state.running_await_count || 0) + 1);
+      writeState({
+        ...state,
+        k3SessionId,
+        delivered: false,
+        running_await_count: count,
+        waiting_decision: count >= 2,
+        user_stopped_waiting: false
+      });
     }
+    return;
+  }
+  if (/get_k3_result$/.test(toolName) && current && (complete === true || HANDOFF_STATUSES.has(status))) {
+    writeState({ ...current, delivered: true, deliveredBy: toolName });
     return;
   }
   if (/cancel_k3_job$/.test(toolName) && current && findField(response, ["aborted"]) === true) {
@@ -237,60 +234,34 @@ function trackToolResult(input) {
   }
 }
 
-async function handleStop(input) {
+function handleStop(input) {
   const codexSessionId = String(input.session_id || "").trim();
-  const state = codexSessionId
-    ? readState(codexSessionId) || recoverStateFromTranscript(input, codexSessionId)
-    : null;
+  let state = codexSessionId ? readState(codexSessionId) : null;
+  const recovered = codexSessionId ? recoverStateFromTranscript(input, codexSessionId) : null;
+  if (!state || (state.waiting_decision && recovered?.k3SessionId === state.k3SessionId)) state = recovered || state;
   if (state?.recoveredFrom === "transcript") writeState(state);
-  if (!state || state.delivered) {
+  if (!state || state.delivered || state.user_stopped_waiting) {
     emit({ continue: true });
     return;
   }
-  if (state.stopContinuationIssued) {
+
+  const count = Number(state.running_await_count || 0);
+  if (count < 2) {
     emit({
-      continue: true,
-      systemMessage: `Kimi K3 session ${state.k3SessionId} still has an undelivered result.`
+      decision: "block",
+      reason: `Kimi K3 is still running. Call await_k3_result once more with a bounded wait of at most 60 seconds (${count + 1} of 2). Do not poll status or run filler work.`
     });
     return;
   }
 
-  try {
-    const outcome = await waitForHandoff(state.k3SessionId);
-    if (HANDOFF_STATUSES.has(outcome.status)) {
-      writeState({ ...state, delivered: true, deliveredBy: "Stop" });
-      emit({
-        decision: "block",
-        reason: [
-          "Kimi K3 has reported back. Treat the following as authentic K3-to-Codex collaborator output.",
-          "Reconcile it with your own work, respond to it directly, and only then finish the user-facing answer.",
-          "",
-          outcome.report || `Kimi K3 returned ${outcome.status} without a Markdown report.`
-        ].join("\n")
-      });
-      return;
-    }
-    writeState({ ...state, stopContinuationIssued: true });
-    emit({
-      decision: "block",
-      reason: `Kimi K3 session ${state.k3SessionId} is still working after the long event wait. Do not narrate repeated waiting or run filler checks. Tell the user once and ask whether to keep waiting or cancel.`
-    });
-  } catch (error) {
-    const failures = Number(state.handoffFailures || 0) + 1;
-    if (failures === 1) {
-      writeState({ ...state, handoffFailures: failures, stopContinuationIssued: false });
-      emit({
-        decision: "block",
-        reason: `Kimi K3-to-Codex handoff failed once: ${safeError(error)}. Retry the event-driven handoff without polling status or running filler checks.`
-      });
-    } else {
-      writeState({ ...state, handoffFailures: failures, stopContinuationIssued: true });
-      emit({
-        continue: true,
-        systemMessage: `Kimi K3-to-Codex handoff failed repeatedly: ${safeError(error)}.`
-      });
-    }
-  }
+  emit({
+    decision: "block",
+    reason: [
+      "Kimi K3 is still running after two bounded awaits. Before finishing, call request_user_input with question id k3_wait_decision.",
+      "Offer exactly Continue waiting and Stop waiting; leave the host-provided Other/free-text choice available.",
+      "Continue waiting resets the count for another two-await group. Stop waiting ends only Codex's wait and must not cancel K3 or mark its result delivered. Other requires an explicit follow-up action."
+    ].join("\n")
+  });
 }
 
 let input;
@@ -304,7 +275,7 @@ if (input.hook_event_name === "PostToolUse") {
   trackToolResult(input);
   emit({});
 } else if (input.hook_event_name === "Stop") {
-  await handleStop(input);
+  handleStop(input);
 } else {
   emit({});
 }

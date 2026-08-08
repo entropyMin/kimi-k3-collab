@@ -1,9 +1,9 @@
 {
-  "description": "Keep Codex active until a delegated Kimi K3 result is handed back.",
+  "description": "Keep Codex active until K3 reports or the user stops waiting.",
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "(start_k3_collaboration|send_k3_message|await_k3_result|get_k3_result|cancel_k3_job)$",
+        "matcher": "(start_k3_collaboration|send_k3_message|await_k3_result|get_k3_result|cancel_k3_job|request_user_input)$",
         "hooks": [
           {
             "type": "command",
@@ -22,8 +22,8 @@
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/scripts/k3-codex-hook.mjs\"",
             "commandWindows": "node \"%PLUGIN_ROOT%\\scripts\\k3-codex-hook.mjs\"",
-            "timeout": 600,
-            "statusMessage": "Waiting for Kimi K3 to report back"
+            "timeout": 10,
+            "statusMessage": "Checking the Kimi K3 handoff"
           }
         ]
       }

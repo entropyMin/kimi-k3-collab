@@ -57,7 +57,7 @@ Normal collaboration has no model-driven status loop or token-consuming retries:
 - Kimi pushes events into one persistent server-side WebSocket.
 - The private app-only `receive_k3_events` call waits until an event arrives, then returns a batch through the host bridge. The component renews this long-held receive without a Codex model turn.
 - `await_k3_result` performs one bounded, event-driven wait after Codex finishes its own subtask. It does not issue periodic status requests.
-- The Stop hook uses the same event wait only as a safety net when Codex tries to finish before collecting K3's report.
+- The Stop hook requires two bounded result waits and then a user decision before Codex may stop waiting for a still-running K3 session.
 - A relay with no panel receives for three minutes closes its socket and releases its bounded event buffer.
 - `get_k3_status` and `get_k3_result` are explicit fallback tools only.
 - Network reconnects may occur after a broken event connection. Reconnect is recovery, not scheduled polling.
@@ -163,18 +163,25 @@ After reviewing the list, target one completed handoff explicitly with `prune --
 
 ## Receive K3 in Codex
 
-After Codex finishes its own complementary subtask, it waits for K3 once:
+Enable Default-mode user input in Codex configuration:
+
+```toml
+[features]
+default_mode_request_user_input = true
+```
+
+After Codex finishes its own complementary subtask, it waits for K3 with a bounded call:
 
 ```text
 await_k3_result {
   session_id: "SESSION",
-  wait_seconds: 100
+  wait_seconds: 60
 }
 ```
 
-The tool returns K3's original Markdown directly to Codex. If K3 needs longer and no useful Codex work remains, the trusted Stop hook takes over the longer event wait. Without that hook, Codex may make one later bounded await; if K3 is still running, it should ask whether to keep waiting or cancel. During automatic waiting it must not narrate repeated waiting, run Git/status filler checks, or use status/result tools for polling.
+The tool returns K3's original Markdown directly to Codex. If the verified result remains `running`, Codex makes one second bounded await. If that also remains `running`, Codex asks with stable question id `k3_wait_decision`: **Continue waiting**, **Stop waiting**, or the host-provided Other/free-text choice. Continue waiting starts another two-await group. Stop waiting ends only Codex's wait and never cancels K3 or marks its result delivered. Other requires an explicit next action. If `request_user_input` is unavailable, Codex asks the same question in plain text. During waiting it must not narrate repeated waiting, run Git/status filler checks, or use status/result tools for polling.
 
-The installed plugin also contributes a Stop hook. Review and trust that hook when Codex prompts you; in the CLI it appears under `/hooks`. Without hook trust, direct `await_k3_result` still works, but the automatic “do not finish before K3 reports” safety net is disabled. The hook can recover the active K3 handoff from the current Codex transcript when a host path skips `PostToolUse`, then wait event-first for up to nine minutes within Codex's documented 600-second hook timeout.
+The installed plugin also contributes a Stop hook. Review and trust that hook when Codex prompts you; in the CLI it appears under `/hooks`. Without hook trust, direct `await_k3_result` still works, but the “do not finish before K3 reports or the user stops waiting” safety net is disabled. The hook can recover the active K3 handoff and fixed-choice decision from the current Codex transcript when a host path skips `PostToolUse`; it does not perform a separate automatic long wait.
 
 Reopen the direct panel:
 

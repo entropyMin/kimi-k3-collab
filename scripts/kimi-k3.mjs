@@ -31,10 +31,11 @@ const SANDBOX_MARKER = path.join(JOB_ROOT, "sandbox-service.json");
 const SERVER_LAUNCH_LOG = path.join(JOB_ROOT, "server-launch.log");
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMPLETE_STATES = new Set(["completed", "cancelled", "failed", "error", "stopped", "end_turn"]);
-const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped"]);
+const FAILURE_STATES = new Set(["cancelled", "failed", "error", "stopped", "stalled"]);
 const PROMPT_TERMINAL_EVENTS = new Set(["prompt.completed", "prompt.aborted"]);
 const CHECKPOINT_EVENTS = new Set(["turn.ended", "error", ...PROMPT_TERMINAL_EVENTS]);
-const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files"]);
+const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files", "stalled"]);
+const STALLED_GRACE_MS = 10000;
 const PROCESS_DEADLINE = Date.now() + 115000;
 const STREAM_EXIT_RESERVE_MS = 10000;
 export const KIMI_SERVER_STARTUP_TIMEOUT_MS = 30000;
@@ -169,7 +170,9 @@ function formatIntegration(value) {
   const integration = value.integration || value.record?.integration;
   if (!integration) return "";
   if (integration.isolation === "single-writer") {
-    return `\n\n---\nExecution handoff: non-Git single-writer changes were made directly in ${integration.source_cwd}.`;
+    return integration.changes_verified === true
+      ? `\n\n---\nExecution handoff: verified changes were made directly in ${integration.source_cwd} under the single-writer protocol.`
+      : `\n\n---\nExecution handoff: direct-write access was available for ${integration.source_cwd} under the single-writer protocol; whether changes occurred is unverified.`;
   }
   const preserved = PRESERVED_WORKTREE_STATES.has(integration.state);
   return `\n\n${[
@@ -1179,7 +1182,7 @@ export function finalizeExecutionWorkspace(record) {
     workspace.turn_finalized_for = record.prompt_id;
     record.integration = {
       isolation: "single-writer",
-      state: "direct_changes",
+      state: record.state === "stalled" ? "stalled" : "direct_changes",
       source_cwd: workspace.source_cwd,
       changes_verified: false,
       note: record.unrestricted
@@ -1273,6 +1276,20 @@ export function finalizeExecutionWorkspace(record) {
     } catch (error) {
       record.integration.cleanup_error = error instanceof Error ? error.message : String(error);
     }
+    return record.integration;
+  }
+
+  if (record.state === "stalled") {
+    workspace.turn_finalized_for = record.prompt_id;
+    record.integration = {
+      isolation: "git-worktree",
+      state: "stalled",
+      source_repo: workspace.source_repo,
+      branch: workspace.branch,
+      base_commit: baseCommit,
+      worktree_root: workspace.worktree_root,
+      changed_paths: changedPaths
+    };
     return record.integration;
   }
 
@@ -1611,6 +1628,9 @@ async function sendMessage(options) {
   if (record.state === "needs_authorization" || record.authorization_request) {
     throw new Error("This K3 session ended with needs_authorization; obtain user approval and start a new session.");
   }
+  if (record.state === "stalled") {
+    throw new Error("This K3 session stalled after becoming idle without a terminal event; start a new session to retry.");
+  }
   const status = await getJobStatus(sessionId);
   if (!status.verified_k3 || status.server_reported_model !== K3_MODEL) {
     throw new Error(`Refusing to continue ${sessionId}: the server did not verify ${K3_MODEL}.`);
@@ -1691,6 +1711,9 @@ async function sendMessage(options) {
     error_code: null,
     updated_at: new Date().toISOString()
   });
+  delete record.idle_without_terminal_since;
+  delete record.stalled_at;
+  delete record.partial_result;
   writeJobRecord(record);
   return {
     kind: "kimi-k3-message",
@@ -1769,6 +1792,85 @@ export function parseNeedsAuthorization(text) {
   };
 }
 
+function anomalousIdle(record, status) {
+  return Boolean(record?.prompt_id)
+    && !record.complete
+    && !status.busy
+    && status.pending_interaction === "none"
+    && !status.last_turn_reason
+    && !COMPLETE_STATES.has(status.state)
+    && status.state !== "blocked"
+    && status.state !== "needs_authorization";
+}
+
+export function applyJobStatus(record, status, text, now = Date.now(), preserveIncomplete = false) {
+  const next = record || {
+    kind: "kimi-k3-native-delegation",
+    session_id: status.session_id,
+    explicit_model: K3_MODEL,
+    started_at: new Date(now).toISOString(),
+    cursor: { seq: 0 }
+  };
+  const observedState = String(next.state || "");
+  const observedTerminal = Boolean(next.complete) || observedState === "blocked" || FAILURE_STATES.has(observedState);
+  const statusComplete = !status.busy
+    && status.pending_interaction === "none"
+    && (COMPLETE_STATES.has(status.state) || Boolean(status.last_turn_reason));
+  const preserveObserved = observedTerminal && (
+    Boolean(next.error) ||
+    Boolean(next.authorization_request) ||
+    (preserveIncomplete && !statusComplete)
+  );
+  Object.assign(next, {
+    state: preserveObserved ? observedState : status.state,
+    complete: preserveObserved ? Boolean(next.complete) : false,
+    server_reported_model: status.server_reported_model,
+    verified_k3: status.verified_k3,
+    updated_at: new Date(now).toISOString(),
+    result: next.error ? next.result ?? null : text ?? next.result ?? null,
+    mode: next.mode || status.mode,
+    focus: next.focus || status.focus
+  });
+
+  const authorizationRequest = parseNeedsAuthorization(text);
+  if (authorizationRequest) {
+    next.state = "needs_authorization";
+    next.complete = true;
+    next.authorization_request = authorizationRequest;
+    delete next.idle_without_terminal_since;
+  } else if (observedState === "stalled" && next.complete) {
+    next.result = null;
+  } else if (anomalousIdle(next, status)) {
+    const observedSince = Date.parse(next.idle_without_terminal_since || "");
+    if (!Number.isFinite(observedSince)) {
+      next.idle_without_terminal_since = new Date(now).toISOString();
+      next.state = "running";
+      next.complete = false;
+    } else if (now - observedSince >= STALLED_GRACE_MS) {
+      next.state = "stalled";
+      next.complete = true;
+      next.error_code = "session_stalled";
+      next.error = "Kimi became idle without a terminal event. No automatic retry or cancellation was performed.";
+      next.partial_result = text ?? next.result ?? null;
+      next.result = null;
+      next.stalled_at = new Date(now).toISOString();
+    } else {
+      next.state = "running";
+      next.complete = false;
+    }
+  } else {
+    if (!preserveObserved) next.complete = statusComplete;
+    delete next.idle_without_terminal_since;
+  }
+  return next;
+}
+
+export function stalledGraceRemaining(record, now = Date.now()) {
+  if (!record?.idle_without_terminal_since || record.complete) return null;
+  const since = Date.parse(record.idle_without_terminal_since);
+  return Number.isFinite(since) ? Math.max(0, STALLED_GRACE_MS - (now - since)) : null;
+}
+
 async function syncJobRecord(sessionId, record = readJobRecord(sessionId), settle = false) {
   let status = await getJobStatus(sessionId);
   if (settle) {
@@ -1778,39 +1880,7 @@ async function syncJobRecord(sessionId, record = readJobRecord(sessionId), settl
     }
   }
   const text = await getLatestAssistantText(sessionId);
-  const complete = !status.busy
-    && status.pending_interaction === "none"
-    && (COMPLETE_STATES.has(status.state) || Boolean(status.last_turn_reason));
-  const next = record || {
-    kind: "kimi-k3-native-delegation",
-    session_id: sessionId,
-    explicit_model: K3_MODEL,
-    started_at: new Date().toISOString(),
-    cursor: { seq: 0 }
-  };
-  const observedState = String(next.state || "");
-  const observedTerminal = Boolean(next.complete) || observedState === "blocked" || FAILURE_STATES.has(observedState);
-  const preserveObserved = observedTerminal && (
-    Boolean(next.error) ||
-    Boolean(next.authorization_request) ||
-    (settle && !complete)
-  );
-  Object.assign(next, {
-    state: preserveObserved ? observedState : status.state,
-    complete: preserveObserved ? Boolean(next.complete) : complete,
-    server_reported_model: status.server_reported_model,
-    verified_k3: status.verified_k3,
-    updated_at: new Date().toISOString(),
-    result: next.error ? next.result ?? null : text ?? next.result ?? null,
-    mode: next.mode || status.mode,
-    focus: next.focus || status.focus
-  });
-  const authorizationRequest = parseNeedsAuthorization(text);
-  if (authorizationRequest) {
-    next.state = "needs_authorization";
-    next.complete = true;
-    next.authorization_request = authorizationRequest;
-  }
+  const next = applyJobStatus(record, status, text, Date.now(), settle);
   if (next.complete) finalizeExecutionSafely(next);
   writeJobRecord(next);
   return {
@@ -1927,11 +1997,13 @@ export function eventMatchesCurrentPrompt(record, event) {
 }
 
 export function applyK3Event(record, event) {
+  if (record?.state === "stalled" && record.complete) return record;
   if (Number.isInteger(event?.seq)) {
     record.cursor = { seq: event.seq, ...(event.epoch ? { epoch: event.epoch } : {}) };
   }
   record.last_event_type = String(event?.type || "");
   record.updated_at = new Date().toISOString();
+  if (eventMatchesCurrentPrompt(record, event)) delete record.idle_without_terminal_since;
   const payload = event?.payload || {};
   const failure = terminalProviderFailure(event)
     || (event?.type === "turn.ended" && payload.reason === "failed"
@@ -1972,15 +2044,9 @@ function cursorPayload(sessionId, record) {
 
 async function streamJob(sessionId, waitSeconds, onText = () => {}) {
   let record = readJobRecord(sessionId);
-  if (record?.complete) {
-    const synced = await syncJobRecord(sessionId, record);
-    record = synced.record;
-    if (record.complete) return { record, assistantStreamed: false };
-  }
-  if (waitSeconds === 0) {
-    const synced = await syncJobRecord(sessionId, record);
-    return { record: synced.record, assistantStreamed: false };
-  }
+  const initial = await syncJobRecord(sessionId, record);
+  record = initial.record;
+  if (record.complete || waitSeconds === 0) return { record, assistantStreamed: false };
 
   const service = await ensureService();
   const deadline = Math.min(Date.now() + waitSeconds * 1000, PROCESS_DEADLINE - STREAM_EXIT_RESERVE_MS);
@@ -2007,8 +2073,23 @@ async function streamJob(sessionId, waitSeconds, onText = () => {}) {
       });
       reconnectDelay = 250;
       while (Date.now() < deadline) {
-        const message = await websocket.nextMessage(Math.min(30000, deadline - Date.now()));
-        if (message == null) continue;
+        const graceRemaining = stalledGraceRemaining(record);
+        const message = await websocket.nextMessage(Math.max(1, Math.min(
+          30000,
+          deadline - Date.now(),
+          graceRemaining ?? 30000
+        )));
+        if (message == null) {
+          if (stalledGraceRemaining(record) === 0) {
+            const synced = await syncJobRecord(sessionId, record);
+            record = synced.record;
+            if (record.complete) {
+              websocket.close();
+              return { record, assistantStreamed: renderState.assistantStreamed };
+            }
+          }
+          continue;
+        }
         let frame;
         try {
           frame = JSON.parse(message);
@@ -2266,7 +2347,20 @@ async function main() {
   }
 
   if (options.action === "status") {
-    printOutput(await getJobStatus(requireSessionId(options)), options.outputFormat);
+    const synced = await syncJobRecord(requireSessionId(options));
+    printOutput({
+      ...synced.status,
+      prompt_id: synced.record.prompt_id || null,
+      state: synced.record.state,
+      complete: synced.record.complete,
+      error: synced.record.error || null,
+      error_code: synced.record.error_code || null,
+      idle_without_terminal_since: synced.record.idle_without_terminal_since || null,
+      stalled_at: synced.record.stalled_at || null,
+      last_event_type: synced.record.last_event_type || null,
+      partial_result: synced.record.partial_result || null,
+      integration: synced.record.integration || null
+    }, options.outputFormat);
     return;
   }
 

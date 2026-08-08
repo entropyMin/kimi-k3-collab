@@ -45,13 +45,14 @@ const MAX_RELAY_EVENTS = 2000;
 const MAX_EVENT_BATCH = 100;
 const MAX_RELAY_BUFFER_BYTES = 16 * 1024 * 1024;
 const MAX_EVENT_BATCH_BYTES = 512 * 1024;
+const MAX_PANEL_PARTIAL_RESULT_CHARS = 60000;
 const MAX_RELAY_FAILURES = 30;
 const MAX_DENIED_TOOL_CALL_IDS = 1024;
 const DEFAULT_RELAY_IDLE_MS = 3 * 60 * 1000;
 const MIN_RELAY_IDLE_MS = 1000;
 const RELAY_IDLE_MS = Math.max(Number(process.env.KIMI_K3_RELAY_IDLE_MS) || DEFAULT_RELAY_IDLE_MS, MIN_RELAY_IDLE_MS);
 const DEFAULT_RECEIVE_WAIT_MS = 45000;
-const DEFAULT_MODEL_WAIT_SECONDS = 100;
+const DEFAULT_MODEL_WAIT_SECONDS = 60;
 const BROWSER_TICKET_TTL_MS = 2 * 60 * 1000;
 const UNRESTRICTED_REQUEST_TTL_MS = 5 * 60 * 1000;
 const UNRESTRICTED_CONFIRMATION = "ENABLE UNRESTRICTED";
@@ -60,8 +61,8 @@ const { privateKey: unrestrictedSigningKey, publicKey: unrestrictedVerificationK
 const unrestrictedPublicKey = unrestrictedVerificationKey
   .export({ type: "spki", format: "der" })
   .toString("base64url");
-const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed", "error", "stopped"]);
-const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files"]);
+const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed", "error", "stopped", "stalled"]);
+const PRESERVED_WORKTREE_STATES = new Set(["scope_violation", "integration_error", "unintegrated_ignored_files", "stalled"]);
 const BRIDGE_ENVIRONMENT_KEYS = new Set([
   "APPDATA",
   "COMSPEC",
@@ -476,6 +477,7 @@ function structuredJob(job) {
   const integration = job.integration || null;
   return {
     session_id: job.session_id,
+    prompt_id: job.prompt_id || null,
     status: normalizeStatus(job.state || job.status || "running"),
     mode: job.mode || null,
     access_mode: job.unrestricted ? "unrestricted" : (job.mode || null),
@@ -486,6 +488,13 @@ function structuredJob(job) {
     compatibility_status: job.compatibility_status || "untested",
     server_reported_model: job.server_reported_model || job.explicit_model || null,
     verified_k3: Boolean(job.verified_k3),
+    complete: Boolean(job.complete),
+    error: job.error || null,
+    error_code: job.error_code || null,
+    idle_without_terminal_since: job.idle_without_terminal_since || null,
+    stalled_at: job.stalled_at || null,
+    last_event_type: job.last_event_type || null,
+    partial_result: job.partial_result || null,
     sandboxed: Boolean(job.sandboxed),
     isolation: job.workspace?.isolation || integration?.isolation || null,
     integration_state: integration?.state || null,
@@ -730,6 +739,7 @@ class SessionRelay {
     this.outage = false;
     this.providerFailureNotified = false;
     this.deniedToolCallIds = new Set();
+    this.stalledNoticeKey = "";
     this.lastReceiveAt = Date.now();
   }
 
@@ -820,6 +830,26 @@ class SessionRelay {
       session_id: this.sessionId,
       volatile: true,
       payload: { status: "resynced", message: "K3 event relay resynchronized its event cursor; live events continue." }
+    });
+  }
+
+  noteStalled(record) {
+    if (record?.state !== "stalled" || !record.stalled_at) return;
+    const key = `${record.prompt_id || ""}:${record.stalled_at}`;
+    if (key === this.stalledNoticeKey) return;
+    this.stalledNoticeKey = key;
+    const full = typeof record.partial_result === "string" ? record.partial_result : "";
+    const truncated = full.length > MAX_PANEL_PARTIAL_RESULT_CHARS;
+    this.enqueue({
+      type: "relay.stalled",
+      session_id: this.sessionId,
+      volatile: true,
+      payload: {
+        prompt_id: record.prompt_id || null,
+        stalled_at: record.stalled_at,
+        partial_result: truncated ? full.slice(0, MAX_PANEL_PARTIAL_RESULT_CHARS) : full || null,
+        partial_result_truncated: truncated
+      }
     });
   }
 
@@ -1337,12 +1367,21 @@ export function createBrowserGateway(
 }
 
 function panelToolResult(sessionId, details, text, extraMeta = {}) {
+  const fullPartial = typeof details?.partial_result === "string" ? details.partial_result : "";
+  const truncated = fullPartial.length > MAX_PANEL_PARTIAL_RESULT_CHARS;
+  const stalledMeta = details?.status === "stalled" ? {
+    "kimi-k3/stalledAt": details.stalled_at,
+    "kimi-k3/stalledPromptId": details.prompt_id || null,
+    "kimi-k3/partialResult": truncated ? fullPartial.slice(0, MAX_PANEL_PARTIAL_RESULT_CHARS) : fullPartial || null,
+    "kimi-k3/partialResultTruncated": truncated
+  } : {};
   return {
     content: [{ type: "text", text }],
     structuredContent: { ...details, session_id: sessionId, view: "kimi-event-stream" },
     _meta: {
       "kimi-k3/sessionId": sessionId,
       ...(details?.unrestricted ? { "kimi-k3/unrestricted": true } : {}),
+      ...stalledMeta,
       ...extraMeta
     }
   };
@@ -1443,6 +1482,7 @@ async function getJobStatus(requestId, rawArguments) {
   const { sessionId } = parseSessionArguments(rawArguments);
   const status = await runBridgeJson(requestId, ["status", "--format", "json", "--session-id", sessionId]);
   const state = normalizeStatus(status.state || "unknown");
+  if (state === "stalled") relays.get(sessionId)?.noteStalled(status);
   return {
     content: [{
       type: "text",
@@ -1473,7 +1513,10 @@ async function getJobResult(requestId, rawArguments) {
   }
   const status = normalizeStatus(record.state || record.status || "running");
   const complete = Boolean(record.complete) || TERMINAL_STATUSES.has(status);
-  const report = record.error
+  if (status === "stalled") relays.get(sessionId)?.noteStalled(record);
+  const report = status === "stalled"
+    ? "Kimi K3 stalled after becoming idle without a terminal event. No automatic retry or cancellation was performed. Start a new session to retry the task."
+    : record.error
     ? `Kimi K3 collaboration failed: ${record.error}`
     : typeof record.result === "string" && record.result.trim()
       ? record.result.trim()
@@ -1497,6 +1540,10 @@ async function getJobResult(requestId, rawArguments) {
       verified_k3: true,
       error: record.error || null,
       error_code: record.error_code || null,
+      idle_without_terminal_since: record.idle_without_terminal_since || null,
+      stalled_at: record.stalled_at || null,
+      last_event_type: record.last_event_type || null,
+      partial_result: record.partial_result || null,
       result_markdown: !record.error && typeof record.result === "string" && record.result.trim() ? record.result.trim() : null,
       ...handoff.structured
     }
@@ -1507,8 +1554,8 @@ async function awaitK3Result(requestId, rawArguments) {
   const input = requireObject(rawArguments);
   let sessionId = requireSessionId(input.session_id);
   const waitSeconds = input.wait_seconds ?? DEFAULT_MODEL_WAIT_SECONDS;
-  if (!Number.isInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > 100) {
-    throw new Error("wait_seconds must be an integer from 1 through 100.");
+  if (!Number.isInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > 60) {
+    throw new Error("wait_seconds must be an integer from 1 through 60.");
   }
   const unrestrictedRequest = unrestrictedRequests.get(sessionId);
   if (unrestrictedRequest) {
@@ -1563,13 +1610,16 @@ async function awaitK3Result(requestId, rawArguments) {
   const status = normalizeStatus(record.state || record.status || "running");
   const complete = Boolean(record.complete) || TERMINAL_STATUSES.has(status);
   const handoffReady = complete || status === "blocked";
-  const report = handoffReady && record.error
+  if (status === "stalled") relays.get(sessionId)?.noteStalled(record);
+  const report = status === "stalled"
+    ? "Kimi K3 stalled after becoming idle without a terminal event. No automatic retry or cancellation was performed. Start a new session to retry the task."
+    : handoffReady && record.error
     ? `Kimi K3 collaboration failed: ${record.error}`
     : handoffReady && typeof record.result === "string" && record.result.trim()
       ? record.result.trim()
     : handoffReady
       ? `Kimi K3 returned ${status} without a Markdown report.`
-      : "Kimi K3 is still working. If useful independent Codex work remains, do only that. Otherwise let the trusted Stop hook perform the longer event wait. If the hook is unavailable, make one later await without filler work; if K3 is still running, tell the user once and ask whether to keep waiting or cancel. During automatic waiting, do not narrate the same waiting state, inspect Git/status as filler, or use get_k3_status/get_k3_result for polling.";
+      : "Kimi K3 is still working. Finish useful independent Codex work, then make at most one more bounded await. After two verified running awaits, ask the user whether to continue waiting or stop waiting; do not cancel K3. Do not narrate repeated waiting, inspect Git/status as filler, or use get_k3_status/get_k3_result for polling.";
   const handoff = handoffReady ? integrationHandoff(record) : { text: "", structured: {} };
   return {
     content: [{ type: "text", text: `${report}${handoff.text}` }],
@@ -1587,6 +1637,10 @@ async function awaitK3Result(requestId, rawArguments) {
       verified_k3: true,
       error: record.error || null,
       error_code: record.error_code || null,
+      idle_without_terminal_since: record.idle_without_terminal_since || null,
+      stalled_at: record.stalled_at || null,
+      last_event_type: record.last_event_type || null,
+      partial_result: record.partial_result || null,
       result_markdown: handoffReady && !record.error && typeof record.result === "string" && record.result.trim()
         ? record.result.trim()
         : null,
@@ -1735,12 +1789,12 @@ const sendToolDefinition = {
 export const awaitToolDefinition = {
   name: "await_k3_result",
   title: "Await Kimi K3 Result",
-  description: "Wait event-first for K3 to finish, then return K3's original Markdown and any isolated Git commit handoff directly to Codex. Use after Codex completes its separate subtask and before the final response; this is not status polling.",
+  description: "Wait event-first for K3 to finish, then return K3's original Markdown and any isolated Git commit handoff directly to Codex. Use at most two bounded 60-second waits before asking the user whether to continue or stop waiting; this is not status polling.",
   inputSchema: {
     type: "object",
     properties: {
       session_id: { type: "string", minLength: 1 },
-      wait_seconds: { type: "integer", minimum: 1, maximum: 100, default: DEFAULT_MODEL_WAIT_SECONDS }
+      wait_seconds: { type: "integer", minimum: 1, maximum: 60, default: DEFAULT_MODEL_WAIT_SECONDS }
     },
     required: ["session_id"],
     additionalProperties: false
@@ -1905,7 +1959,7 @@ async function handleMessage(message) {
       capabilities: { tools: {}, resources: {} },
       serverInfo: { name: "Kimi K3 Collab", version: VERSION },
       instructions:
-        "Use start_k3_collaboration once to give K3 a separate subtask, continue Codex's own work, then call await_k3_result before the final response so K3 reports directly back to Codex. Only when the user explicitly requests dangerous unrestricted access, use request_unrestricted_k3; it cannot start until the user confirms privately in the panel. If K3 is still running and no useful Codex work remains, let the trusted Stop hook perform the longer event wait. Never narrate repeated waiting, run filler checks, or poll status/result during automatic waiting."
+        "Use start_k3_collaboration once for a separate K3 subtask, then call await_k3_result before the final response. If two verified bounded waits still return running, call request_user_input with id k3_wait_decision and choices Continue waiting and Stop waiting; Other requires an explicit action. Stop waiting never cancels K3. Only use request_unrestricted_k3 after explicit user authorization. Never poll status/result or run filler checks while waiting."
     });
     return;
   }

@@ -383,6 +383,7 @@
         receiveSequence: 0,
         orphanedReceives: 0,
         streamStopped: false,
+        stalled: false,
         terminal: false,
         disposed: false,
         tools: new Map(),
@@ -390,7 +391,8 @@
         assistants: new Map(),
         currentTurnId: "",
         lastLocalPrompt: "",
-        lastLocalPromptAt: 0
+        lastLocalPromptAt: 0,
+        stalledNotices: new Set()
       };
 
       function hiddenMeta(value) {
@@ -427,7 +429,13 @@
         if (!sessionId) return null;
         return {
           sessionId,
-          unrestricted: Boolean(meta?.["kimi-k3/unrestricted"])
+          unrestricted: Boolean(meta?.["kimi-k3/unrestricted"]),
+          stalledNotice: meta?.["kimi-k3/stalledAt"] ? {
+            prompt_id: meta?.["kimi-k3/stalledPromptId"] || null,
+            stalled_at: meta["kimi-k3/stalledAt"],
+            partial_result: meta?.["kimi-k3/partialResult"] || null,
+            partial_result_truncated: Boolean(meta?.["kimi-k3/partialResultTruncated"])
+          } : null
         };
       }
 
@@ -512,6 +520,38 @@
         pre.textContent = safeText(value);
         details.append(summary, pre);
         card.append(details);
+      }
+
+      function addStalledNotice(payload = {}) {
+        const key = `${payload.prompt_id || ""}:${payload.stalled_at || ""}`;
+        if (state.stalledNotices.has(key)) return;
+        state.stalledNotices.add(key);
+        state.stalled = true;
+        const card = eventCard({
+          icon: "!",
+          title: "K3 session stalled",
+          detail: "Kimi became idle without a terminal event",
+          status: "failure",
+          className: "notice"
+        });
+        const message = document.createElement("pre");
+        message.className = "markdown";
+        message.textContent = "No automatic retry or cancellation was performed. Open Kimi Code for the full native history.";
+        card.append(message);
+        if (payload.partial_result) {
+          const suffix = payload.partial_result_truncated
+            ? "\n\n[truncated in live panel; open Kimi Code for the full native history]"
+            : "";
+          addRawDetails(
+            card,
+            "Partial K3 output — incomplete, do not treat as final",
+            `${payload.partial_result}${suffix}`
+          );
+        }
+        appendCard(card);
+        setConnection("K3 session stalled", "error");
+        elements.prompt.disabled = true;
+        elements.send.disabled = true;
       }
 
       function describeTool(payload) {
@@ -646,9 +686,9 @@
       function handleFrame(frame) {
         if (!frame || typeof frame !== "object") return;
         if (frame.type === "server_hello") {
-          setConnection("Live", "live");
-          elements.prompt.disabled = false;
-          elements.send.disabled = false;
+          setConnection(state.stalled ? "K3 session stalled" : "Live", state.stalled ? "error" : "live");
+          elements.prompt.disabled = state.stalled;
+          elements.send.disabled = state.stalled;
           return;
         }
         if (frame.type === "ping") return;
@@ -685,6 +725,10 @@
         }
         if (frame.type === "relay.policy") {
           addNotice(frame.payload?.message || "K3 read-only policy handled an approval request.", frame.payload?.status === "failed");
+          return;
+        }
+        if (frame.type === "relay.stalled") {
+          addStalledNotice(frame.payload);
           return;
         }
         if (frame.type === "error" && !frame.session_id) {
@@ -948,6 +992,7 @@
           return true;
         }
         if (connection.sessionId === state.sessionId) {
+          if (connection.stalledNotice) addStalledNotice(connection.stalledNotice);
           if (state.receiveLoopGeneration || state.terminal) return true;
           state.generation += 1;
           Object.assign(state, {
@@ -967,12 +1012,14 @@
           relayGeneration: "",
           receiveFailures: 0,
           streamStopped: false,
+          stalled: false,
           disposed: false,
           terminal: false,
           tools: new Map(),
           subagents: new Map(),
           assistants: new Map(),
-          currentTurnId: ""
+          currentTurnId: "",
+          stalledNotices: new Set()
         });
         elements.timeline.replaceChildren();
         elements.timeline.hidden = true;
@@ -985,6 +1032,7 @@
         elements.access.hidden = !state.unrestricted;
         elements.external.disabled = false;
         setConnection("Connecting", "busy");
+        if (connection.stalledNotice) addStalledNotice(connection.stalledNotice);
         void receiveLoop(state.generation);
         return true;
       }

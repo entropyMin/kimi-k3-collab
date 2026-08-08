@@ -30,6 +30,7 @@ const bridgeUnitHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-k3-bridge-uni
 const originalKimiHome = process.env.KIMI_CODE_HOME;
 process.env.KIMI_CODE_HOME = bridgeUnitHome;
 const {
+  applyJobStatus,
   applyK3Event,
   createRenderState,
   eventMatchesCurrentPrompt,
@@ -44,6 +45,7 @@ const {
   renderK3Event,
   restoreExecutionWorkspace,
   scopeViolations,
+  stalledGraceRemaining,
   validateUnrestrictedGrant,
   wrappedServerCommand
 } = await import(pathToFileURL(bridge));
@@ -113,6 +115,82 @@ if (
   Object.keys(sanitizedKimiEnvironment).some((key) => key.startsWith("KIMI_K3_"))
 ) {
   throw new Error("The unrestricted grant or needs_authorization protocol contract failed.");
+}
+
+const idleStatus = {
+  session_id: "session_stalled_fixture",
+  state: "idle",
+  busy: false,
+  pending_interaction: "none",
+  last_turn_reason: "",
+  server_reported_model: "kimi-code/k3",
+  verified_k3: true,
+  mode: "analyze",
+  focus: "engineering"
+};
+const stalledCandidate = applyJobStatus({
+  session_id: idleStatus.session_id,
+  prompt_id: "prompt_stalled_fixture",
+  state: "running",
+  complete: false,
+  result: null
+}, idleStatus, "partial K3 output", 1000);
+const stalledRecord = applyJobStatus({ ...stalledCandidate }, idleStatus, "partial K3 output", 11000);
+const recoveredCandidate = applyJobStatus({
+  ...stalledCandidate,
+  idle_without_terminal_since: new Date(1000).toISOString()
+}, { ...idleStatus, state: "running", busy: true }, "continued", 2000);
+const pendingCandidate = applyJobStatus({ ...stalledCandidate }, {
+  ...idleStatus,
+  state: "blocked",
+  pending_interaction: "approval"
+}, "partial K3 output", 2000);
+const completedCandidate = applyJobStatus({ ...stalledCandidate }, {
+  ...idleStatus,
+  state: "completed",
+  last_turn_reason: "completed"
+}, "final K3 output", 2000);
+const oldPromptEventRecord = { ...stalledCandidate };
+applyK3Event(oldPromptEventRecord, {
+  type: "assistant.delta",
+  seq: 1,
+  payload: { promptId: "prompt_old", delta: "old" }
+});
+const currentPromptEventRecord = { ...stalledCandidate };
+applyK3Event(currentPromptEventRecord, {
+  type: "assistant.delta",
+  seq: 2,
+  payload: { promptId: "prompt_stalled_fixture", delta: "new" }
+});
+const lateStalledEventRecord = { ...stalledRecord };
+applyK3Event(lateStalledEventRecord, {
+  type: "turn.started",
+  seq: 3,
+  payload: { promptId: "prompt_stalled_fixture", turnId: "late" }
+});
+if (
+  stalledCandidate.state !== "running" ||
+  stalledCandidate.complete ||
+  stalledGraceRemaining(stalledCandidate, 1000) !== 10000 ||
+  stalledRecord.state !== "stalled" ||
+  stalledRecord.complete !== true ||
+  stalledRecord.error_code !== "session_stalled" ||
+  stalledRecord.result !== null ||
+  stalledRecord.partial_result !== "partial K3 output" ||
+  !stalledRecord.idle_without_terminal_since ||
+  !stalledRecord.stalled_at ||
+  recoveredCandidate.idle_without_terminal_since !== undefined ||
+  pendingCandidate.idle_without_terminal_since !== undefined ||
+  pendingCandidate.state !== "blocked" ||
+  completedCandidate.idle_without_terminal_since !== undefined ||
+  completedCandidate.complete !== true ||
+  oldPromptEventRecord.idle_without_terminal_since === undefined ||
+  currentPromptEventRecord.idle_without_terminal_since !== undefined ||
+  lateStalledEventRecord.state !== "stalled" ||
+  lateStalledEventRecord.complete !== true ||
+  lateStalledEventRecord.error_code !== "session_stalled"
+) {
+  throw new Error("The persisted anomalous-idle grace period or stalled transition is invalid.");
 }
 const {
   bridgeEnvironment,
@@ -189,8 +267,8 @@ if (
   throw new Error("The Kimi bridge environment allowlist leaked an unapproved variable.");
 }
 if (
-  awaitToolDefinition.inputSchema?.properties?.wait_seconds?.default !== 100 ||
-  awaitToolDefinition.inputSchema?.properties?.wait_seconds?.maximum !== 100
+  awaitToolDefinition.inputSchema?.properties?.wait_seconds?.default !== 60 ||
+  awaitToolDefinition.inputSchema?.properties?.wait_seconds?.maximum !== 60
 ) {
   throw new Error("The model-visible K3-to-Codex handoff does not use one bounded event wait.");
 }
@@ -468,7 +546,7 @@ if (auditLines.length !== 1 || JSON.parse(auditLines[0]).event !== "sensitive_pa
   throw new Error("Security audit records were not durable and idempotent.");
 }
 
-for (const preservedState of ["scope_violation", "integration_error", "unintegrated_ignored_files"]) {
+for (const preservedState of ["scope_violation", "integration_error", "unintegrated_ignored_files", "stalled"]) {
   const preservedHandoff = integrationHandoff({
     integration: {
       isolation: "git-worktree",
@@ -629,6 +707,45 @@ try {
     throw new Error("The isolated Git handoff changed the source checkout or lost its commit.");
   }
 
+  const stalledPrepared = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  fs.writeFileSync(path.join(stalledPrepared.cwd, "src", "feature.txt"), "incomplete stalled change\n");
+  const stalledHandoff = finalizeExecutionWorkspace({
+    session_id: "session_stalled_git_fixture",
+    prompt_id: "prompt_stalled_git_fixture",
+    mode: "execute",
+    state: "stalled",
+    complete: true,
+    workspace: stalledPrepared.workspace
+  });
+  if (
+    stalledHandoff.state !== "stalled" ||
+    stalledHandoff.commit ||
+    !stalledHandoff.changed_paths.includes("src/feature.txt") ||
+    !fs.existsSync(stalledPrepared.workspace.worktree_root) ||
+    fs.readFileSync(path.join(isolationFixture, "src", "feature.txt"), "utf8") !== "base\n"
+  ) {
+    throw new Error("A stalled Git execution was committed, discarded, or applied to the source checkout.");
+  }
+  checkedGit(isolationFixture, ["worktree", "remove", "--force", stalledPrepared.workspace.worktree_root]);
+  checkedGit(isolationFixture, ["branch", "-D", stalledPrepared.workspace.branch]);
+
+  const stalledCleanPrepared = await prepareExecutionWorkspace(isolationFixture, [path.join(isolationFixture, "src")]);
+  const stalledCleanHandoff = finalizeExecutionWorkspace({
+    session_id: "session_stalled_clean_git_fixture",
+    prompt_id: "prompt_stalled_clean_git_fixture",
+    mode: "execute",
+    state: "stalled",
+    complete: true,
+    workspace: stalledCleanPrepared.workspace
+  });
+  if (
+    stalledCleanHandoff.state !== "no_changes" ||
+    fs.existsSync(stalledCleanPrepared.workspace.worktree_root) ||
+    checkedGit(isolationFixture, ["branch", "--list", stalledCleanPrepared.workspace.branch])
+  ) {
+    throw new Error("A clean stalled Git execution did not remove its temporary resources.");
+  }
+
   await restoreExecutionWorkspace(record);
   record.prompt_id = "prompt_isolation_followup";
   record.workspace.base_commit = checkedGit(record.workspace.worktree_root, ["rev-parse", "HEAD"]);
@@ -668,6 +785,31 @@ try {
     /changed the source directory/i.test(unrestrictedHandoff.note)
   ) {
     throw new Error("Unrestricted execution did not use the direct single-writer path.");
+  }
+
+  const stalledDirectWorkspace = await prepareExecutionWorkspace(
+    isolationFixture,
+    [isolationFixture],
+    undefined,
+    true,
+    true
+  );
+  const stalledDirectHandoff = finalizeExecutionWorkspace({
+    session_id: "session_stalled_direct_fixture",
+    prompt_id: "prompt_stalled_direct_fixture",
+    mode: "execute",
+    state: "stalled",
+    complete: true,
+    unrestricted: true,
+    workspace: stalledDirectWorkspace.workspace
+  });
+  if (
+    stalledDirectHandoff.state !== "stalled" ||
+    stalledDirectHandoff.changes_verified !== false ||
+    stalledDirectWorkspace.workspace.lock_active !== false ||
+    /changes were made/i.test(integrationHandoff({ integration: stalledDirectHandoff }).text)
+  ) {
+    throw new Error("A stalled direct-write handoff retained its lock or claimed verified changes.");
   }
 
   fs.writeFileSync(path.join(isolationFixture, "src", "feature.txt"), "overlapping local change\n");
@@ -1378,11 +1520,15 @@ if (action === "start") {
   if (!fs.readFileSync(0, "utf8").trim()) process.exit(2);
   process.stdout.write(JSON.stringify({ session_id: session, state: "running", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "status") {
-  process.stdout.write(JSON.stringify({ session_id: requestedSession, state: "completed", busy: false, mode: requestedSession === "session_mode_missing" ? null : "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
+  process.stdout.write(JSON.stringify(requestedSession === "session_stalled"
+    ? { session_id: requestedSession, prompt_id: "prompt_stalled", state: "stalled", complete: true, busy: false, error: "Kimi became idle without a terminal event.", error_code: "session_stalled", idle_without_terminal_since: "2026-08-08T00:00:00.000Z", stalled_at: "2026-08-08T00:00:10.000Z", partial_result: "p".repeat(70000), mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
+    : { session_id: requestedSession, state: "completed", busy: false, mode: requestedSession === "session_mode_missing" ? null : "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }));
 } else if (action === "result") {
   process.stdout.write(value("--format") === "json"
     ? JSON.stringify(requestedSession === "session_running"
       ? { session_id: requestedSession, state: "running", complete: false, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
+      : requestedSession === "session_stalled"
+        ? { session_id: requestedSession, prompt_id: "prompt_stalled", state: "stalled", complete: true, error: "Kimi became idle without a terminal event.", error_code: "session_stalled", idle_without_terminal_since: "2026-08-08T00:00:00.000Z", stalled_at: "2026-08-08T00:00:10.000Z", partial_result: "p".repeat(70000), result: null, mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
       : requestedSession === "session_failed"
         ? { session_id: requestedSession, state: "failed", complete: true, error: "[provider.rate_limit] 429 overloaded", error_code: "provider.rate_limit", result: "# Stale report", mode: "analyze", focus: "engineering", server_reported_model: "kimi-code/k3", verified_k3: true }
       : requestedSession === "session_scope_violation_fixture"
@@ -1641,6 +1787,9 @@ try {
     !panel.result?.contents?.[0]?.text?.includes("state.receiveLoopGeneration || state.terminal") ||
     !panel.result?.contents?.[0]?.text?.includes("Stream unavailable") ||
     !panel.result?.contents?.[0]?.text?.includes("relay.policy") ||
+    !panel.result?.contents?.[0]?.text?.includes("relay.stalled") ||
+    !panel.result?.contents?.[0]?.text?.includes("Partial K3 output — incomplete, do not treat as final") ||
+    !panel.result?.contents?.[0]?.text?.includes("partial_result_truncated") ||
     !panel.result?.contents?.[0]?.text?.includes("resynced") ||
     !panel.result?.contents?.[0]?.text?.includes("stream gap: resumed at source offset") ||
     panel.result?.contents?.[0]?.text?.includes("<iframe") ||
@@ -1883,7 +2032,8 @@ try {
     !awaited.result?.structuredContent?.result_markdown?.includes("# Stub K3 report") ||
     !awaited.result?.content?.[0]?.text?.includes("# Stub K3 report") ||
     runningAwaited.result?.structuredContent?.complete !== false ||
-    !runningAwaited.result?.content?.[0]?.text?.includes("do not narrate the same waiting state") ||
+    !runningAwaited.result?.content?.[0]?.text?.includes("at most one more bounded await") ||
+    !runningAwaited.result?.content?.[0]?.text?.includes("continue waiting or stop waiting") ||
     !runningAwaited.result?.content?.[0]?.text?.includes("inspect Git/status as filler") ||
     !runningAwaited.result?.content?.[0]?.text?.includes("for polling") ||
     failedAwaited.result?.structuredContent?.status !== "failed" ||
@@ -2119,6 +2269,117 @@ try {
     encoding: "utf8",
     timeout: 5000
   });
+  const decisionSession = "codex_wait_decision_fixture";
+  const decisionStart = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: decisionSession,
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_running", status: "running" } }
+  });
+  const firstAwaitTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: decisionSession,
+    tool_name: "mcp__kimi_k3__await_k3_result",
+    tool_response: { structuredContent: { session_id: "session_running", status: "running", complete: false, verified_k3: true } }
+  });
+  const afterFirstAwait = runHook({ hook_event_name: "Stop", session_id: decisionSession });
+  const secondAwaitTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: decisionSession,
+    tool_name: "mcp__kimi_k3__await_k3_result",
+    tool_response: { structuredContent: { session_id: "session_running", status: "running", complete: false, verified_k3: true } }
+  });
+  const afterSecondAwait = runHook({ hook_event_name: "Stop", session_id: decisionSession });
+  const questionInput = {
+    questions: [{
+      id: "k3_wait_decision",
+      options: [{ label: "Continue waiting" }, { label: "Stop waiting" }]
+    }]
+  };
+  const continueTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: decisionSession,
+    tool_name: "request_user_input",
+    tool_input: questionInput,
+    tool_response: { answers: { k3_wait_decision: { answers: ["Continue waiting"] } } }
+  });
+  const afterContinue = runHook({ hook_event_name: "Stop", session_id: decisionSession });
+  runHook({
+    hook_event_name: "PostToolUse",
+    session_id: decisionSession,
+    tool_name: "mcp__kimi_k3__await_k3_result",
+    tool_response: { structuredContent: { session_id: "session_running", status: "running", complete: false, verified_k3: true } }
+  });
+  runHook({
+    hook_event_name: "PostToolUse",
+    session_id: decisionSession,
+    tool_name: "mcp__kimi_k3__await_k3_result",
+    tool_response: { structuredContent: { session_id: "session_running", status: "running", complete: false, verified_k3: true } }
+  });
+  const otherTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: decisionSession,
+    tool_name: "request_user_input",
+    tool_input: questionInput,
+    tool_response: { answers: { k3_wait_decision: { answers: ["Wait another five minutes"] } } }
+  });
+  const afterOther = runHook({ hook_event_name: "Stop", session_id: decisionSession });
+  const stopTracked = runHook({
+    hook_event_name: "PostToolUse",
+    session_id: decisionSession,
+    tool_name: "request_user_input",
+    tool_input: questionInput,
+    tool_response: { answers: { k3_wait_decision: { answers: ["Stop waiting"] } } }
+  });
+  const afterStopWaiting = runHook({ hook_event_name: "Stop", session_id: decisionSession });
+  const decisionFile = path.join(hookData, "handoffs", `${createHash("sha256").update(decisionSession).digest("hex")}.json`);
+  const decisionState = JSON.parse(fs.readFileSync(decisionFile, "utf8"));
+
+  const unverifiedSession = "codex_unverified_await_fixture";
+  runHook({
+    hook_event_name: "PostToolUse",
+    session_id: unverifiedSession,
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_running", status: "running" } }
+  });
+  runHook({
+    hook_event_name: "PostToolUse",
+    session_id: unverifiedSession,
+    tool_name: "mcp__kimi_k3__await_k3_result",
+    tool_response: { structuredContent: { session_id: "session_running", status: "running", complete: false, verified_k3: false } }
+  });
+  const afterUnverified = runHook({ hook_event_name: "Stop", session_id: unverifiedSession });
+
+  const stalledHookSession = "codex_stalled_hook_fixture";
+  runHook({
+    hook_event_name: "PostToolUse",
+    session_id: stalledHookSession,
+    tool_name: "mcp__kimi_k3__start_k3_collaboration",
+    tool_response: { structuredContent: { session_id: "session_stalled", status: "running" } }
+  });
+  runHook({
+    hook_event_name: "PostToolUse",
+    session_id: stalledHookSession,
+    tool_name: "mcp__kimi_k3__await_k3_result",
+    tool_response: { structuredContent: { session_id: "session_stalled", status: "stalled", complete: true, verified_k3: true } }
+  });
+  const afterStalled = runHook({ hook_event_name: "Stop", session_id: stalledHookSession });
+
+  const decisionTranscriptSession = "codex_transcript_decision_fixture";
+  const decisionTranscript = path.join(mcpFixtureHome, "codex-decision-transcript.jsonl");
+  fs.writeFileSync(decisionTranscript, [
+    transcriptEvent("kimi-k3", "start_k3_collaboration", { Ok: { structuredContent: { session_id: "session_running", status: "running" } } }),
+    transcriptEvent("kimi-k3", "await_k3_result", { Ok: { structuredContent: { session_id: "session_running", status: "running", complete: false, verified_k3: true } } }, { session_id: "session_running" }),
+    transcriptEvent("kimi-k3", "await_k3_result", { Ok: { structuredContent: { session_id: "session_running", status: "running", complete: false, verified_k3: true } } }, { session_id: "session_running" }),
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", role: "user", content: "Stop waiting" } })
+  ].join("\n"), "utf8");
+  const transcriptDecisionStop = runHook({
+    hook_event_name: "Stop",
+    session_id: decisionTranscriptSession,
+    transcript_path: decisionTranscript
+  });
+  const transcriptDecisionFile = path.join(hookData, "handoffs", `${createHash("sha256").update(decisionTranscriptSession).digest("hex")}.json`);
+  const transcriptDecisionState = JSON.parse(fs.readFileSync(transcriptDecisionFile, "utf8"));
   if (
     tracked.status !== 0 ||
     handedOff.status !== 0 ||
@@ -2140,25 +2401,35 @@ try {
     malformed.status !== 0 ||
     nullPayload.status !== 0 ||
     JSON.parse(handedOff.stdout).decision !== "block" ||
-    !JSON.parse(handedOff.stdout).reason.includes("# Stub K3 report") ||
-    JSON.parse(released.stdout).continue !== true ||
-    JSON.parse(guarded.stdout).continue !== true ||
+    !JSON.parse(handedOff.stdout).reason.includes("1 of 2") ||
+    JSON.parse(released.stdout).decision !== "block" ||
+    JSON.parse(guarded.stdout).decision !== "block" ||
     JSON.parse(cancelStop.stdout).continue !== true ||
     JSON.parse(providerFailureHandoff.stdout).decision !== "block" ||
-    !JSON.parse(providerFailureHandoff.stdout).reason.includes("[provider.rate_limit] 429 overloaded") ||
-    JSON.parse(providerFailureHandoff.stdout).reason.includes("# Stale report") ||
     JSON.parse(transcriptHandoff.stdout).decision !== "block" ||
-    !JSON.parse(transcriptHandoff.stdout).reason.includes("# Stub K3 report") ||
     transcriptState.k3SessionId !== "session_portable_mcp" ||
     JSON.parse(failedOnce.stdout).decision !== "block" ||
-    retryState.handoffFailures !== 1 ||
-    retryState.stopContinuationIssued !== false ||
     JSON.parse(retried.stdout).decision !== "block" ||
-    !JSON.parse(retried.stdout).reason.includes("# Stub K3 report") ||
+    !JSON.parse(retried.stdout).reason.includes("1 of 2") ||
     JSON.parse(persistentFailureFirst.stdout).decision !== "block" ||
-    JSON.parse(persistentFailureSecond.stdout).continue !== true ||
-    persistentFailureState.handoffFailures !== 2 ||
-    persistentFailureState.stopContinuationIssued !== true ||
+    JSON.parse(persistentFailureSecond.stdout).decision !== "block" ||
+    decisionStart.status !== 0 ||
+    firstAwaitTracked.status !== 0 ||
+    secondAwaitTracked.status !== 0 ||
+    continueTracked.status !== 0 ||
+    otherTracked.status !== 0 ||
+    stopTracked.status !== 0 ||
+    !JSON.parse(afterFirstAwait.stdout).reason.includes("2 of 2") ||
+    !JSON.parse(afterSecondAwait.stdout).reason.includes("k3_wait_decision") ||
+    !JSON.parse(afterContinue.stdout).reason.includes("1 of 2") ||
+    !JSON.parse(afterOther.stdout).reason.includes("k3_wait_decision") ||
+    JSON.parse(afterStopWaiting.stdout).continue !== true ||
+    decisionState.delivered !== false ||
+    decisionState.user_stopped_waiting !== true ||
+    !JSON.parse(afterUnverified.stdout).reason.includes("1 of 2") ||
+    JSON.parse(afterStalled.stdout).continue !== true ||
+    JSON.parse(transcriptDecisionStop.stdout).continue !== true ||
+    transcriptDecisionState.user_stopped_waiting !== true ||
     Object.keys(JSON.parse(malformed.stdout)).length !== 0 ||
     Object.keys(JSON.parse(nullPayload.stdout)).length !== 0
   ) {
@@ -2441,7 +2712,12 @@ if (
   !skillContract.includes("isolated worktree") ||
   !skillContract.includes("isolation=single-writer") ||
   !skillContract.includes("request_unrestricted_k3") ||
-  !skillContract.includes("needs_authorization")
+  !skillContract.includes("needs_authorization") ||
+  !skillContract.includes("default_mode_request_user_input = true") ||
+  !skillContract.includes("k3_wait_decision") ||
+  !skillContract.includes("Continue waiting") ||
+  !skillContract.includes("Stop waiting") ||
+  !skillContract.includes("Other/free-text")
 ) {
   throw new Error("The direct MCP skill lacks parallel work or the K3-to-Codex handoff contract.");
 }
@@ -2458,13 +2734,16 @@ if (
 const hooksManifest = JSON.parse(fs.readFileSync(path.join(root, "hooks", "hooks.json"), "utf8"));
 const hookText = fs.readFileSync(handoffHook, "utf8");
 if (
-  hooksManifest.hooks?.Stop?.[0]?.hooks?.[0]?.timeout !== 600 ||
+  hooksManifest.hooks?.Stop?.[0]?.hooks?.[0]?.timeout !== 10 ||
   !hooksManifest.hooks?.PostToolUse?.[0]?.matcher?.includes("await_k3_result") ||
   !hooksManifest.hooks?.PostToolUse?.[0]?.matcher?.includes("cancel_k3_job") ||
+  !hooksManifest.hooks?.PostToolUse?.[0]?.matcher?.includes("request_user_input") ||
   !hooksManifest.hooks?.Stop?.[0]?.hooks?.[0]?.commandWindows ||
   !hookText.includes('decision: "block"') ||
-  !hookText.includes("|| 540") ||
-  !hookText.includes("authentic K3-to-Codex collaborator output")
+  !hookText.includes("k3_wait_decision") ||
+  !hookText.includes("Continue waiting") ||
+  !hookText.includes("Stop waiting") ||
+  hookText.includes("KIMI_K3_STOP_MAX_WAIT_SECONDS")
 ) {
   throw new Error("The plugin-bundled K3-to-Codex Stop handoff is invalid.");
 }
