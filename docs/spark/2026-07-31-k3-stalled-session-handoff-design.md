@@ -1,6 +1,7 @@
 # K3 stalled session handoff design
 
 Date: 2026-07-31
+Updated: 2026-08-08
 
 ## Context
 
@@ -39,6 +40,9 @@ incident, so the plugin must not label this condition as a provider error.
 - Show the stalled state and partial output in the MCP App panel.
 - Preserve the plugin's event-driven, no-polling contract.
 - Recover the grace-period state across MCP process restarts.
+- After two bounded K3 waits still return `running`, ask the user whether to
+  continue waiting, stop waiting, or provide another instruction before Codex
+  ends the conversation.
 
 ## Non-goals
 
@@ -48,6 +52,8 @@ incident, so the plugin must not label this condition as a provider error.
 - Add a background watchdog or periodic status poll.
 - Reclassify Kimi Code 0.31.0 compatibility.
 - Add unrelated panel or execution-workspace features.
+- Automatically modify the user's global Codex configuration.
+- Treat “stop waiting” as permission to cancel the K3 prompt.
 
 ## Considered approaches
 
@@ -145,6 +151,83 @@ the persisted grace period has elapsed.
 MCP restart recovery reads `idle_without_terminal_since` from the durable job
 record. Restarting the MCP process does not restart the 10-second grace
 period.
+
+## Codex user-input prerequisite
+
+The host must expose Codex's `request_user_input` tool in Default mode. The
+required user configuration is:
+
+```toml
+[features]
+default_mode_request_user_input = true
+```
+
+The current Codex CLI reports this feature as under development. The official
+[Codex App Server documentation](https://learn.chatgpt.com/docs/app-server#api-overview)
+likewise describes `tool/requestUserInput` as experimental. The plugin must
+document the prerequisite in the README and K3 skill, and portable checks must
+verify that those exact instructions remain present. The plugin must not
+silently edit the user's global `config.toml`.
+
+If the tool is unavailable despite the prerequisite, the skill falls back to
+a plain-text user question. The Stop hook remains conservative and does not
+infer consent to finish or cancel from tool absence.
+
+## Two-wait user decision flow
+
+This flow applies only when K3 is legitimately still `running`. Terminal
+`completed`, `failed`, `cancelled`, `blocked`, `needs_authorization`, or
+`stalled` results follow their existing handoff paths immediately.
+
+1. Codex finishes its own complementary work.
+2. Codex calls `await_k3_result` with a bounded wait of at most 60 seconds.
+3. If the verified result is still `running`, Codex calls it once more with a
+   bounded wait of at most 60 seconds.
+4. If the second successful wait is still `running` and Codex has no useful
+   work left, Codex calls `request_user_input` with stable question id
+   `k3_wait_decision` and two explicit choices:
+   - `Continue waiting`
+   - `Stop waiting`
+   The host-provided free-form Other choice remains available.
+
+The choices mean:
+
+- **Continue waiting:** reset the running-wait counter and perform another
+  group of at most two bounded awaits. Ask again if both remain running.
+- **Stop waiting:** stop Codex's wait, retain the K3 session, and allow Codex
+  to finish. Do not call `cancel_k3_job`, mark the K3 result delivered, or
+  change the K3 job state.
+- **Other:** follow the user's free-form instruction. It does not implicitly
+  release the Stop hook. Codex must take an explicit action such as continuing
+  to wait, cancelling K3, or asking again.
+
+Only successful, verified `await_k3_result` calls that return `running` count
+toward the two-wait threshold. Invalid calls, transport errors, blocked
+results, and terminal results do not count. A successful follow-up prompt
+starts a new count for that prompt.
+
+The K3 skill instructions own the normal model workflow. The Stop hook is a
+safety net that enforces the same contract when Codex attempts to finish:
+
+- persist `running_await_count`, `waiting_decision`, and
+  `user_stopped_waiting` alongside the existing handoff state;
+- reset those fields on `start_k3_collaboration` and `send_k3_message`;
+- increment the count after each verified running await;
+- before two waits, block Stop and direct Codex to make the remaining bounded
+  await rather than performing a separate nine-minute automatic hook wait;
+- after two waits without a decision, block Stop and direct Codex to call
+  `request_user_input`;
+- reset the count after `Continue waiting`;
+- allow Stop after `Stop waiting` while keeping the K3 session undelivered and
+  uncancelled;
+- keep Stop blocked after Other until Codex performs the user's explicit
+  instruction.
+
+The PostToolUse hook should consume the stable `k3_wait_decision` answer when
+the host emits built-in tool hook events. The existing recent-transcript
+recovery path is the compatibility fallback when that event is unavailable.
+The fallback only recognizes the two fixed choices; it never guesses the
+meaning of free-form Other text.
 
 ## Result and follow-up behavior
 
@@ -284,6 +367,25 @@ Tests pre-populate an expired timestamp instead of waiting 10 real seconds.
 - Follow-up messaging rejects the stalled session.
 - Structured fields and tool schemas remain backward compatible.
 
+### User-directed wait tests
+
+- One verified running await keeps the Stop hook blocked and requests the
+  second bounded await.
+- Two verified running awaits require `request_user_input` before Stop may
+  finish.
+- Continue waiting resets the count and permits another two-await group.
+- Stop waiting permits Codex to finish without calling cancellation, changing
+  the K3 job, or marking its result delivered.
+- Other does not automatically release the hook; an explicit subsequent K3
+  action determines the outcome.
+- Terminal or stalled results bypass the question and complete their normal
+  handoff.
+- Tool errors and unverified responses do not increment the count.
+- PostToolUse answer tracking and transcript-tail recovery produce identical
+  decisions.
+- The skill contract contains the exact feature prerequisite, stable question
+  id, two explicit choices, and free-form Other behavior.
+
 ### Validation
 
 The implementation is accepted when all of the following pass:
@@ -309,7 +411,11 @@ injection.
   terminal state.
 - Partial output remains available but cannot be mistaken for a final K3
   report.
-- No automatic provider action, model request, cancellation, polling loop, or
-  dependency is added.
+- After two legitimate running waits, Codex cannot silently finish without a
+  user decision.
+- Choosing Continue waiting repeats a bounded two-wait group; choosing Stop
+  waiting preserves the live K3 session without cancellation.
+- The stalled-session detector adds no automatic provider action, model
+  request, cancellation, polling loop, or dependency.
 - Normal K3 sessions and existing security/integration failures retain their
   current behavior.
